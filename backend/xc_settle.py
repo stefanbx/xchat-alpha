@@ -61,8 +61,7 @@ if 'error' not in vi and int(vi['balance']) >= amt_raw and amt_raw > 0:
     # immutable off-chain reward receipt (signed record of the whole split)
     receipt = {"creator": to, "creator_raw": str(creator_raw), "relay": relay_acct, "relay_raw": str(relay_raw),
                "reposter": reposter or None, "reposter_raw": str(reposter_raw), "media": media or None, "ts": ts}
-    rd_ = dict(l.split(' ', 1) for l in subprocess.check_output(
-        ['/tmp/xc_sign', VKEY, f"{to}|{creator_raw}|{relay_acct}|{relay_raw}|{reposter}|{reposter_raw}|{ts}"]).decode().splitlines())
+    rd_ = dict(l.split(' ', 1) for l in xc._sign_lines(VKEY, f"{to}|{creator_raw}|{relay_acct}|{relay_raw}|{reposter}|{reposter_raw}|{ts}"))
     receipt['sig'] = rd_['sig']; receipt['pub'] = rd_['pub']
     c = int(rd('/tmp/xc_onchain_count.txt', '0'))
     open('/tmp/xc_onchain_count.txt', 'w').write(str(c + blocks))

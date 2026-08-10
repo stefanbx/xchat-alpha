@@ -28,7 +28,7 @@ for acc, h in heads.items():
         continue                           # only republish heads we hold the key for (wallet + demo authors)
     seq, cid = h['seq'], h['cid']; expires = now + xc.HEAD_TTL
     msg = f"{acc}|{seq}|{cid}|{expires}"
-    d = dict(l.split(' ', 1) for l in subprocess.check_output(['/tmp/xc_sign', sk, msg]).decode().splitlines())
+    d = dict(l.split(' ', 1) for l in xc._sign_lines(sk, msg))
     head = {"author": acc, "handle": h.get('handle', ''), "seq": seq, "cid": cid,
             "ts": h.get('ts', now), "expires": expires, "sig": d['sig'], "pub": d['pub']}
     for r in RELAYS:

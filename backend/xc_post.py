@@ -11,7 +11,7 @@ RELAYS = xc.discover_relays()
 ACC = xc.wallet_acct(); HANDLE = 'you.xno'; THREAD = f'/tmp/xc_thread_{ACC}.json'
 
 def sign_msg(msg):
-    return dict(l.split(' ', 1) for l in subprocess.check_output(['/tmp/xc_sign', xc.wallet_key(), msg]).decode().splitlines())
+    return dict(l.split(' ', 1) for l in xc._sign_lines(xc.wallet_key(), msg))
 
 def rd(p, d=''):
     return open(p).read().strip() if os.path.exists(p) else d

@@ -37,7 +37,7 @@ for handle, posts in by.items():
     seq = 1
     expires = now + xc.HEAD_TTL
     msg = f"{account}|{seq}|{cid}|{expires}"                          # expiry is SIGNED — a relay can't extend a head's life
-    d = dict(l.split(' ', 1) for l in subprocess.check_output(['/tmp/xc_sign', xc.keyof(seedbyte), msg]).decode().splitlines())
+    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.keyof(seedbyte), msg))
     head = {"author": account, "handle": handle, "seq": seq, "cid": cid,
             "ts": max(p['ts'] for p in posts), "expires": expires, "sig": d['sig'], "pub": d['pub']}
     push(head)

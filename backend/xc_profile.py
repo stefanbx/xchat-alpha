@@ -23,7 +23,7 @@ def canon(acc, ts, display, bio, avatar, banner):
 
 def verify(pub, msg, sig):
     try:
-        return subprocess.check_output(['/tmp/xc_verify', pub, msg, sig]).decode().strip() == 'ok'
+        return xc.verify_msg(pub, msg, sig)
     except Exception:
         return False
 
@@ -34,8 +34,7 @@ if mode == 'pub':
     avatar = rd('/tmp/xc_profile_avatar.txt')
     banner = rd('/tmp/xc_profile_banner.txt')
     ts = int(time.time())
-    d = dict(l.split(' ', 1) for l in subprocess.check_output(
-        ['/tmp/xc_sign', xc.wallet_key(), canon(acc, ts, display, bio, avatar, banner)]).decode().splitlines())
+    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.wallet_key(), canon(acc, ts, display, bio, avatar, banner)))
     rec = {'account': acc, 'display': display, 'bio': bio, 'avatar': avatar, 'banner': banner,
            'ts': ts, 'sig': d['sig'], 'pub': d['pub']}
     pushed = 0

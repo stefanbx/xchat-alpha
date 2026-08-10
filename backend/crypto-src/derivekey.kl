@@ -1,7 +1,0 @@
-import "kt_wallet.kl"
-fn main() {
-  let sk = hex_to_list(arg(1))
-  let pub = ed_pubkey(sk)
-  print(addr_encode(pub))
-  print(list_hex(pub, 32))
-}

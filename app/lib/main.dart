@@ -1,6 +1,6 @@
 // ӾChat — a censorship-free X. The "Ӿ" is the XNO (Nano) symbol.
 // Identity = a Nano keypair. Feed = read from the ledger. Tips = feeless Nano.
-// Backend = the Keel engine (same censorship-free stack as KeelTube).
+// Backend = a signed-events node (see backend/) reached over HTTP.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -1271,7 +1271,7 @@ class _FeedScreenState extends State<FeedScreen> {
             'settled ${entries.length} creator${entries.length == 1 ? '' : 's'} in $blocks Nano block${blocks == 1 ? '' : 's'} · ⚙ PoW delegated (0 ms on device)')));
   }
 
-  // ---- reputation-weighted, earned + decaying (ported from the KeelTube client) ----
+  // ---- reputation-weighted moderation: earned + decaying labeler weight ----
   double _recency(Labeler l) {
     if (l.lastTs == 0) return 0.01;
     final now = DateTime.now().millisecondsSinceEpoch / 1000;

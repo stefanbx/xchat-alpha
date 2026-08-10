@@ -21,7 +21,7 @@ def canon(poll_id, account, option, ts):
 
 def verify(pub, msg, sig):
     try:
-        return subprocess.check_output(['/tmp/xc_verify', pub, msg, sig]).decode().strip() == 'ok'
+        return xc.verify_msg(pub, msg, sig)
     except Exception:
         return False
 
@@ -29,8 +29,7 @@ if mode == 'vote':
     pid = rd('/tmp/xc_poll_id.txt')
     option = rd('/tmp/xc_poll_option.txt', '0')
     ts = int(time.time())
-    d = dict(l.split(' ', 1) for l in subprocess.check_output(
-        ['/tmp/xc_sign', xc.wallet_key(), canon(pid, acc, option, ts)]).decode().splitlines())
+    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.wallet_key(), canon(pid, acc, option, ts)))
     rec = {'poll_id': pid, 'account': acc, 'option': int(option), 'ts': ts, 'sig': d['sig'], 'pub': d['pub']}
     pushed = 0
     for r in RELAYS:

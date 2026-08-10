@@ -19,13 +19,48 @@ def ipfs_add(path):
                             env={**os.environ, 'IPFS_PATH': os.path.expanduser('~/.ipfs')})
     return cid
 
-def sign(sk, prev, rep, bal, link):
-    return dict(l.split(' ', 1) for l in subprocess.check_output(
-        ['/tmp/ktblock', sk, prev, rep, bal, link]).decode().splitlines())
+# ---- Nano crypto (pure Python via nanopy; ed25519-blake2b). Replaces the former native
+# helpers /tmp/{derivekey,ktblock,xc_sign,xc_verify} so the node runs on any OS, no build step.
+import nanopy as _np
+from nanopy import ext as _ext
+import os as _os
 
-def derive(k):
-    o = subprocess.check_output(['/tmp/derivekey', k]).decode().splitlines()
-    return o[0], o[1]  # addr, pub
+def _addr(pubhex):
+    return _np.Account(pk=pubhex).addr                         # 32-byte pubkey hex -> nano_ address
+
+def _block_hash(account_pub, prev, rep_pub, bal, link):        # Nano state-block hash (blake2b)
+    h = hashlib.blake2b(digest_size=32)
+    h.update(bytes(31) + bytes([6]))                           # state-block preamble
+    h.update(bytes.fromhex(account_pub)); h.update(bytes.fromhex(prev))
+    h.update(bytes.fromhex(rep_pub)); h.update(int(bal).to_bytes(16, 'big')); h.update(bytes.fromhex(link))
+    return h.digest()
+
+def sign(sk, prev, rep, bal, link):                            # Nano state-block signature
+    skb = bytes.fromhex(sk); pub = _ext.publickey(skb).hex()
+    bh = _block_hash(pub, prev, rep, bal, link)
+    return {'account': _addr(pub), 'rep': _addr(rep),
+            'sig': _ext.sign(skb, bh, _os.urandom(32)).hex(), 'hash': bh.hex(), 'pub': pub}
+
+def derive(k):                                                 # private key hex -> (nano_ addr, pub hex)
+    pub = _ext.publickey(bytes.fromhex(k)).hex()
+    return _addr(pub), pub
+
+def _msg_bytes(msg):
+    return msg.encode() if isinstance(msg, str) else msg
+
+def _sign_lines(key, msg):                                     # ed25519-blake2b signature over a message
+    skb = bytes.fromhex(key)
+    return ['sig ' + _ext.sign(skb, _msg_bytes(msg), _os.urandom(32)).hex(),
+            'pub ' + _ext.publickey(skb).hex()]
+
+def _verify_ok(pub, msg, sig):                                 # verify an ed25519-blake2b signature
+    try:
+        return 'ok' if _ext.verify_signature(bytes.fromhex(sig), bytes.fromhex(pub), _msg_bytes(msg)) == 1 else 'bad'
+    except Exception:
+        return 'bad'
+
+def verify_msg(pub, msg, sig):
+    return _verify_ok(pub, msg, sig) == 'ok'
 
 def keyof(seedbyte):
     return hashlib.blake2b(bytes([seedbyte] * 32) + bytes(4), digest_size=32).hexdigest()

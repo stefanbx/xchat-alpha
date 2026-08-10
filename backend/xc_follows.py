@@ -16,7 +16,7 @@ def canon(account, ts, follows):
 
 def verify(pub, msg, sig):
     try:
-        return subprocess.check_output(['/tmp/xc_verify', pub, msg, sig]).decode().strip() == 'ok'
+        return xc.verify_msg(pub, msg, sig)
     except Exception:
         return False
 
@@ -24,8 +24,7 @@ if mode == 'pub':
     csv = open('/tmp/xc_follows_csv.txt').read().strip()    # comma-joined accounts from the app
     follows = sorted(set(a for a in csv.split(',') if a))
     ts = int(time.time())
-    d = dict(l.split(' ', 1) for l in subprocess.check_output(
-        ['/tmp/xc_sign', xc.wallet_key(), canon(acc, ts, follows)]).decode().splitlines())
+    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.wallet_key(), canon(acc, ts, follows)))
     rec = {"account": acc, "follows": follows, "ts": ts, "sig": d['sig'], "pub": d['pub']}
     pushed = 0
     for r in RELAYS:

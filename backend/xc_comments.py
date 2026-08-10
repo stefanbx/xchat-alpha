@@ -24,7 +24,7 @@ def canon(post_id, account, ts, text, parent=''):
 
 def verify(pub, msg, sig):
     try:
-        return subprocess.check_output(['/tmp/xc_verify', pub, msg, sig]).decode().strip() == 'ok'
+        return xc.verify_msg(pub, msg, sig)
     except Exception:
         return False
 
@@ -38,8 +38,7 @@ if mode == 'post':
     handle = rd('/tmp/xc_comment_handle.txt', 'you.xno')
     parent = rd('/tmp/xc_comment_parent.txt')          # parent comment cid (nested reply), else ''
     ts = int(time.time())
-    d = dict(l.split(' ', 1) for l in subprocess.check_output(
-        ['/tmp/xc_sign', xc.wallet_key(), canon(post_id, acc, ts, text, parent)]).decode().splitlines())
+    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.wallet_key(), canon(post_id, acc, ts, text, parent)))
     rec = {"post_id": post_id, "account": acc, "handle": handle, "text": text, "parent": parent,
            "ts": ts, "sig": d['sig'], "pub": d['pub'], "cid": comment_id(post_id, acc, ts)}
     pushed = 0

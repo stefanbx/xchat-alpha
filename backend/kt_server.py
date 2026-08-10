@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-# ӾChat backend — a HOSTABLE port of the Keel engine (kt_server.kl).
+# ӾChat backend node — a small, hostable HTTP server that bridges the app to the network.
 #
-# The Keel engine only runs on macOS/arm64, so a public APK can't use it. This is the same server
-# in Python: it exposes the identical /api/* routes by reusing the very same helper scripts the Keel
-# engine spawned (xc_feed.py, xc_post.py, xc_reldir.py, ...). Anyone can run this — `python3 kt_server.py
-# <port>` — on any OS, so the app is not tied to one person's Mac. Wallet state is namespaced per
-# instance (XC_NS = port), matching the engine: one backend = one identity ("run your own node").
+# Pure Python: it exposes the /api/* routes by delegating to the helper scripts alongside it
+# (xc_feed.py, xc_post.py, xc_reldir.py, ...) and signs with nanopy (ed25519-blake2b). Anyone can
+# run this — `python3 kt_server.py <port>` — on any OS, so the app is not tied to one machine.
+# Wallet state is namespaced per instance (XC_NS = port): one node = one identity ("run your own node").
 #
 #   python3 kt_server.py 8790            # serve on :8790 (binds 0.0.0.0 so a phone/relay can reach it)
 import os, sys, json, subprocess, urllib.parse
@@ -43,7 +42,7 @@ def read(path, default=''):
     except Exception:
         return default
 
-# ---- inline routes (were Keel crypto/curl) ----
+# ---- inline routes ----
 def api_me():
     try:
         acct = xc.wallet_acct()

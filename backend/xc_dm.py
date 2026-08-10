@@ -26,12 +26,11 @@ def my_pk_hex(sk):
     return bytes(sk.public_key).hex()
 
 def sign(msg):
-    return dict(l.split(' ', 1) for l in subprocess.check_output(
-        ['/tmp/xc_sign', xc.wallet_key(), msg]).decode().splitlines())
+    return dict(l.split(' ', 1) for l in xc._sign_lines(xc.wallet_key(), msg))
 
 def verify(pub, msg, sig):
     try:
-        return subprocess.check_output(['/tmp/xc_verify', pub, msg, sig]).decode().strip() == 'ok'
+        return xc.verify_msg(pub, msg, sig)
     except Exception:
         return False
 

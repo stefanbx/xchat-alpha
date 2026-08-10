@@ -36,7 +36,7 @@ def canon(rec):
 
 def verify(pub, msg, sig):
     try:
-        return subprocess.check_output(['/tmp/xc_verify', pub, msg, sig]).decode().strip() == 'ok'
+        return xc.verify_msg(pub, msg, sig)
     except Exception:
         return False
 
@@ -64,8 +64,7 @@ if mode == 'publish':
     pinned = post('/blob', {'cid': cid, 'b64': b64})
     rec = {'publisher': PUBLISHER, 'version': version, 'cid': cid, 'sha256': sha,
            'size': size, 'changelog': changelog, 'ts': int(time.time())}
-    d = dict(l.split(' ', 1) for l in subprocess.check_output(
-        ['/tmp/xc_sign', xc.keyof(PUB_SEEDBYTE), canon(rec)]).decode().splitlines())
+    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.keyof(PUB_SEEDBYTE), canon(rec)))
     rec['sig'] = d['sig']; rec['pub'] = d['pub']
     pushed = post('/release', rec)
     json.dump({'ok': True, 'version': version, 'cid': cid, 'size': size,

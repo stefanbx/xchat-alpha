@@ -21,6 +21,7 @@ node over HTTP — set the address in **Settings → Connection**.
 
 ```bash
 cd backend
+pip install -r requirements.txt             # nanopy + pynacl
 export XC_NANO_RPC=https://rpc.nano.to      # scan the real XNO ledger for relays
 python3 kt_server.py 8790
 ```
@@ -30,21 +31,13 @@ programs alongside it (`xc_feed.py`, `xc_post.py`, `xc_reldir.py`, …) — so t
 readable Python you can audit and extend. State is namespaced per instance via the `XC_NS` env
 var (defaults to the port).
 
-### The native crypto helpers
+### Nano crypto
 
-Nano key derivation and block/message signing run through four small native programs, built from
-the Keel sources in `backend/crypto-src/` (`derivekey.kl`, `xc_sign.kl`, `kt_block.kl`,
-`nano_sign.kl`, …). The prebuilt binaries the helpers call (`/tmp/derivekey`, `/tmp/xc_sign`,
-`/tmp/ktblock`, `/tmp/xc_verify`) are currently **macOS/arm64**. To run the node on Linux/Windows,
-rebuild them for your platform — Keel transpiles to Go, which cross-compiles anywhere:
-
-```bash
-keel --go backend/crypto-src/derivekey.kl > derivekey.go && GOOS=linux go build -o derivekey derivekey.go
-# …same for xc_sign.kl, kt_block.kl, xc_verify.kl; place the binaries where the helpers expect them
-```
-
-Porting these (or replacing them with a pure-Python Nano crypto lib) is the top roadmap item —
-it's what lets any host run a node. PRs very welcome.
+All key derivation, message/block signing, and verification is **pure Python** via
+[`nanopy`](https://pypi.org/project/nanopy/) (ed25519-blake2b) — see the crypto section at the top
+of `xc_common.py`. No native build, no platform-specific binaries; the node runs anywhere Python
+runs. Encrypted DMs use `pynacl` (X25519). If you extend the signing, keep it byte-compatible with
+Nano's scheme so existing signed content keeps verifying.
 
 ## Run a relay
 
@@ -60,8 +53,7 @@ URL and announce it on-chain (see the README) so nodes discover it by scanning t
 
 ```
 app/                Flutter app (Dart) — one codebase, Android + iOS
-backend/            the node: kt_server.py + xc_*.py helpers
-backend/crypto-src/ Keel source for the native Nano-crypto helpers
+backend/            the node: kt_server.py + xc_*.py helpers (pure Python)
 relay/              xc_relayd.py — a relay
 docs/WHITEPAPER.md  the design, and how to verify discovery on-chain
 ```

@@ -15,8 +15,7 @@ gate. The "Ӿ" is the XNO symbol.
 | Path | What it is |
 |------|------------|
 | `app/` | The Flutter app (Android/iOS one codebase) — full source |
-| `backend/` | The node: `kt_server.py` + the helper programs it runs. Hostable, any OS |
-| `backend/crypto-src/` | Keel source for the native Nano-crypto helpers (reproducible) |
+| `backend/` | The node: `kt_server.py` + the helper programs it runs. **Pure Python, any OS** |
 | `relay/` | `xc_relayd.py` — a relay. Pure Python, run one yourself |
 | `apk/` | Pre-built signed Android APK + checksums |
 | `docs/` | Whitepaper |
@@ -47,20 +46,19 @@ no app store in the trust path.
 
 ## Run your own node (recommended — this is the decentralized path)
 
-The node is one identity per instance; your seed stays on your machine. It reuses the helper
-programs in `backend/`.
+The node is one identity per instance; your seed stays on your machine. It's **pure Python and
+runs on any OS** — no build step.
 
 ```bash
 cd backend
-export XC_NANO_RPC=https://rpc.nano.to        # scan the REAL XNO ledger for relays
+pip install -r requirements.txt                 # nanopy (Nano crypto) + pynacl (DM encryption)
+export XC_NANO_RPC=https://rpc.nano.to          # scan the REAL XNO ledger for relays
 python3 kt_server.py 8790                       # serves on 0.0.0.0:8790
 ```
 
 Then in the app, **Settings → Connection → Endpoint** → `http://<your-node-host>:8790`.
-
-> The reference crypto helpers currently ship as macOS/arm64 binaries built from
-> `backend/crypto-src/*.kl`. Linux/Windows builds (via `keel --go` → `go build`) are the
-> immediate next step so any host can run the node; until then, run the node on macOS.
+All Nano key derivation, signing, and verification is done in-process with `nanopy`
+(ed25519-blake2b) — nothing to compile, nothing platform-specific.
 
 ## Run your own relay
 

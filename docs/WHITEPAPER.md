@@ -140,10 +140,9 @@ run natively or hosted.
 
 This is an **alpha**. Known limitations: the reference backend is single-identity-per-instance
 (multi-tenant hosting and a fully self-contained app that signs on-device are on the roadmap);
-running the backend today needs the native crypto helpers (Keel source included; Linux builds are
-a documented next step); moderation labeling is minimal; and mainnet *reads* for discovery are
-free, but a relay's one-time on-chain *announcement* is a real (tiny) transaction the relay
-operator makes with a funded wallet. See the README for how to run a node, run a relay, announce
+moderation labeling is minimal; and mainnet *reads* for discovery are free, but a relay's one-time
+on-chain *announcement* is a real (tiny) transaction the relay operator makes with a funded wallet.
+The node itself is pure Python (`nanopy` for ed25519-blake2b) and runs on any OS. See the README for how to run a node, run a relay, announce
 it on-chain, and verify discovery yourself.
 
 ---
