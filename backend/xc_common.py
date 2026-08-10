@@ -9,8 +9,10 @@ GPUB = 'b0311ea55708d6a53c75cdbf88300259c6d018522fe3d4d0a242e431f9e8b6d0'
 NANO_ALPH = "13456789abcdefghijkmnopqrstuwxyz"
 
 def rpc(o):
+    # public mainnet RPCs (e.g. rpc.nano.to) reject the default python User-Agent with 403 — send one.
     return json.loads(urllib.request.urlopen(
-        urllib.request.Request(R, json.dumps(o).encode(), {'Content-Type': 'application/json'}), timeout=30).read())
+        urllib.request.Request(R, json.dumps(o).encode(),
+                               {'Content-Type': 'application/json', 'User-Agent': 'xchat-node/0.1'}), timeout=30).read())
 
 def ipfs_add(path):
     cid = subprocess.check_output(['ipfs', 'add', '-Q', '--cid-version=1', '--raw-leaves=false', path],
@@ -35,7 +37,7 @@ def _block_hash(account_pub, prev, rep_pub, bal, link):        # Nano state-bloc
     h.update(bytes.fromhex(rep_pub)); h.update(int(bal).to_bytes(16, 'big')); h.update(bytes.fromhex(link))
     return h.digest()
 
-def sign(sk, prev, rep, bal, link):                            # Nano state-block signature
+def sign(sk, prev, rep, bal, link):                            # state-block sign (was /tmp/ktblock)
     skb = bytes.fromhex(sk); pub = _ext.publickey(skb).hex()
     bh = _block_hash(pub, prev, rep, bal, link)
     return {'account': _addr(pub), 'rep': _addr(rep),
@@ -48,12 +50,12 @@ def derive(k):                                                 # private key hex
 def _msg_bytes(msg):
     return msg.encode() if isinstance(msg, str) else msg
 
-def _sign_lines(key, msg):                                     # ed25519-blake2b signature over a message
+def _sign_lines(key, msg):                                     # was /tmp/xc_sign: ed25519-blake2b over the message
     skb = bytes.fromhex(key)
     return ['sig ' + _ext.sign(skb, _msg_bytes(msg), _os.urandom(32)).hex(),
             'pub ' + _ext.publickey(skb).hex()]
 
-def _verify_ok(pub, msg, sig):                                 # verify an ed25519-blake2b signature
+def _verify_ok(pub, msg, sig):                                 # was /tmp/xc_verify
     try:
         return 'ok' if _ext.verify_signature(bytes.fromhex(sig), bytes.fromhex(pub), _msg_bytes(msg)) == 1 else 'bad'
     except Exception:

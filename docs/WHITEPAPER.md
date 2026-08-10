@@ -113,36 +113,122 @@ the app says so honestly.
 ## 8. Trust roots (there are exactly three, and all are minimal)
 
 1. **Your seed** — your identity. Yours alone; back it up.
-2. **The publisher key** — authenticates app updates. Pinned in the client; its account is public.
+2. **The publisher's public key** — authenticates app updates. Only the *public* address is pinned
+   in the client (verify-only); the private key is held **offline** by the maintainer and never
+   ships, so no one else can sign a release.
 3. **The rendezvous addresses** — the discovery bootstrap. *Keyless and plural* — meeting points,
    not controllers. This is the irreducible minimum every peer-to-peer system needs (Bitcoin has
    hardcoded DNS seeds); the design makes it as weak-as-possible rather than pretending it away.
 
 Everything else is derived, signed, replicated, and swappable.
 
-## 9. Architecture at a glance
+## 9. Threat model — every attack vector we considered, and how it's stopped
+
+We assume **every relay, every node you don't personally run, and the network itself are hostile.**
+Here is each vector, its defense, and honest status (✅ done · 🔨 building before public release ·
+🗺️ roadmap).
+
+### Keys & identity
+- **A node steals your seed.** → **On-device signing**: your seed never leaves your device; nodes
+  only relay signed events and read the public ledger. This is the single most important property —
+  it's what makes running *any* node safe. 🔨
+- **A guessable publisher key lets anyone sign a malicious update.** → The publisher signing key is a
+  real, random key held **offline** by the maintainer; only its **public** address ships. (The old
+  demo key derived from a source constant is removed.) 🔨
+- **A relay's account key is guessable from its public URL** (so it could be impersonated or, if
+  funded, drained). → A relay announces from the **operator's own secret key**, never a URL-derived
+  one. 🔨
+- **Seed at rest on a lost/rooted phone.** → Move seed storage to the OS secure enclave/keystore.
+  (Alpha uses app-private storage.) 🗺️
+
+### Content & relays
+- **A relay forges posts.** → Every event is **signature-verified**, and each author's head key is
+  bound to its account (`pub_to_addr(pub) == author`). Forgeries fail. ✅
+- **A relay tampers with content.** → Content is **hash-addressed** (CID); any change breaks the
+  hash. ✅
+- **A relay reads your DMs.** → Relays hold only **X25519 ciphertext**. ✅
+- **A relay censors/withholds content.** → **Plural relays**; clients read from all and keep the
+  highest signed sequence. Killing a relay leaves the feed intact. ✅
+- **Replay/rollback of old signed content.** → **Monotonic sequence numbers** + head TTL; a lower-seq
+  replay is ignored. ✅
+- **Sybil relays flood discovery.** → A fake relay can only fail to serve; clients verify content
+  signatures and use plural relays. Each announcement costs on-chain dust + PoW. ✅
+- **Eclipse (surround a client with only malicious relays).** → Honest relays are announced
+  **on-chain and immutably**; an attacker can add fakes but cannot remove or hide honest
+  announcements, so a scanning client still finds real relays. ✅
+
+### App updates — the "push malware to steal Nano" vector
+- **A relay serves a malicious APK / a forged release.** → The client accepts a release only if it is
+  **signed by the pinned publisher key** AND the downloaded APK's **SHA-256 matches the signed
+  record**, re-verified on-device. Wrong bytes → hash mismatch → rejected; forged record → wrong key
+  → ignored. ✅ (tested)
+- **Silent/forced install.** → Installs require an **explicit user tap**; no background auto-install. ✅
+- **Downgrade attack.** → The client keeps the **highest** valid version; an attacker can't sign a
+  higher one. ✅
+- **Can't confirm the APK matches the source.** → Full source + APK **SHA-256** + signing-cert
+  fingerprint are published; **reproducible builds** are the next step. 🗺️
+
+### Money (tips & settlement)
+- **A node redirects your tip to the attacker.** → **On-device signing**: you sign the exact
+  recipient and amount locally; the node cannot alter it. 🔨
+- **Reshare-payment gaming** (reshare after a tip to claim the split). → Attribution is **locked at
+  tip time**. ✅
+- **Double-spend / balance forgery.** → Handled by Nano mainnet consensus, outside our trust surface. ✅
+
+### Moderation
+- **A malicious labeler mass-flags to censor.** → Labels are **reputation-weighted**; the viewer
+  chooses the threshold and which labelers to trust; nothing is ever globally deleted ("show anyway"
+  always works). ✅
+- **Forged labels.** → Labels are signed; forgeries fail verification. ✅
+
+### Client & supply chain
+- **Malicious content exploiting the renderer** (crafted media, hostile links). → Text renders as
+  text (no markup execution); links aren't auto-opened. Hardening media decoders is 🗺️.
+- **A malicious dependency** in the app or node. → Pinned versions; dependency audit + minimal deps
+  (the node is stdlib + `nanopy` + `pynacl`). 🗺️
+
+### Network & privacy
+- **Relays/nodes see your IP and what you fetch.** → Network-metadata privacy (onion routing) is
+  🗺️; the alpha does **not** hide network metadata — treat it as public.
+
+### Denial of service
+- **Spam floods relays.** → Signed events tie spam to a key (block/mute it); relay-side rate limits
+  and optional proof-of-work on posts are 🗺️.
+
+**The irreducible trust roots stay three:** your seed (on your device), the publisher's *public*
+key (pinned, verify-only), and the rendezvous addresses (keyless, plural). Everything else is
+derived, signed, replicated, and swappable.
+
+## 10. Architecture at a glance
 
 ```
-  📱 app (Flutter)  ──►  backend node (Python, run-your-own or hosted)
-                              │
-                              ├─ reads the XNO ledger ──►  discovers relays (scan rendezvous)
-                              └─ talks to ──►  plural relays  (signed events, blob cache)
-                                                   ▲
-                        tips settle ──►  Nano ledger (batched, direct, non-custodial)
+  📱 app (Flutter) — HOLDS your seed, SIGNS locally
+        │  (only signed events + read requests leave the phone)
+        ▼
+   backend node (Python, pure, any OS) ──► reads the XNO ledger ──► discovers relays
+        │                                     (scan keyless rendezvous)
+        └─ forwards signed events to ──► plural relays  (signed bytes + blob cache)
+                                              ▲
+                    tips settle ──► Nano ledger (batched, direct, signed on-device)
 ```
 
-The backend is a thin, hostable node: identity, discovery, feed aggregation, and signing. It is
-one-identity-per-instance (your seed stays on your node) — **run your own** for full
-self-sovereignty, or point at a public node to try it. It reuses the same helper programs whether
-run natively or hosted.
+**Your key never leaves your device.** The app signs every post, event, and tip locally; the node
+is a thin relay-and-ledger-reader that only forwards already-signed data and scans the ledger for
+discovery — it never sees your seed and cannot sign or spend on your behalf. That is what makes it
+safe to run your own node *or* point at anyone's public node: none of them can steal from you,
+because none of them ever hold a key. The node is pure Python and runs on any OS.
 
-## 10. Status & honesty
+## 11. Status & honesty
 
-This is an **alpha**. Known limitations: the reference backend is single-identity-per-instance
-(multi-tenant hosting and a fully self-contained app that signs on-device are on the roadmap);
-moderation labeling is minimal; and mainnet *reads* for discovery are free, but a relay's one-time
-on-chain *announcement* is a real (tiny) transaction the relay operator makes with a funded wallet.
-The node itself is pure Python (`nanopy` for ed25519-blake2b) and runs on any OS. See the README for how to run a node, run a relay, announce
+This is an **alpha**. **Done:** the node is **pure Python** (`nanopy` ed25519-blake2b) and runs on
+any OS; relay discovery is **verified against the live mainnet ledger** (read path); the self-update
+path is signature + on-device SHA-256 verified. **Being hardened before public release (🔨):**
+**on-device signing** so the node never holds your seed, a real **offline publisher key**, and the
+relay announce signed by the operator's own key. **Honest limits:** moderation labeling is minimal;
+network metadata is **not** private (no onion routing yet — treat your IP as visible); the node is
+single-identity-per-instance (multi-tenant hosting is roadmap); and a relay's one-time on-chain
+*announcement* is a real (tiny) mainnet transaction the operator makes with a funded wallet. See the
+README to run a node, run a relay, announce it, and verify discovery yourself. See the README for how to run a node, run a relay, announce
 it on-chain, and verify discovery yourself.
 
 ---
