@@ -1,0 +1,9 @@
+import "kt_wallet.kl"
+fn demo_seed() { let s = []  let i = 0  loop { if i >= 32 { break }  push(s, 7)  i = i + 1 }  s }
+fn main() {
+  let sk = derive_privkey(demo_seed(), 0)
+  let pub = ed_pubkey(sk)
+  print("privkey " + list_hex(sk, 32))
+  print("pubkey " + list_hex(pub, 32))
+  print("account " + addr_encode(pub))
+}

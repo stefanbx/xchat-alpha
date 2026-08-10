@@ -1,0 +1,216 @@
+# Nano block assembly + broadcast — the leg that turns a signed block into a
+# live on-chain action. Every piece is proven against REAL ledger data with no
+# funds moved: the block hash is reconstructed and checked byte-for-byte against
+# a real cemented block (and its real signature verified against my hash), the
+# work function is checked against the node, and the broadcast RE-PUBLISHES an
+# already-cemented block (idempotent — no value moves). Assembling and signing a
+# NEW block is shown on a throwaway key that holds nothing.
+import "../fastpy/keel/lang/std/mmap.kl"
+import "../fastpy/keel/lang/std/http.kl"
+import "../fastpy/keel/lang/std/strings.kl"
+import c dlopen(str, int) -> int
+import c dlsym(int, str) -> int
+
+type Sodium = { gh, smb, sm, sreduce, smul, sadd, padd }
+fn sodium_load() {
+  let lib = dlopen("/opt/homebrew/lib/libsodium.dylib", 2)
+  drop(invoke(dlsym(lib, "sodium_init")))
+  Sodium { gh: dlsym(lib, "crypto_generichash"),
+    smb: dlsym(lib, "crypto_scalarmult_ed25519_base_noclamp"),
+    sm: dlsym(lib, "crypto_scalarmult_ed25519_noclamp"),
+    sreduce: dlsym(lib, "crypto_core_ed25519_scalar_reduce"),
+    smul: dlsym(lib, "crypto_core_ed25519_scalar_mul"),
+    sadd: dlsym(lib, "crypto_core_ed25519_scalar_add"),
+    padd: dlsym(lib, "crypto_core_ed25519_add") }
+}
+fn blake2b(s, in_ptr, inlen, out_ptr, outlen) { drop(invoke(s.gh, out_ptr, outlen, in_ptr, inlen, 0, 0)) }
+fn hexval(c) { if c >= 48 { if c <= 57 { c - 48 } else { if c >= 97 { c - 87 } else { c - 55 } } } else { 0 } }
+fn hex_to(ptr, hex) { let n = len(hex) / 2  let i = 0
+  loop { if i >= n { break }  poke(ptr, i, hexval(hex[i + i]) * 16 + hexval(hex[i + i + 1]))  i = i + 1 }  n }
+fn buf_hex(ptr, n) { let d = "0123456789abcdef"  let parts = []  let i = 0
+  loop { if i >= n { break }  let b = peek(ptr, i)  push(parts, chr(d[b / 16]) + chr(d[b % 16]))  i = i + 1 }  concat(parts) }
+fn copy_bytes(dst, doff, src, soff, n) { let i = 0  loop { if i >= n { break }  poke(dst, doff + i, peek(src, soff + i))  i = i + 1 } }
+fn zero_bytes(ptr, n) { let i = 0  loop { if i >= n { break }  poke(ptr, i, 0)  i = i + 1 } }
+fn bytes_eq(a, b, n) { let ok = true  let i = 0  loop { if i >= n { break }  if peek(a, i) != peek(b, i) { ok = false }  i = i + 1 }  ok }
+
+fn ed_sign(s, sk_ptr, msg_ptr, msglen, out_sig) {
+  let h = mm_alloc(64)  blake2b(s, sk_ptr, 32, h.ptr, 64)
+  poke(h.ptr, 0, peek(h.ptr, 0) & 248)  poke(h.ptr, 31, (peek(h.ptr, 31) & 127) | 64)
+  let A = mm_alloc(32)  drop(invoke(s.smb, A.ptr, h.ptr))
+  let b1 = mm_alloc(128 + msglen)  copy_bytes(b1.ptr, 0, h.ptr, 32, 32)  copy_bytes(b1.ptr, 32, msg_ptr, 0, msglen)
+  let hr = mm_alloc(64)  blake2b(s, b1.ptr, 32 + msglen, hr.ptr, 64)
+  let r = mm_alloc(32)  drop(invoke(s.sreduce, r.ptr, hr.ptr))
+  let R = mm_alloc(32)  drop(invoke(s.smb, R.ptr, r.ptr))
+  let b2 = mm_alloc(128 + msglen)  copy_bytes(b2.ptr, 0, R.ptr, 0, 32)  copy_bytes(b2.ptr, 32, A.ptr, 0, 32)  copy_bytes(b2.ptr, 64, msg_ptr, 0, msglen)
+  let hk = mm_alloc(64)  blake2b(s, b2.ptr, 64 + msglen, hk.ptr, 64)
+  let k = mm_alloc(32)  drop(invoke(s.sreduce, k.ptr, hk.ptr))
+  let a64 = mm_alloc(64)  zero_bytes(a64.ptr, 64)  copy_bytes(a64.ptr, 0, h.ptr, 0, 32)
+  let ared = mm_alloc(32)  drop(invoke(s.sreduce, ared.ptr, a64.ptr))
+  let ka = mm_alloc(32)  drop(invoke(s.smul, ka.ptr, k.ptr, ared.ptr))
+  let S = mm_alloc(32)  drop(invoke(s.sadd, S.ptr, ka.ptr, r.ptr))
+  copy_bytes(out_sig, 0, R.ptr, 0, 32)  copy_bytes(out_sig, 32, S.ptr, 0, 32)
+}
+fn ed_verify(s, pub_ptr, msg_ptr, msglen, sig_ptr) {
+  let b = mm_alloc(128 + msglen)  copy_bytes(b.ptr, 0, sig_ptr, 0, 32)  copy_bytes(b.ptr, 32, pub_ptr, 0, 32)  copy_bytes(b.ptr, 64, msg_ptr, 0, msglen)
+  let hk = mm_alloc(64)  blake2b(s, b.ptr, 64 + msglen, hk.ptr, 64)
+  let k = mm_alloc(32)  drop(invoke(s.sreduce, k.ptr, hk.ptr))
+  let S = mm_alloc(32)  copy_bytes(S.ptr, 0, sig_ptr, 32, 32)
+  let lhs = mm_alloc(32)  drop(invoke(s.smb, lhs.ptr, S.ptr))
+  let kA = mm_alloc(32)  let rc = invoke(s.sm, kA.ptr, k.ptr, pub_ptr)
+  let rhs = mm_alloc(32)
+  if rc != 0 { false } else { drop(invoke(s.padd, rhs.ptr, sig_ptr, kA.ptr))  bytes_eq(lhs.ptr, rhs.ptr, 32) }
+}
+fn ed_pubkey(s, sk_ptr, out_pub) {
+  let h = mm_alloc(64)  blake2b(s, sk_ptr, 32, h.ptr, 64)
+  poke(h.ptr, 0, peek(h.ptr, 0) & 248)  poke(h.ptr, 31, (peek(h.ptr, 31) & 127) | 64)
+  drop(invoke(s.smb, out_pub, h.ptr))
+}
+
+fn b32a() { "13456789abcdefghijkmnopqrstuwxyz" }
+# encode nbytes at ptr, with `pad` leading zero bits, into base32 symbols
+fn b32_encode(buf, nbytes, pad) {
+  let alpha = b32a()  let out = []  let bits = 0  let nbits = pad  let i = 0
+  loop { if i >= nbytes { break }
+    bits = (bits << 8) | peek(buf, i)  nbits = nbits + 8
+    loop { if nbits < 5 { break }  nbits = nbits - 5  push(out, chr(alpha[(bits >> nbits) & 31])) }
+    bits = bits & ((1 << nbits) - 1)  i = i + 1 }
+  concat(out)
+}
+# decode `count` symbols of `s` from `start`, dropping `pad` leading bits, into out_ptr
+fn b32_decode(s, start, count, pad, out_ptr) {
+  let alpha = b32a()  let bits = 0  let nbits = 0  let oi = 0  let i = 0
+  loop { if i >= count { break }
+    let v = index_of(alpha, chr(s[start + i]))
+    bits = (bits << 5) | v  nbits = nbits + 5
+    if i == 0 { nbits = nbits - pad  bits = bits & ((1 << nbits) - 1) }
+    loop { if nbits < 8 { break }  nbits = nbits - 8  poke(out_ptr, oi, (bits >> nbits) & 255)  oi = oi + 1  bits = bits & ((1 << nbits) - 1) }
+    i = i + 1 }
+}
+fn addr_encode(sod, pub_ptr) {
+  let ck = mm_alloc(8)  blake2b(sod, pub_ptr, 32, ck.ptr, 5)
+  let cr = mm_alloc(5)  let i = 0  loop { if i >= 5 { break }  poke(cr.ptr, i, peek(ck.ptr, 4 - i))  i = i + 1 }
+  "nano_" + b32_encode(pub_ptr, 32, 4) + b32_encode(cr.ptr, 5, 0)
+}
+# decode a nano_/xrb_ address into out_ptr (32 bytes); returns true if checksum ok
+fn addr_decode(sod, addr, out_ptr) {
+  let us = index_of(addr, "_")
+  let body = slice(addr, us + 1, len(addr))          # 60 chars: 52 pubkey + 8 checksum
+  b32_decode(body, 0, 52, 4, out_ptr)
+  let cbuf = mm_alloc(5)  b32_decode(body, 52, 8, 0, cbuf.ptr)
+  let ck = mm_alloc(8)  blake2b(sod, out_ptr, 32, ck.ptr, 5)
+  let ok = true  let i = 0
+  loop { if i >= 5 { break }  if peek(cbuf.ptr, i) != peek(ck.ptr, 4 - i) { ok = false }  i = i + 1 }
+  ok
+}
+# decimal raw amount -> 16-byte big-endian u128
+fn bal_encode(dec, out_ptr) {
+  zero_bytes(out_ptr, 16)  let i = 0
+  loop { if i >= len(dec) { break }
+    let carry = dec[i] - 48  let j = 15
+    loop { if j < 0 { break }  let v = peek(out_ptr, j) * 10 + carry  poke(out_ptr, j, v & 255)  carry = v / 256  j = j - 1 }
+    i = i + 1 }
+}
+# state-block hash: Blake2b-256 of preamble(0x..06) ‖ account ‖ prev ‖ rep ‖ balance16 ‖ link
+fn block_hash(sod, acct, prev, rep, bal16, link, out) {
+  let buf = mm_alloc(176)  zero_bytes(buf.ptr, 32)  poke(buf.ptr, 31, 6)
+  copy_bytes(buf.ptr, 32, acct, 0, 32)  copy_bytes(buf.ptr, 64, prev, 0, 32)  copy_bytes(buf.ptr, 96, rep, 0, 32)
+  copy_bytes(buf.ptr, 128, bal16, 0, 16)  copy_bytes(buf.ptr, 144, link, 0, 32)
+  blake2b(sod, buf.ptr, 176, out, 32)
+}
+fn hex_u64(hex) { let v = 0  let i = 0  loop { if i >= len(hex) { break }  v = (v << 4) | hexval(hex[i])  i = i + 1 }  v }
+# Nano work value = Blake2b-8( work_LE ‖ root ) read as little-endian u64
+fn pow_value(sod, work, root, buf, out8) {
+  let i = 0  loop { if i >= 8 { break }  poke(buf, i, (work >> (8 * i)) & 255)  i = i + 1 }
+  copy_bytes(buf, 8, root, 0, 32)  blake2b(sod, buf, 40, out8, 8)
+}
+fn le8_hex(out8) { let d = "0123456789abcdef"  let out = []  let i = 7
+  loop { if i < 0 { break }  let b = peek(out8, i)  push(out, chr(d[b / 16]) + chr(d[b % 16]))  i = i - 1 }  concat(out) }
+fn jget(body, key) {
+  let m = "\"" + key + "\":\""  let k = index_of(body, m)
+  if k < 0 { "" } else { let rest = slice(body, k + len(m), len(body))  let q = index_of(rest, "\"")  if q < 0 { "" } else { slice(rest, 0, q) } }
+}
+
+fn main() {
+  let s = sodium_load()
+  let url = "https://rpc.nano.to"
+
+  print("== 1. address encode/decode (base32 + Blake2b-40 checksum) ==")
+  let pub = mm_alloc(32)
+  drop(hex_to(pub.ptr, "c008b814a7d269a1fa3c6528b19201a24d797912db9996ff02a1ff356e45552b"))
+  let addr = addr_encode(s, pub.ptr)
+  let want = "nano_3i1aq1cchnmbn9x5rsbap8b15akfh7wj7pwskuzi7ahz8oq6cobd99d4r3b7"
+  print("  encode got  " + addr)
+  print("  encode want " + want)
+  print("  MATCH " + str(addr == want))
+  let back = mm_alloc(32)  let ok = addr_decode(s, want, back.ptr)
+  print("  decode checksum ok " + str(ok) + "  roundtrip " + str(bytes_eq(pub.ptr, back.ptr, 32)))
+
+  print("== 2-4. hash + ACCOUNT signature + work + broadcast on a REAL block ==")
+  # seed-0 account: busy with dust receives, so its recent blocks are ordinary
+  # account-signed state blocks. Walk back past any epoch block (those are
+  # signed by the epoch key, not the account) to a send/receive/change.
+  let acctaddr = "nano_3i1aq1cchnmbn9x5rsbap8b15akfh7wj7pwskuzi7ahz8oq6cobd99d4r3b7"
+  let ai = http_post_json(url, "{\"action\":\"account_info\",\"account\":\"" + acctaddr + "\"}")
+  if !ai.ok { print("  (offline — skipped)") } else {
+    let cur = jget(ai.body, "frontier")
+    let found = false
+    let hop = 0
+    loop {
+      if found { break }
+      if hop >= 8 { break }
+      let bi = http_post_json(url, "{\"action\":\"block_info\",\"json_block\":\"true\",\"hash\":\"" + cur + "\"}")
+      let btype = jget(bi.body, "type")
+      let subtype = jget(bi.body, "subtype")
+      if btype == "state" && subtype != "epoch" {
+        let acct = jget(bi.body, "account")
+        let prev = jget(bi.body, "previous")
+        let rep = jget(bi.body, "representative")
+        let bal = jget(bi.body, "balance")
+        let link = jget(bi.body, "link")
+        let sighex = jget(bi.body, "signature")
+        let workhex = jget(bi.body, "work")
+        print("  block " + cur)
+        print("  subtype " + subtype + "  balance " + bal)
+        let a = mm_alloc(32)  drop(addr_decode(s, acct, a.ptr))
+        let p = mm_alloc(32)  drop(hex_to(p.ptr, prev))
+        let r = mm_alloc(32)  drop(addr_decode(s, rep, r.ptr))
+        let b16 = mm_alloc(16)  bal_encode(bal, b16.ptr)
+        let l = mm_alloc(32)  drop(hex_to(l.ptr, link))
+        let myhash = mm_alloc(32)  block_hash(s, a.ptr, p.ptr, r.ptr, b16.ptr, l.ptr, myhash.ptr)
+        let hb = mm_alloc(32)  drop(hex_to(hb.ptr, cur))
+        print("  my hash " + buf_hex(myhash.ptr, 32))
+        print("  HASH MATCHES CHAIN " + str(bytes_eq(myhash.ptr, hb.ptr, 32)))
+        let sig = mm_alloc(64)  drop(hex_to(sig.ptr, sighex))
+        print("  ACCOUNT SIGNATURE verifies against my hash " + str(ed_verify(s, a.ptr, myhash.ptr, 32, sig.ptr)))
+        let buf = mm_alloc(40)  let out8 = mm_alloc(8)
+        pow_value(s, hex_u64(workhex), p.ptr, buf.ptr, out8.ptr)
+        let wv = http_post_json(url, "{\"action\":\"work_validate\",\"work\":\"" + workhex + "\",\"hash\":\"" + prev + "\"}")
+        print("  my difficulty   " + le8_hex(out8.ptr))
+        print("  node difficulty " + jget(wv.body, "difficulty"))
+        let blk = "{\"type\":\"state\",\"account\":\"" + acct + "\",\"previous\":\"" + prev +
+          "\",\"representative\":\"" + rep + "\",\"balance\":\"" + bal + "\",\"link\":\"" + link +
+          "\",\"signature\":\"" + sighex + "\",\"work\":\"" + workhex + "\"}"
+        let pr = http_post_json(url, "{\"action\":\"process\",\"json_block\":\"true\",\"subtype\":\"" + subtype + "\",\"block\":" + blk + "}")
+        print("  process (re-publish, idempotent) response: " + pr.body)
+        found = true
+      } else {
+        print("  skip " + btype + "/" + subtype + " block, walking back...")
+        cur = jget(bi.body, "previous")
+        hop = hop + 1
+      }
+    }
+    if !found { print("  (no account-signed state block found in 8 hops)") }
+  }
+
+  print("== 5. assemble + sign a NEW block on a throwaway key (holds nothing) ==")
+  let sk = mm_alloc(32)  let i = 0  loop { if i >= 32 { break }  poke(sk.ptr, i, 1)  i = i + 1 }
+  let tpub = mm_alloc(32)  ed_pubkey(s, sk.ptr, tpub.ptr)
+  print("  throwaway account " + addr_encode(s, tpub.ptr))
+  let prev0 = mm_alloc(32)  zero_bytes(prev0.ptr, 32)          # open block: previous = 0
+  let b16 = mm_alloc(16)  bal_encode("1000000000000000000000000000000", b16.ptr)
+  let dst = mm_alloc(32)  drop(hex_to(dst.ptr, "c008b814a7d269a1fa3c6528b19201a24d797912db9996ff02a1ff356e45552b"))
+  let nh = mm_alloc(32)  block_hash(s, tpub.ptr, prev0.ptr, tpub.ptr, b16.ptr, dst.ptr, nh.ptr)
+  let nsig = mm_alloc(64)  ed_sign(s, sk.ptr, nh.ptr, 32, nsig.ptr)
+  print("  new block hash " + buf_hex(nh.ptr, 32))
+  print("  signed + self-verifies " + str(ed_verify(s, tpub.ptr, nh.ptr, 32, nsig.ptr)))
+}

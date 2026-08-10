@@ -1,0 +1,13 @@
+# xc_sign — sign an arbitrary event message with an author key (ed25519-blake2b).
+# Used to make ӾChat posts SIGNED OFF-CHAIN events: authenticity from the signature,
+# not from touching the Nano ledger. Usage: xc_sign <privkey_hex> <message>
+import "kt_wallet.kl"
+fn str_bytes(s) { let out = []  let i = 0  loop { if i >= len(s) { break }  push(out, s[i])  i = i + 1 }  out }
+fn main() {
+  let sk = hex_to_list(arg(1))
+  let msg = str_bytes(arg(2))
+  let pub = ed_pubkey(sk)
+  let sig = ed_sign(sk, msg)
+  print("sig " + list_hex(sig, 64))
+  print("pub " + list_hex(pub, 32))
+}

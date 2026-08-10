@@ -1,0 +1,211 @@
+# Ed25519-Blake2b — Nano's signature scheme, built on libsodium's low-level
+# ed25519 scalar/point ops with our OWN Blake2b feeding them. libsodium's
+# crypto_sign* is hardwired to SHA-512 and would produce the WRONG key and
+# signature for Nano; Nano uses Blake2b-512 in place of SHA-512 everywhere.
+# Proven three ways in main(): a derivation vector, a REAL live-network
+# signature, and a sign->verify round-trip with a tamper check.
+import "../fastpy/keel/lang/std/mmap.kl"
+import "../fastpy/keel/lang/std/http.kl"
+import "../fastpy/keel/lang/std/strings.kl"
+import c dlopen(str, int) -> int
+import c dlsym(int, str) -> int
+
+type Sodium = { gh, smb, sm, sreduce, smul, sadd, padd }
+
+fn sodium_load() {
+  let lib = dlopen("/opt/homebrew/lib/libsodium.dylib", 2)
+  drop(invoke(dlsym(lib, "sodium_init")))
+  Sodium {
+    gh: dlsym(lib, "crypto_generichash"),
+    smb: dlsym(lib, "crypto_scalarmult_ed25519_base_noclamp"),
+    sm: dlsym(lib, "crypto_scalarmult_ed25519_noclamp"),
+    sreduce: dlsym(lib, "crypto_core_ed25519_scalar_reduce"),
+    smul: dlsym(lib, "crypto_core_ed25519_scalar_mul"),
+    sadd: dlsym(lib, "crypto_core_ed25519_scalar_add"),
+    padd: dlsym(lib, "crypto_core_ed25519_add"),
+  }
+}
+
+fn blake2b(s, in_ptr, inlen, out_ptr, outlen) {
+  drop(invoke(s.gh, out_ptr, outlen, in_ptr, inlen, 0, 0))
+}
+
+fn hexval(c) {
+  if c >= 48 { if c <= 57 { c - 48 } else { if c >= 97 { c - 87 } else { c - 55 } } } else { 0 }
+}
+fn hex_to(ptr, hex) {
+  let n = len(hex) / 2
+  let i = 0
+  loop { if i >= n { break }
+    poke(ptr, i, hexval(hex[i + i]) * 16 + hexval(hex[i + i + 1]))
+    i = i + 1 }
+  n
+}
+fn buf_hex(ptr, n) {
+  let d = "0123456789abcdef"
+  let parts = []
+  let i = 0
+  loop { if i >= n { break }
+    let b = peek(ptr, i)
+    push(parts, chr(d[b / 16]) + chr(d[b % 16]))
+    i = i + 1 }
+  concat(parts)
+}
+fn copy_bytes(dst, doff, src, soff, n) {
+  let i = 0
+  loop { if i >= n { break }  poke(dst, doff + i, peek(src, soff + i))  i = i + 1 }
+}
+fn zero_bytes(ptr, n) {
+  let i = 0
+  loop { if i >= n { break }  poke(ptr, i, 0)  i = i + 1 }
+}
+fn bytes_eq(a, b, n) {
+  let ok = true
+  let i = 0
+  loop { if i >= n { break }  if peek(a, i) != peek(b, i) { ok = false }  i = i + 1 }
+  ok
+}
+
+# public key A = a*B, where a = clamp(Blake2b-512(sk)[0:32])
+fn ed_pubkey(s, sk_ptr, out_pub) {
+  let h = mm_alloc(64)
+  blake2b(s, sk_ptr, 32, h.ptr, 64)
+  poke(h.ptr, 0, peek(h.ptr, 0) & 248)
+  poke(h.ptr, 31, (peek(h.ptr, 31) & 127) | 64)
+  drop(invoke(s.smb, out_pub, h.ptr))
+}
+
+# RFC-8032 sign with H = Blake2b-512.  sig(64) = R(32) || S(32)
+fn ed_sign(s, sk_ptr, msg_ptr, msglen, out_sig) {
+  let h = mm_alloc(64)
+  blake2b(s, sk_ptr, 32, h.ptr, 64)
+  poke(h.ptr, 0, peek(h.ptr, 0) & 248)
+  poke(h.ptr, 31, (peek(h.ptr, 31) & 127) | 64)
+  let A = mm_alloc(32)
+  drop(invoke(s.smb, A.ptr, h.ptr))                 # A = a*B  (a in h[0:32])
+
+  # r = reduce( Blake2b-512( prefix(h[32:64]) || msg ) )
+  let b1 = mm_alloc(96 + msglen)
+  copy_bytes(b1.ptr, 0, h.ptr, 32, 32)
+  copy_bytes(b1.ptr, 32, msg_ptr, 0, msglen)
+  let hr = mm_alloc(64)
+  blake2b(s, b1.ptr, 32 + msglen, hr.ptr, 64)
+  let r = mm_alloc(32)
+  drop(invoke(s.sreduce, r.ptr, hr.ptr))
+  let R = mm_alloc(32)
+  drop(invoke(s.smb, R.ptr, r.ptr))                 # R = r*B
+
+  # k = reduce( Blake2b-512( R || A || msg ) )
+  let b2 = mm_alloc(96 + msglen)
+  copy_bytes(b2.ptr, 0, R.ptr, 0, 32)
+  copy_bytes(b2.ptr, 32, A.ptr, 0, 32)
+  copy_bytes(b2.ptr, 64, msg_ptr, 0, msglen)
+  let hk = mm_alloc(64)
+  blake2b(s, b2.ptr, 64 + msglen, hk.ptr, 64)
+  let k = mm_alloc(32)
+  drop(invoke(s.sreduce, k.ptr, hk.ptr))
+
+  # a reduced mod L (clamped a is ~2^254 > L), then S = (k*a + r) mod L
+  let a64 = mm_alloc(64)
+  zero_bytes(a64.ptr, 64)
+  copy_bytes(a64.ptr, 0, h.ptr, 0, 32)
+  let ared = mm_alloc(32)
+  drop(invoke(s.sreduce, ared.ptr, a64.ptr))
+  let ka = mm_alloc(32)
+  drop(invoke(s.smul, ka.ptr, k.ptr, ared.ptr))
+  let S = mm_alloc(32)
+  drop(invoke(s.sadd, S.ptr, ka.ptr, r.ptr))
+
+  copy_bytes(out_sig, 0, R.ptr, 0, 32)
+  copy_bytes(out_sig, 32, S.ptr, 0, 32)
+}
+
+# verify: [S]B == R + [k]A, with k = reduce(Blake2b-512(R||A||msg))
+fn ed_verify(s, pub_ptr, msg_ptr, msglen, sig_ptr) {
+  let b = mm_alloc(96 + msglen)
+  copy_bytes(b.ptr, 0, sig_ptr, 0, 32)
+  copy_bytes(b.ptr, 32, pub_ptr, 0, 32)
+  copy_bytes(b.ptr, 64, msg_ptr, 0, msglen)
+  let hk = mm_alloc(64)
+  blake2b(s, b.ptr, 64 + msglen, hk.ptr, 64)
+  let k = mm_alloc(32)
+  drop(invoke(s.sreduce, k.ptr, hk.ptr))
+  let S = mm_alloc(32)
+  copy_bytes(S.ptr, 0, sig_ptr, 32, 32)
+  let lhs = mm_alloc(32)
+  drop(invoke(s.smb, lhs.ptr, S.ptr))               # S*B
+  let kA = mm_alloc(32)
+  let rc = invoke(s.sm, kA.ptr, k.ptr, pub_ptr)     # k*A
+  let rhs = mm_alloc(32)
+  if rc != 0 { false } else {
+    drop(invoke(s.padd, rhs.ptr, sig_ptr, kA.ptr))  # R + k*A
+    bytes_eq(lhs.ptr, rhs.ptr, 32)
+  }
+}
+
+# minimal JSON string-field reader
+fn jget(body, key) {
+  let m = "\"" + key + "\":\""
+  let k = index_of(body, m)
+  if k < 0 { "" } else {
+    let rest = slice(body, k + len(m), len(body))
+    let q = index_of(rest, "\"")
+    if q < 0 { "" } else { slice(rest, 0, q) }
+  }
+}
+
+fn main() {
+  let s = sodium_load()
+
+  print("== A. key derivation vs the canonical vector (seed 0, index 0) ==")
+  let sk = mm_alloc(32)
+  drop(hex_to(sk.ptr, "9f0e444c69f77a49bd0be89db92c38fe713e0963165cca12faf5712d7657120f"))
+  let pub = mm_alloc(32)
+  ed_pubkey(s, sk.ptr, pub.ptr)
+  let got = buf_hex(pub.ptr, 32)
+  let want = "c008b814a7d269a1fa3c6528b19201a24d797912db9996ff02a1ff356e45552b"
+  print("  pubkey got  " + got)
+  print("  pubkey want " + want)
+  print("  MATCH " + str(got == want))
+
+  print("== C. sign -> verify round-trip + tamper check ==")
+  let msg = mm_alloc(32)
+  drop(hex_to(msg.ptr, "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"))
+  let sig = mm_alloc(64)
+  ed_sign(s, sk.ptr, msg.ptr, 32, sig.ptr)
+  print("  signature " + buf_hex(sig.ptr, 64))
+  print("  verify(good) " + str(ed_verify(s, pub.ptr, msg.ptr, 32, sig.ptr)))
+  # determinism: sign again, must be identical
+  let sig2 = mm_alloc(64)
+  ed_sign(s, sk.ptr, msg.ptr, 32, sig2.ptr)
+  print("  deterministic " + str(bytes_eq(sig.ptr, sig2.ptr, 64)))
+  # tamper: flip one byte of R, verify must fail
+  poke(sig.ptr, 3, peek(sig.ptr, 3) ^ 1)
+  print("  verify(tampered) " + str(ed_verify(s, pub.ptr, msg.ptr, 32, sig.ptr)))
+
+  print("== B. verify a REAL signature from the live Nano genesis block ==")
+  let ghash = "991CF190094C00F0B68E2E5F75F6BEE95A2E0BD93CEAA4A6734DB9F19B728948"
+  let bi = http_post_json("https://rpc.nano.to",
+    "{\"action\":\"block_info\",\"json_block\":\"true\",\"hash\":\"" + ghash + "\"}")
+  if !bi.ok { print("  (offline — skipped)") } else {
+    let acct = jget(bi.body, "block_account")
+    let signhex = jget(bi.body, "signature")
+    print("  block_account " + acct)
+    print("  signature     " + signhex)
+    let ak = http_post_json("https://rpc.nano.to",
+      "{\"action\":\"account_key\",\"account\":\"" + acct + "\"}")
+    let keyhex = jget(ak.body, "key")
+    print("  account pubkey " + keyhex)
+    if len(signhex) == 128 && len(keyhex) == 64 {
+      let A = mm_alloc(32)
+      drop(hex_to(A.ptr, keyhex))
+      let H = mm_alloc(32)
+      drop(hex_to(H.ptr, ghash))
+      let rsig = mm_alloc(64)
+      drop(hex_to(rsig.ptr, signhex))
+      print("  verify(real signature) " + str(ed_verify(s, A.ptr, H.ptr, 32, rsig.ptr)))
+      poke(rsig.ptr, 40, peek(rsig.ptr, 40) ^ 1)
+      print("  verify(real, tampered) " + str(ed_verify(s, A.ptr, H.ptr, 32, rsig.ptr)))
+    } else { print("  (unexpected RPC shape — skipped verify)") }
+  }
+}
