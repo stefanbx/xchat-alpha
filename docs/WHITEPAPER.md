@@ -100,22 +100,45 @@ chokepoint), no custodian. A tip can be split immutably on-chain between the cre
 that served the media, and whoever reposted it. Everything else — the entire social graph — never
 touches the ledger, so the network stays light no matter how busy it gets.
 
-## 7. Self-delivery — updates over the relays, no app-store gate
+## 7. Self-delivery — updates verified against public source, with no single key
 
-The app updates **itself** through its own network: a publisher key signs a content-addressed
-release record, appended to a per-publisher list on the relays; the APK bytes are pinned to relay
-caches. The client keeps the highest *valid* (publisher-signed) version, downloads the bytes,
-**re-verifies the SHA-256 on-device**, and hands off to the OS installer. A forged higher version
-signed by the wrong key is ignored; a takedown of any relay doesn't stop updates. The one layer
-that isn't censorship-free is the OS install gate itself (Android allows it; iOS does not) — and
-the app says so honestly.
+The app updates **itself** through its own network, and — like everything else here — the trust is
+**plural, not vested in one authority.** A single signing key would be a single point of failure
+(leak it → everyone gets malware; lose it → updates die), so distribution is designed to not depend
+on any one secret:
+
+- **Reproducible builds.** The APK is a *deterministic* function of the public source: the same
+  commit builds to byte-identical bytes with the same SHA-256. Anyone can rebuild from the open
+  repository and confirm the released binary **is** the published code — so trust rests on the code
+  everyone can read, not on a signature. A malicious binary is caught by anyone who rebuilds.
+- **Plural attestors (K-of-N), user-chosen — the same model as moderation.** Independent maintainers
+  each attest "commit X builds to hash H." The client accepts a release backed by at least *K*
+  independent attestations, and the user chooses which attestor set to trust. No single key can push
+  an update; losing one attestor doesn't stop updates.
+- **On-chain transparency.** Release hashes + attestations are committed to the XNO ledger
+  (append-only, public), so serving *different* bytes to different users is publicly detectable — no
+  hidden, targeted update.
+- **Content-addressed serving over plural relays.** The bytes are pinned to relay caches by hash; the
+  client **re-verifies the SHA-256 on-device** before installing. A takedown of any relay doesn't
+  stop updates; a hostile relay serving wrong bytes fails the hash check.
+- **The human is the final gate.** Installs require an explicit tap; the app surfaces the version,
+  commit, and how many attestors agree. The one layer that isn't censorship-free is the OS install
+  gate itself (Android allows sideload/self-update; iOS does not) — and the app says so.
+
+**Bootstrapping honesty:** reproducible builds make the *binary* trustless relative to the source;
+a real K-of-N quorum needs several independent maintainers, so early on the attestor set is small
+(size-1 at genesis, with keys on separate devices) — but the *mechanism* is already plural, designed
+to grow into a quorum rather than to be replaced by one. The alpha ships a single content-addressed
+signer as a bootstrap; reproducible builds + the multi-attestor format are the hardening toward 1.0.
 
 ## 8. Trust roots (there are exactly three, and all are minimal)
 
 1. **Your seed** — your identity. Yours alone; back it up.
-2. **The publisher's public key** — authenticates app updates. Only the *public* address is pinned
-   in the client (verify-only); the private key is held **offline** by the maintainer and never
-   ships, so no one else can sign a release.
+2. **The release attestor set** — authenticates app updates. *Not a single key:* an update is trusted
+   when it is a **reproducible build of the public source** confirmed by a **user-chosen quorum** of
+   independent attestations, logged on-chain. Early on the quorum is small (a bootstrap), but no
+   single secret is load-bearing — the binary is verifiable from source by anyone, so this is a
+   plural, growable anchor rather than a fixed point of failure.
 3. **The rendezvous addresses** — the discovery bootstrap. *Keyless and plural* — meeting points,
    not controllers. This is the irreducible minimum every peer-to-peer system needs (Bitcoin has
    hardcoded DNS seeds); the design makes it as weak-as-possible rather than pretending it away.
@@ -158,15 +181,23 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   announcements, so a scanning client still finds real relays. ✅
 
 ### App updates — the "push malware to steal Nano" vector
-- **A relay serves a malicious APK / a forged release.** → The client accepts a release only if it is
-  **signed by the pinned publisher key** AND the downloaded APK's **SHA-256 matches the signed
-  record**, re-verified on-device. Wrong bytes → hash mismatch → rejected; forged record → wrong key
-  → ignored. ✅ (tested)
+- **A relay serves a malicious APK / a forged release.** → The bytes are **content-addressed** and
+  the **SHA-256 is re-checked on-device**; a hostile relay serving wrong bytes fails the hash. ✅
+- **A single compromised or lost signing key** (the residual single-point-of-failure). → Distribution
+  is designed to **not depend on one secret**: the APK is a **reproducible build of the public source**
+  (anyone can rebuild and verify), releases require a **user-chosen K-of-N quorum** of independent
+  attestations, and hashes are logged **on-chain** for public auditability. One compromised key can't
+  push an update; one lost key doesn't stop them. Honest bootstrap: today the quorum is size-1, but
+  the mechanism is plural by design. 🔨
+- **Confirming the APK matches the source.** → **Reproducible builds** + published SHA-256 +
+  on-chain attestations let anyone confirm the binary *is* the open code — trust in the code, not a
+  signer. 🔨 (alpha ships full source + APK SHA-256 + cert fingerprint; reproducibility is the
+  hardening step)
 - **Silent/forced install.** → Installs require an **explicit user tap**; no background auto-install. ✅
-- **Downgrade attack.** → The client keeps the **highest** valid version; an attacker can't sign a
-  higher one. ✅
-- **Can't confirm the APK matches the source.** → Full source + APK **SHA-256** + signing-cert
-  fingerprint are published; **reproducible builds** are the next step. 🗺️
+- **Downgrade attack.** → The client keeps the **highest attested** version; an attacker can't forge
+  a quorum. ✅
+- **A targeted (per-user) malicious update.** → The on-chain transparency log makes serving different
+  bytes to different users publicly detectable. 🔨
 
 ### Money (tips & settlement)
 - **A node redirects your tip to the attacker.** → **On-device signing**: you sign the exact
