@@ -9,7 +9,10 @@ xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
 key = xc.wallet_key(); acc, pub = xc.derive(key)
 ai = xc.rpc({'action': 'account_info', 'account': acc})
 funded = False
-if 'error' in ai:                                     # brand-new account → fund + open
+# Only auto-fund on the local DEV network (we hold the dev genesis key). On mainnet a new account
+# just stays unopened/zero — fine, because posting is off-chain and needs no funds.
+_dev = '127.0.0.1' in xc.R or 'localhost' in xc.R
+if _dev and 'error' in ai:                            # brand-new account → fund + open (dev only)
     sh = xc.gsend(pub, 10**30)                        # 1 XNO from genesis
     wk = xc.rpc({'action': 'work_generate', 'hash': pub})['work']
     d = xc.sign(key, '0' * 64, pub, str(10**30), sh)

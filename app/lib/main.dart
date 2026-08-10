@@ -21,10 +21,10 @@ import 'package:crypto/crypto.dart' show sha256;
 // The engine/relay endpoint. Default: the Android emulator reaches the host loopback at
 // 10.0.2.2. Runtime-configurable (Settings → Connection) so the app can point at a hosted
 // relay (e.g. a Fly.io node) — that's how a physical phone + an emulator share one network.
-const String kDefaultBase = 'http://10.0.2.2:8787';
+const String kDefaultBase = 'https://xchat-alpha-node.fly.dev'; // hosted alpha node (run your own + repoint in Settings)
 String kBase = kDefaultBase;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.0.3'; // this build; the update checker compares against the signed release
+const String kAppVersion = '0.1.0'; // this build; the update checker compares against the signed release
 // Alpha safety cap: the in-app wallet is meant to hold only a small tip float, not savings — so the
 // worst a bad app build could ever steal is small. Keep real funds in your own wallet.
 const double kWalletCapXno = 2.0;

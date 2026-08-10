@@ -34,15 +34,17 @@ source" once). **Verify it first:**
 
 ```
 sha256sum xchat-alpha.apk
-# expected: 754e745be8f079be879e0b6d4a7c1291c21bff85a6080fc05d9ac1dd87c2751c
+# expected: 47a36e2f12d6352e22b83f20dabda740bc1a6f09d14afbe2d2cc9f80908c0bdf
 ```
 
 Signing certificate SHA-256: `d3c83e1a08edc6339a95489bce6cd017e10c921272af15429aa07a9919b7788e`
 
 On first launch, **Create a new wallet** (write down the seed — it *is* your account) or restore
-an existing seed. Then set the node address in **Settings → Connection** to your node (below).
-Once updates land in-app, the app re-verifies each release's SHA-256 on-device before installing —
-no app store in the trust path.
+an existing seed — and you're on the network. Out of the box the app connects to a **hosted alpha
+node** (`https://xchat-alpha-node.fly.dev`, reading **mainnet** for discovery) so you can try it
+immediately; to be fully self-sovereign, **run your own node** (below) and repoint in
+**Settings → Connection**. Once updates land in-app, the app re-verifies each release's SHA-256
+on-device before installing — no app store in the trust path.
 
 ## Run your own node (recommended — this is the decentralized path)
 
@@ -59,6 +61,9 @@ python3 kt_server.py 8790                       # serves on 0.0.0.0:8790
 Then in the app, **Settings → Connection → Endpoint** → `http://<your-node-host>:8790`.
 All Nano key derivation, signing, and verification is done in-process with `nanopy`
 (ed25519-blake2b) — nothing to compile, nothing platform-specific.
+
+**Host it publicly** — `deploy/` has a `Dockerfile` + `fly.toml` + `entrypoint.sh` that bundle the
+node + a relay + IPFS into one image (`fly deploy`). The reference hosted node runs exactly this.
 
 ## Run your own relay
 

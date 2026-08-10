@@ -14,11 +14,16 @@ def rpc(o):
         urllib.request.Request(R, json.dumps(o).encode(),
                                {'Content-Type': 'application/json', 'User-Agent': 'xchat-node/0.1'}), timeout=30).read())
 
+IPFS_PATH = os.environ.get('IPFS_PATH', '/tmp/ipfsB')
+
 def ipfs_add(path):
     cid = subprocess.check_output(['ipfs', 'add', '-Q', '--cid-version=1', '--raw-leaves=false', path],
-                                  env={**os.environ, 'IPFS_PATH': '/tmp/ipfsB'}).decode().strip()
-    subprocess.check_output(['ipfs', 'add', '-Q', '--cid-version=1', '--raw-leaves=false', path],
-                            env={**os.environ, 'IPFS_PATH': os.path.expanduser('~/.ipfs')})
+                                  env={**os.environ, 'IPFS_PATH': IPFS_PATH}).decode().strip()
+    try:                                                   # best-effort mirror to a second repo (dev only)
+        subprocess.check_output(['ipfs', 'add', '-Q', '--cid-version=1', '--raw-leaves=false', path],
+                                env={**os.environ, 'IPFS_PATH': os.path.expanduser('~/.ipfs')})
+    except Exception:
+        pass
     return cid
 
 # ---- Nano crypto (pure Python via nanopy; ed25519-blake2b). Replaces the former native
