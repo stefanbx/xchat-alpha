@@ -100,6 +100,10 @@ chokepoint), no custodian. A tip can be split immutably on-chain between the cre
 that served the media, and whoever reposted it. Everything else — the entire social graph — never
 touches the ledger, so the network stays light no matter how busy it gets.
 
+**Minimal custody.** The in-app wallet is a *tip float*, not a bank. A safety cap (2 XNO in the
+alpha) plus an optional auto-sweep to an external savings address the app cannot spend from bound
+how much is ever at risk inside the app; your savings live in your own wallet (see §9).
+
 ## 7. Self-delivery — updates verified against public source, with no single key
 
 The app updates **itself** through its own network, and — like everything else here — the trust is
@@ -130,6 +134,31 @@ a real K-of-N quorum needs several independent maintainers, so early on the atte
 (size-1 at genesis, with keys on separate devices) — but the *mechanism* is already plural, designed
 to grow into a quorum rather than to be replaced by one. The alpha ships a single content-addressed
 signer as a bootstrap; reproducible builds + the multi-attestor format are the hardening toward 1.0.
+
+### How a release propagates — no single domain, no single pusher
+
+Two things travel separately, which is why there is no central distribution point:
+
+- **The pointer** (a few hundred bytes): the release record `{version, commit, sha256, attestations}`
+  lives **on the XNO ledger** (immutable, public — no website) and on the relays.
+- **The bytes** (the APK): **content-addressed** by hash and cached on the **relays**, plural and
+  interchangeable.
+
+The client reads the pointer from the ledger, fetches the bytes from *any* relay that has them, and
+checks the hash. It never matters *where* the bytes came from — only that they match the
+on-chain-attested hash.
+
+Nobody pushes the release to every relay. The publisher pins it to a handful they can reach; from
+there it spreads with the same gossip the content layer uses — **relay-to-relay backfill**,
+**supporter/client re-pinning** to relays that lack it, and **lazy pull-and-cache** on first request.
+More relays means more redundancy, not more coordination.
+
+And because the build is **reproducible**, the bytes are **regenerable from the public source** by
+anyone (`git checkout <commit> && ./reproduce.sh` → the same hash). So the APK is not a precious
+artifact that must flow from one origin — it can be mirrored anywhere (relays, IPFS, a git host, a
+friend's phone), every copy verifiable by the same hash. **The source repository is the real seed of
+distribution**, and git is itself distributed. A git host can vanish, any relay can be down, and the
+right code still gets out — while wrong bytes, from anywhere, are rejected by hash.
 
 ## 8. Trust roots (there are exactly three, and all are minimal)
 
@@ -200,6 +229,15 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   bytes to different users publicly detectable. 🔨
 
 ### Money (tips & settlement)
+- **A malicious app *build* steals your funds.** The app holds your key, so if poisoned code ever
+  runs it can spend whatever that key controls — **no distribution scheme cures this once it's
+  running** (true of every self-custody wallet). Two-sided defense: (1) **verified distribution** keeps
+  bad builds off your device in the first place (reproducible builds + confirmations); (2) **minimal
+  custody** bounds the damage if one slips through — the app is meant to hold only a small **tip
+  float**, enforced by a **safety cap** (2 XNO in the alpha) plus an optional **auto-sweep** that
+  forwards anything above the cap to an **external savings address the app holds no key for.** So a
+  bad build's ceiling is the small cap, never your savings — real funds stay in your own wallet.
+  ✅ (cap + auto-sweep, verified: 4.07 → 2.0 XNO, excess auto-moved out) · 🔨 (prevention side)
 - **A node redirects your tip to the attacker.** → **On-device signing**: you sign the exact
   recipient and amount locally; the node cannot alter it. 🔨
 - **Reshare-payment gaming** (reshare after a tip to claim the split). → Attribution is **locked at

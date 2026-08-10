@@ -1,6 +1,6 @@
 // ӾChat — a censorship-free X. The "Ӿ" is the XNO (Nano) symbol.
 // Identity = a Nano keypair. Feed = read from the ledger. Tips = feeless Nano.
-// Backend = a signed-events node (see backend/) reached over HTTP.
+// Backend = the Keel engine (same censorship-free stack as KeelTube).
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -25,6 +25,9 @@ const String kDefaultBase = 'http://10.0.2.2:8787';
 String kBase = kDefaultBase;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
 const String kAppVersion = '2.0.3'; // this build; the update checker compares against the signed release
+// Alpha safety cap: the in-app wallet is meant to hold only a small tip float, not savings — so the
+// worst a bad app build could ever steal is small. Keep real funds in your own wallet.
+const double kWalletCapXno = 2.0;
 const Color kAccent = Color(0xFF3E9BFF); // Nano blue
 const Color kBg = Color(0xFF000000);
 const Color kCard = Color(0xFF0A0A0A);
@@ -90,6 +93,8 @@ class Settings {
   bool notifyLike, notifyComment, notifyTip;
   int forYouFreshness;      // For You ranking: 0 = popular, 1 = balanced, 2 = latest
   bool forYouBoostFollows;  // boost posts from people you follow
+  bool autoSweep;           // auto-forward balance above the safety cap to a savings address
+  String sweepAddr;         // the external savings address (this app holds no key for it)
   Settings({
     this.defaultTip = 0.01,
     this.relaySplit = 10,
@@ -99,6 +104,8 @@ class Settings {
     this.notifyTip = true,
     this.forYouFreshness = 1,
     this.forYouBoostFollows = true,
+    this.autoSweep = false,
+    this.sweepAddr = '',
   });
   int get creatorSplit => 100 - relaySplit - reposterSplit;
 }
@@ -119,6 +126,8 @@ class SettingsStore {
         notifyTip: m['notifyTip'] ?? true,
         forYouFreshness: (m['forYouFreshness'] as num?)?.toInt() ?? 1,
         forYouBoostFollows: m['forYouBoostFollows'] ?? true,
+        autoSweep: m['autoSweep'] ?? false,
+        sweepAddr: m['sweepAddr'] ?? '',
       );
     } catch (_) {
       return Settings();
@@ -137,6 +146,8 @@ class SettingsStore {
           'notifyTip': s.notifyTip,
           'forYouFreshness': s.forYouFreshness,
           'forYouBoostFollows': s.forYouBoostFollows,
+          'autoSweep': s.autoSweep,
+          'sweepAddr': s.sweepAddr,
         }));
   }
 }
@@ -1271,7 +1282,7 @@ class _FeedScreenState extends State<FeedScreen> {
             'settled ${entries.length} creator${entries.length == 1 ? '' : 's'} in $blocks Nano block${blocks == 1 ? '' : 's'} · ⚙ PoW delegated (0 ms on device)')));
   }
 
-  // ---- reputation-weighted moderation: earned + decaying labeler weight ----
+  // ---- reputation-weighted, earned + decaying (ported from the KeelTube client) ----
   double _recency(Labeler l) {
     if (l.lastTs == 0) return 0.01;
     final now = DateTime.now().millisecondsSinceEpoch / 1000;
@@ -1971,8 +1982,80 @@ class _FeedScreenState extends State<FeedScreen> {
               ),
             ]),
             const SizedBox(height: 6),
-            const Text('dev network · valueless test tokens · feeless · PoW delegated',
-                style: TextStyle(color: kDim, fontSize: 11)),
+            Text('dev network · valueless test tokens · feeless · PoW delegated · safety cap ${kWalletCapXno.toStringAsFixed(0)} XNO',
+                style: const TextStyle(color: kDim, fontSize: 11)),
+            const SizedBox(height: 12),
+            // safety: auto-forward anything above the cap to an external savings address (app holds no key for it)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(10), border: Border.all(color: kLine)),
+              child: Column(children: [
+                Row(children: [
+                  const Icon(Icons.savings_outlined, size: 18, color: kDim),
+                  const SizedBox(width: 10),
+                  Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('Auto-move to savings', style: TextStyle(color: kText, fontSize: 13.5, fontWeight: FontWeight.w600)),
+                    Text('forward anything over ${kWalletCapXno.toStringAsFixed(0)} XNO to your own wallet',
+                        style: const TextStyle(color: kDim, fontSize: 11)),
+                  ])),
+                  Switch(
+                    value: _settings.autoSweep,
+                    activeColor: kAccent,
+                    onChanged: (v) async {
+                      if (v) {
+                        final a = _settings.sweepAddr.startsWith('nano_') ? _settings.sweepAddr : await _askSavingsAddr();
+                        if (a == null) return;
+                        await _saveSweep(on: true, addr: a);
+                      } else {
+                        await _saveSweep(on: false);
+                      }
+                      if (ctx.mounted) setSheet(() {});
+                    },
+                  ),
+                ]),
+                if (_settings.autoSweep)
+                  InkWell(
+                    onTap: () async { final a = await _askSavingsAddr(); if (a != null) { await _saveSweep(addr: a); if (ctx.mounted) setSheet(() {}); } },
+                    child: Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Row(children: [
+                        const Icon(Icons.arrow_outward, size: 13, color: kAccent),
+                        const SizedBox(width: 6),
+                        Expanded(child: Text(_settings.sweepAddr.isEmpty ? 'set savings address' : 'to ${short(_settings.sweepAddr)}',
+                            style: const TextStyle(color: kAccent, fontFamily: 'monospace', fontSize: 11))),
+                        const Icon(Icons.edit, size: 12, color: kDim),
+                      ]),
+                    ),
+                  ),
+              ]),
+            ),
+            if (xno > kWalletCapXno && !_settings.autoSweep) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                    color: const Color(0x22E0A83E),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: const Color(0xFFE0A83E))),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: const [
+                    Icon(Icons.shield_outlined, size: 16, color: Color(0xFFE0A83E)),
+                    SizedBox(width: 6),
+                    Text('Over the safety cap', style: TextStyle(color: Color(0xFFE0A83E), fontWeight: FontWeight.w800, fontSize: 13)),
+                  ]),
+                  const SizedBox(height: 4),
+                  Text('You hold ${(xno - kWalletCapXno).toStringAsFixed(2)} XNO above the cap. Move it to your own '
+                      'wallet, or turn on auto-move above so it never sits here.',
+                      style: const TextStyle(color: kDim, fontSize: 11.5, height: 1.35)),
+                  const SizedBox(height: 8),
+                  SizedBox(width: double.infinity, child: FilledButton(
+                    onPressed: () { Navigator.pop(ctx); _showSend(); },
+                    style: FilledButton.styleFrom(backgroundColor: const Color(0xFFE0A83E), foregroundColor: Colors.black),
+                    child: const Text('Move extra to my wallet', style: TextStyle(fontWeight: FontWeight.w800)),
+                  )),
+                ]),
+              ),
+            ],
             const SizedBox(height: 8),
             ListTile(
               contentPadding: EdgeInsets.zero,
@@ -2885,12 +2968,78 @@ class _FeedScreenState extends State<FeedScreen> {
       });
       _syncSupporter(); // reflect current supporter state now that the account is known
       _initProfile();   // pull our own profile (name/avatar) into the cache
+      _maybeSweep();    // keep only the safety-cap float here; forward the rest to savings
     } catch (e) {
       setState(() {
         _error = 'could not reach the ledger engine\n($kBase)';
         _loading = false;
       });
     }
+  }
+
+  // Auto-forward anything above the safety cap to the user's external savings address (which this
+  // app holds no key for), so the most a bad app build could ever touch is the small in-app float.
+  bool _sweeping = false;
+  Future<void> _maybeSweep() async {
+    if (_sweeping || !_settings.autoSweep) return;
+    final addr = _settings.sweepAddr.trim();
+    if (!addr.startsWith('nano_') || addr.length < 60 || addr == _account) return;
+    final xno = (double.tryParse(_balance) ?? 0) / 1e30;
+    final excess = xno - kWalletCapXno;
+    if (excess <= 0.0001) return;
+    _sweeping = true;
+    try {
+      final r = await Api.send(addr, excess.toStringAsFixed(6));
+      if (r != null && r['ok'] == true) {
+        await _load();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              backgroundColor: kCard,
+              content: Text('🛡 auto-moved ${excess.toStringAsFixed(2)} XNO above the cap to your savings')));
+        }
+      }
+    } catch (_) {} finally {
+      _sweeping = false;
+    }
+  }
+
+  Future<void> _saveSweep({bool? on, String? addr}) async {
+    setState(() {
+      if (on != null) _settings.autoSweep = on;
+      if (addr != null) _settings.sweepAddr = addr;
+    });
+    await SettingsStore.save(_settings);
+    _maybeSweep();
+  }
+
+  Future<String?> _askSavingsAddr() async {
+    final ctl = TextEditingController(text: _settings.sweepAddr);
+    return showDialog<String>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: kCard,
+        title: const Text('Savings address', style: TextStyle(color: kText, fontSize: 16, fontWeight: FontWeight.w800)),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('A Nano address in your OWN wallet — this app holds no key for it. Anything above the '
+              'cap is auto-sent here, so a bad app build can never touch it.',
+              style: TextStyle(color: kDim, fontSize: 12, height: 1.35)),
+          const SizedBox(height: 10),
+          TextField(controller: ctl, maxLines: 2,
+              style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 12),
+              decoration: _fieldDeco('nano_…')),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel', style: TextStyle(color: kDim))),
+          FilledButton(
+            onPressed: () {
+              final a = ctl.text.trim();
+              if (a.startsWith('nano_') && a.length >= 60 && a != _account) Navigator.pop(context, a);
+            },
+            style: FilledButton.styleFrom(backgroundColor: kAccent, foregroundColor: Colors.black),
+            child: const Text('Save')),
+        ],
+      ),
+    );
   }
 
   Future<void> _compose({Post? quotedPost}) async {
