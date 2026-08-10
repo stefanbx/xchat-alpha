@@ -4,10 +4,21 @@
 # the PUBLISHER key (a mutable head, like an author's). The app resolves the record, verifies
 # the publisher signature + hash, then installs. GitHub is a mirror, not the root of trust —
 # the signature is. Takedown of any one relay doesn't stop updates.
-# Usage: xc_release.py publish   (reads /tmp/xc_rel_{apk,version,changelog}.txt)
+# Usage: xc_release.py keygen    (create the publisher key ONCE, outside the repo)
+#        xc_release.py publish   (reads /tmp/xc_rel_{apk,version,changelog}.txt)
 #        xc_release.py check     (reads /tmp/xc_rel_current.txt  -> newest signed release)
 #        xc_release.py fetch      (reads /tmp/xc_rel_{cid,sha}.txt -> verified APK on disk)
-import json, os, sys, time, base64, hashlib, subprocess, urllib.request
+#
+# THE PUBLISHER KEY IS A SECRET, AND IT USED NOT TO BE. It was `keyof(0x99)` — a key derived from a
+# constant in this file, which anyone reading the repo could recompute. That made the whole update
+# path theatre: a stranger could sign a release record for any APK, the app would report "publisher
+# signature verified", and install it. A signature is only a root of trust if exactly one party can
+# produce it.
+#
+# So: the ACCOUNT is public and pinned (below, or via XC_PUBLISHER_ACCOUNT) and the KEY lives
+# OUTSIDE this repo — XC_PUBLISHER_KEY, or ~/.xchat/publisher.key, 0600, made by `keygen`. Only
+# `publish` needs it; `check` and `fetch` need the account alone.
+import json, os, stat, sys, time, base64, hashlib, subprocess, urllib.request
 import importlib.util
 spec = importlib.util.spec_from_file_location("xc_common", os.path.join(os.path.dirname(__file__), "xc_common.py"))
 xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
@@ -15,8 +26,10 @@ xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
 RELAYS = xc.discover_relays()
 mode = sys.argv[1] if len(sys.argv) > 1 else 'check'
 
-PUB_SEEDBYTE = 0x99                                   # the publisher identity (demo trust anchor)
-PUBLISHER = xc.acct(PUB_SEEDBYTE)                     # publisher Nano account (the app pins this)
+KEY_FILE = os.path.expanduser(os.environ.get('XC_PUBLISHER_KEY_FILE', '~/.xchat/publisher.key'))
+# The publisher account the app pins — public by nature, and safe here. Set XC_PUBLISHER_ACCOUNT to
+# override it; a network of your own has its own publisher, and pinning theirs is the whole point.
+PUBLISHER_PINNED = 'nano_3nefzmwosgqdo97pt6rzjiiazrgx5sf58eksbsbbhrmca7cg3fxisora1dp8'
 APK_OUT = '/tmp/xchat_update.apk'
 
 def rd(p, d=''):
@@ -24,6 +37,14 @@ def rd(p, d=''):
         return open(p).read().strip() or d
     except Exception:
         return d
+
+PUBLISHER = os.environ.get('XC_PUBLISHER_ACCOUNT', '') or PUBLISHER_PINNED or \
+    rd(os.path.expanduser('~/.xchat/publisher.account'))
+
+def publisher_key():
+    # the secret, from the environment or a file outside the repo — never from a constant
+    k = os.environ.get('XC_PUBLISHER_KEY', '') or rd(KEY_FILE)
+    return k if len(k) == 64 else ''
 
 def vt(s):                                            # "1.2.0" -> (1,2,0) for ordering
     try:
@@ -51,7 +72,40 @@ def post(path, obj, timeout=30):
             pass
     return ok
 
-if mode == 'publish':
+if mode == 'keygen':
+    # one publisher key, made once, kept off the network and out of the repo
+    if publisher_key():
+        json.dump({'ok': False, 'error': f'a publisher key already exists at {KEY_FILE} — refusing to '
+                   'overwrite it (delete it yourself if you really mean to rotate)'},
+                  open('/tmp/xc_release_result.json', 'w'))
+        print(f'refusing to overwrite {KEY_FILE}'); sys.exit(1)
+    os.makedirs(os.path.dirname(KEY_FILE), exist_ok=True)
+    key = os.urandom(32).hex()
+    with open(KEY_FILE, 'w') as f:
+        f.write(key + '\n')
+    os.chmod(KEY_FILE, stat.S_IRUSR | stat.S_IWUSR)     # 0600: the one copy, readable by you alone
+    addr, _pub = xc.derive(key)
+    open(os.path.expanduser('~/.xchat/publisher.account'), 'w').write(addr + '\n')
+    json.dump({'ok': True, 'account': addr, 'key_file': KEY_FILE}, open('/tmp/xc_release_result.json', 'w'))
+    print(f'publisher key written to {KEY_FILE} (0600)\n'
+          f'publisher account: {addr}\n\n'
+          f'Pin it: set PUBLISHER_PINNED in this file (or XC_PUBLISHER_ACCOUNT) to that account.\n'
+          f'BACK THE KEY UP. Lose it and you cannot sign another update; leak it and someone else can.')
+
+elif mode == 'publish':
+    key = publisher_key()
+    if not key:
+        json.dump({'ok': False, 'error': f'no publisher key (XC_PUBLISHER_KEY or {KEY_FILE}) — run '
+                   '`python3 xc_release.py keygen` first'}, open('/tmp/xc_release_result.json', 'w'))
+        print('no publisher key; run: python3 xc_release.py keygen'); sys.exit(1)
+    signer_acct = xc.derive(key)[0]
+    if PUBLISHER and signer_acct != PUBLISHER:
+        # signing with a key the app does not pin produces a record every client silently ignores
+        json.dump({'ok': False, 'error': f'this key signs as {signer_acct}, but the pinned publisher '
+                   f'is {PUBLISHER} — the app would ignore the record'},
+                  open('/tmp/xc_release_result.json', 'w'))
+        print('publisher key does not match the pinned account'); sys.exit(1)
+    PUBLISHER = PUBLISHER or signer_acct
     apk = rd('/tmp/xc_rel_apk.txt')
     version = rd('/tmp/xc_rel_version.txt', '1.0.0')
     changelog = rd('/tmp/xc_rel_changelog.txt', 'update')
@@ -64,7 +118,7 @@ if mode == 'publish':
     pinned = post('/blob', {'cid': cid, 'b64': b64})
     rec = {'publisher': PUBLISHER, 'version': version, 'cid': cid, 'sha256': sha,
            'size': size, 'changelog': changelog, 'ts': int(time.time())}
-    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.keyof(PUB_SEEDBYTE), canon(rec)))
+    d = dict(l.split(' ', 1) for l in xc._sign_lines(key, canon(rec)))
     rec['sig'] = d['sig']; rec['pub'] = d['pub']
     pushed = post('/release', rec)
     json.dump({'ok': True, 'version': version, 'cid': cid, 'size': size,
@@ -91,6 +145,13 @@ elif mode == 'fetch':
 
 else:                                                  # check: newest VALID signed release
     current = rd('/tmp/xc_rel_current.txt', '0.0.0')
+    if not PUBLISHER:
+        # NO PINNED PUBLISHER, NO UPDATES. The alternative — trusting whatever record turns up — is
+        # how a self-updating app installs a stranger's APK. Refuse rather than guess.
+        json.dump({'ok': True, 'update': False, 'publisher': '', 'current': current,
+                   'error': 'no publisher account pinned; in-app updates are off'},
+                  open('/tmp/xc_release_result.json', 'w'))
+        sys.exit()
     best = None
     seen_sigs = set()
     # RELAYS sort local (http://127.*) before the public loopback (https://*.trycloudflare),

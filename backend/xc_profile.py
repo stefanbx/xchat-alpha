@@ -28,15 +28,16 @@ def verify(pub, msg, sig):
         return False
 
 if mode == 'pub':
-    acc = xc.wallet_acct()
-    display = rd('/tmp/xc_profile_display.txt')
-    bio = rd('/tmp/xc_profile_bio.txt')
-    avatar = rd('/tmp/xc_profile_avatar.txt')
-    banner = rd('/tmp/xc_profile_banner.txt')
-    ts = int(time.time())
-    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.wallet_key(), canon(acc, ts, display, bio, avatar, banner)))
+    # The profile is ALREADY SIGNED BY THE APP (on-device). The node only verifies + relays — it
+    # holds no seed and cannot forge or alter a profile.
+    src = json.load(open('/tmp/xc_profile_rec.json'))
+    acc = src.get('account', ''); display = src.get('display', ''); bio = src.get('bio', '')
+    avatar = src.get('avatar', ''); banner = src.get('banner', '')
+    ts = src.get('ts'); sig = src.get('sig', ''); pub = src.get('pub', '')
+    if not (xc.pub_to_addr(pub) == acc and verify(pub, canon(acc, ts, display, bio, avatar, banner), sig)):
+        json.dump({'ok': False, 'error': 'bad signature'}, open('/tmp/xc_profile_result.json', 'w')); sys.exit()
     rec = {'account': acc, 'display': display, 'bio': bio, 'avatar': avatar, 'banner': banner,
-           'ts': ts, 'sig': d['sig'], 'pub': d['pub']}
+           'ts': ts, 'sig': sig, 'pub': pub}
     pushed = 0
     for r in RELAYS:
         try:

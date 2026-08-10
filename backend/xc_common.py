@@ -239,13 +239,15 @@ WALLET_FILE = ('/tmp/xc_wallet_seed_' + _NS + '.txt') if _NS else '/tmp/xc_walle
 
 # ---- the user's embedded Nano wallet (seed = the whole identity) ----
 def wallet_seed_hex():
+    # SEEDLESS NODE: there is no wallet seed on the node anymore. Kept only so any dead legacy code
+    # imports without error; it returns nothing, so the node has no key material at rest.
     try:
         s = open(WALLET_FILE).read().strip()
         if len(s) >= 64:
             return s[:64]
     except Exception:
         pass
-    return '07' * 32                                   # default = demo seed 0x07
+    return ''                                          # no baked-in seed
 
 def wallet_key():                                       # private key hex from the wallet seed (index 0)
     seed = bytes.fromhex(wallet_seed_hex())

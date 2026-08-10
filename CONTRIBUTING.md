@@ -1,8 +1,12 @@
 # Building & contributing to ӾChat
 
 Everything here is source you can build, change, and run. Contributions welcome — the roadmap
-items in the whitepaper (Linux node builds, on-device signing, multi-tenant hosting, richer
-moderation) are all good places to start.
+items in the whitepaper (hardware-backed seed storage, multi-tenant hosting, richer moderation,
+onion routing for network metadata) are all good places to start.
+
+**The one invariant:** the seed lives on the device and nowhere else. Every write is signed in the
+app (`app/lib/wallet.dart`) and the node only verifies. If a change would have the node hold, read,
+or derive a user key, it is the wrong change — and `test/` will fail it.
 
 ## Build the app (Flutter)
 
@@ -31,13 +35,36 @@ programs alongside it (`xc_feed.py`, `xc_post.py`, `xc_reldir.py`, …) — so t
 readable Python you can audit and extend. State is namespaced per instance via the `XC_NS` env
 var (defaults to the port).
 
-### Nano crypto
+### Nano crypto, and which side does what
 
-All key derivation, message/block signing, and verification is **pure Python** via
-[`nanopy`](https://pypi.org/project/nanopy/) (ed25519-blake2b) — see the crypto section at the top
-of `xc_common.py`. No native build, no platform-specific binaries; the node runs anywhere Python
-runs. Encrypted DMs use `pynacl` (X25519). If you extend the signing, keep it byte-compatible with
-Nano's scheme so existing signed content keeps verifying.
+The node **verifies**; the app **signs**. On the node, hashing, address handling and signature
+verification are pure Python via [`nanopy`](https://pypi.org/project/nanopy/) (ed25519-blake2b) —
+see the crypto section at the top of `xc_common.py`. No native build; it runs anywhere Python runs.
+In the app, the same scheme is implemented with `nanodart`, and DM sealing with `pinenacl` (X25519,
+wire-compatible with PyNaCl).
+
+Those are two independent implementations of one format, which is a real risk: a mismatch of a
+single byte rejects every write and looks like a network outage. So if you touch a canonical message
+or the signing scheme, change it on **both** sides and run:
+
+```bash
+python3 test/interop_test.py     # app-signed (Dart) → node-verified (Python), all write paths
+python3 test/e2e_test.py         # the whole thing, live, including that tampered records are refused
+cd app && flutter test           # the wallet on its own
+```
+
+## Publishing a release (maintainers)
+
+The update-signing key is a secret and must never enter this repo:
+
+```bash
+python3 backend/xc_release.py keygen    # once → ~/.xchat/publisher.key (0600) + the account to pin
+# put the printed account in PUBLISHER_PINNED in backend/xc_release.py (or XC_PUBLISHER_ACCOUNT)
+python3 backend/xc_release.py publish   # signs + pins the APK to the relays
+```
+
+Clients pin the publisher **account** and accept only records signed by it. With nothing pinned,
+in-app updates are off — refusing beats trusting whoever answers first.
 
 ## Run a relay
 
@@ -53,8 +80,11 @@ URL and announce it on-chain (see the README) so nodes discover it by scanning t
 
 ```
 app/                Flutter app (Dart) — one codebase, Android + iOS
+  lib/wallet.dart   the on-device signer: the only place a seed is ever touched
+  bin/              the signing harness the tests drive, standing in for a phone
 backend/            the node: kt_server.py + xc_*.py helpers (pure Python)
 relay/              xc_relayd.py — a relay
+test/               interop (Dart↔Python) and end-to-end tests
 docs/WHITEPAPER.md  the design, and how to verify discovery on-chain
 ```
 

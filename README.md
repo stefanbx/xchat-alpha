@@ -14,15 +14,16 @@ gate. The "Ӿ" is the XNO symbol.
 
 | Path | What it is |
 |------|------------|
-| `app/` | The Flutter app (Android/iOS one codebase) — full source |
+| `app/` | The Flutter app (Android/iOS one codebase) — full source, and the on-device signer in `lib/wallet.dart` |
 | `backend/` | The node: `kt_server.py` + the helper programs it runs. **Pure Python, any OS** |
 | `relay/` | `xc_relayd.py` — a relay. Pure Python, run one yourself |
 | `apk/` | Pre-built signed Android APK + checksums |
 | `docs/` | Whitepaper |
+| `test/` | The interop and end-to-end tests behind the "your seed never leaves" claim |
 
 ## The four layers, in one breath
 
-- **Identity** = a Nano keypair (no email, no account). Restore your seed anywhere, your account returns.
+- **Identity** = a Nano keypair (no email, no account). Restore your seed anywhere, your account returns. **The seed never leaves the phone** — the app signs everything locally and no node API will even accept one.
 - **Content** = signed events on *plural* relays. Relays verify nothing; clients verify every signature. One relay down doesn't matter.
 - **Discovery** = relays self-announce on the XNO ledger; the app finds them by scanning keyless, plural *rendezvous* accounts. No relay URL is hardcoded. (See [Verify discovery](#verify-discovery-yourself).)
 - **Settlement** = only tips touch Nano, batched and non-custodial. The whole social graph is off-chain.
@@ -34,10 +35,12 @@ source" once). **Verify it first:**
 
 ```
 sha256sum xchat-alpha.apk
-# expected: 47a36e2f12d6352e22b83f20dabda740bc1a6f09d14afbe2d2cc9f80908c0bdf
+# expected: 2ca5af0f2243a2c7d08b0eb92b4dd0a1b32ff12884247e7d299df0f8bc647421
 ```
 
-Signing certificate SHA-256: `d3c83e1a08edc6339a95489bce6cd017e10c921272af15429aa07a9919b7788e`
+Signing certificate SHA-256: `3cc918358c69a37a84be1f048dccfc3a7c1edf74f2a0790cb28b5ccacd15f393`
+(`apksigner verify --print-certs xchat-alpha.apk`). Android only installs an update over an app
+signed by the same certificate, so this fingerprint is what ties every future release to this one.
 
 On first launch, **Create a new wallet** (write down the seed — it *is* your account) or restore
 an existing seed — and you're on the network. Out of the box the app connects to a **hosted alpha
@@ -48,8 +51,8 @@ on-device before installing — no app store in the trust path.
 
 ## Run your own node (recommended — this is the decentralized path)
 
-The node is one identity per instance; your seed stays on your machine. It's **pure Python and
-runs on any OS** — no build step.
+The node holds **no seed and no identity**: it verifies signatures the app made, adds proof-of-work,
+relays bytes, and reads the ledger. It's **pure Python and runs on any OS** — no build step.
 
 ```bash
 cd backend
@@ -59,8 +62,9 @@ python3 kt_server.py 8790                       # serves on 0.0.0.0:8790
 ```
 
 Then in the app, **Settings → Connection → Endpoint** → `http://<your-node-host>:8790`.
-All Nano key derivation, signing, and verification is done in-process with `nanopy`
-(ed25519-blake2b) — nothing to compile, nothing platform-specific.
+Signature *verification*, block hashing and address handling are done in-process with `nanopy`
+(ed25519-blake2b) — nothing to compile, nothing platform-specific. *Signing* happens only in the
+app, so pointing at somebody else's node costs you nothing: it cannot post as you or spend for you.
 
 **Host it publicly** — `deploy/` has a `Dockerfile` + `fly.toml` + `entrypoint.sh` that bundle the
 node + a relay + IPFS into one image (`fly deploy`). The reference hosted node runs exactly this.
@@ -99,23 +103,36 @@ You don't have to trust us that discovery is on-chain:
 In the app, tap the **"📡 relays"** strip to see every discovered relay with its live signal
 strength and reliability, and the rendezvous it was found through.
 
-## Support development
+## Run the tests
 
-ӾChat is built in the open. If you'd like to help fund the work, XNO donations are welcome:
+The "your seed never leaves the device" claim is the one worth checking rather than believing, so
+it is what the tests are about.
 
+```bash
+cd app && flutter test                  # the wallet: derivation, canonical messages, DM sealing
+python3 test/interop_test.py            # the app's Dart signatures, verified by the node's Python
+python3 test/e2e_test.py                # a real relay + node, driven through the app's own signer
 ```
-nano_YOUR_XNO_ADDRESS_HERE
-```
 
-*(Donations are voluntary and non-custodial — they go directly to the address above.)*
+`interop_test.py` matters because the app signs with Dart (`nanodart`) and the node verifies with
+Python (`nanopy`): if those disagree by one byte, every post is rejected and it looks like a network
+fault. `e2e_test.py` checks each write path **twice** — that a correctly signed record is accepted
+and reaches the relay, and that a tampered one is refused. (Both need `nanopy`; the e2e run also
+needs `dart` on PATH and an `ipfs` daemon.)
 
 ## Security & honesty
 
 - **Alpha quality.** Don't put anything you can't afford to lose on it.
 - The app **never** sends money on your behalf; tips and any settlement are user-initiated and
   go directly wallet-to-wallet.
-- The reference backend is single-identity-per-instance; multi-tenant hosting and a fully
-  self-contained (on-device signing) app are on the roadmap.
+- **The node cannot act as you.** It holds no seed; every write is signed on the device and the
+  node only verifies, adds proof-of-work, and relays. There is no API that accepts a seed.
+- **The seed is stored in the app's private storage, which is not hardware-backed.** A rooted or
+  physically compromised phone can read it. Back up the seed; treat the phone as the weak point.
+- **In-app updates need a pinned publisher.** The update-signing key lives outside this repo
+  (`xc_release.py keygen` → `~/.xchat/publisher.key`, 0600). With no publisher account pinned, the
+  app refuses in-app updates rather than trusting an unknown signer.
+- Network metadata is not private: no onion routing yet, so treat your IP as visible.
 - The only layer that isn't censorship-free is the OS install gate (Android allows sideload/
   self-update; iOS does not) — the app tells you so.
 

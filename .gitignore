@@ -3,9 +3,17 @@ app/build/
 app/.dart_tool/
 app/.gradle/
 **/__pycache__/
-# secrets / local state — never commit
+# secrets / local state — never commit.
+# The signing keys live in ~/.xchat and are only referenced from here; these patterns are the
+# backstop for the day someone copies one into the tree "just for a second".
 *.jks
 *.keystore
+*.p12
+key.properties
+publisher.key
 relay/*.json
 *-state.json
 /tmp/
+
+# staged for the container image by deploy/deploy.sh
+deploy/app/

@@ -11,7 +11,6 @@ xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
 
 RELAYS = xc.discover_relays()
 mode = sys.argv[1] if len(sys.argv) > 1 else 'get'
-acc = xc.wallet_acct()
 
 def rd(p, d=''):
     return open(p).read().strip() if os.path.exists(p) else d
@@ -26,11 +25,14 @@ def verify(pub, msg, sig):
         return False
 
 if mode == 'vote':
-    pid = rd('/tmp/xc_poll_id.txt')
-    option = rd('/tmp/xc_poll_option.txt', '0')
-    ts = int(time.time())
-    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.wallet_key(), canon(pid, acc, option, ts)))
-    rec = {'poll_id': pid, 'account': acc, 'option': int(option), 'ts': ts, 'sig': d['sig'], 'pub': d['pub']}
+    # The vote is ALREADY SIGNED BY THE APP (on-device). The node only verifies + relays — it holds
+    # no seed and cannot forge or alter a vote.
+    rec = json.load(open('/tmp/xc_poll_rec.json'))
+    pid = rec.get('poll_id', ''); a = rec.get('account', ''); option = rec.get('option', 0)
+    ts = rec.get('ts'); sig = rec.get('sig', ''); pub = rec.get('pub', '')
+    if not (xc.pub_to_addr(pub) == a and verify(pub, canon(pid, a, option, ts), sig)):
+        json.dump({'ok': False, 'error': 'bad signature'}, open('/tmp/xc_poll_result.json', 'w')); sys.exit()
+    rec = {'poll_id': pid, 'account': a, 'option': int(option), 'ts': ts, 'sig': sig, 'pub': pub}
     pushed = 0
     for r in RELAYS:
         try:
@@ -42,6 +44,7 @@ if mode == 'vote':
     json.dump({'ok': True, 'relays': pushed, 'option': int(option)}, open('/tmp/xc_poll_result.json', 'w'))
 else:                                                  # get: merge + verify votes, tally per option
     pid = rd('/tmp/xc_poll_id.txt')
+    acc = rd('/tmp/xc_poll_acct.txt')                  # the viewer's account (from the app) — for "my vote"
     latest = {}                                        # account -> (ts, option), keeping the newest valid vote
     for r in RELAYS:
         try:

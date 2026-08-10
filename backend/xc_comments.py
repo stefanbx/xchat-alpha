@@ -11,7 +11,6 @@ xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
 
 RELAYS = xc.discover_relays()
 mode = sys.argv[1] if len(sys.argv) > 1 else 'get'
-acc = xc.wallet_acct()
 
 def rd(p, d=''):
     try:
@@ -33,14 +32,16 @@ def comment_id(post_id, account, ts):
     return f"{post_id}#{account}#{ts}"
 
 if mode == 'post':
-    post_id = rd('/tmp/xc_comment_post.txt')
-    text = rd('/tmp/xc_comment_text.txt')
-    handle = rd('/tmp/xc_comment_handle.txt', 'you.xno')
-    parent = rd('/tmp/xc_comment_parent.txt')          # parent comment cid (nested reply), else ''
-    ts = int(time.time())
-    d = dict(l.split(' ', 1) for l in xc._sign_lines(xc.wallet_key(), canon(post_id, acc, ts, text, parent)))
+    # The comment is ALREADY SIGNED BY THE APP (on-device). The node only verifies + relays — it
+    # holds no seed and cannot forge or alter a reply.
+    src = json.load(open('/tmp/xc_comment_rec.json'))
+    post_id = src.get('post_id', ''); acc = src.get('account', ''); text = src.get('text', '')
+    handle = src.get('handle', 'you.xno'); parent = src.get('parent', '')
+    ts = src.get('ts'); sig = src.get('sig', ''); pub = src.get('pub', '')
+    if not (xc.pub_to_addr(pub) == acc and verify(pub, canon(post_id, acc, ts, text, parent), sig)):
+        json.dump({"ok": False, "error": "bad signature"}, open('/tmp/xc_comments_result.json', 'w')); sys.exit()
     rec = {"post_id": post_id, "account": acc, "handle": handle, "text": text, "parent": parent,
-           "ts": ts, "sig": d['sig'], "pub": d['pub'], "cid": comment_id(post_id, acc, ts)}
+           "ts": ts, "sig": sig, "pub": pub, "cid": comment_id(post_id, acc, ts)}
     pushed = 0
     for r in RELAYS:
         try:

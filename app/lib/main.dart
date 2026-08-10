@@ -14,20 +14,28 @@ import 'package:http/http.dart' as http;
 import 'package:battery_plus/battery_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:crypto/crypto.dart' show sha256;
+import 'wallet.dart';
 
 // The engine/relay endpoint. Default: the Android emulator reaches the host loopback at
 // 10.0.2.2. Runtime-configurable (Settings → Connection) so the app can point at a hosted
 // relay (e.g. a Fly.io node) — that's how a physical phone + an emulator share one network.
 const String kDefaultBase = 'https://xchat-alpha-node.fly.dev'; // hosted alpha node (run your own + repoint in Settings)
 String kBase = kDefaultBase;
+
+// On-device signer, built from the local seed. Every write the app publishes (follows, comments,
+// polls, profile, …) is signed HERE and only the signed record is sent — the node never sees the
+// seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
+NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
 const String kAppVersion = '0.1.0'; // this build; the update checker compares against the signed release
 // Alpha safety cap: the in-app wallet is meant to hold only a small tip float, not savings — so the
 // worst a bad app build could ever steal is small. Keep real funds in your own wallet.
 const double kWalletCapXno = 2.0;
+const int kHeadTtl = 3600; // seconds a signed head stays live before it must be republished (matches the node)
 const Color kAccent = Color(0xFF3E9BFF); // Nano blue
 const Color kBg = Color(0xFF000000);
 const Color kCard = Color(0xFF0A0A0A);
@@ -62,13 +70,38 @@ class XChatApp extends StatelessWidget {
 }
 
 // ---- wallet: the seed IS the identity; stored on-device, the only backup ----
+//
+// It lives in the PLATFORM KEYSTORE (Android EncryptedSharedPreferences / iOS Keychain), not in
+// ordinary preferences. It used to be plain SharedPreferences, which is a world-readable-to-root
+// XML file: the seed never crossed the network, but anything with access to the app's data
+// directory could lift the whole identity out of it.
+//
+// Anyone who installed an earlier build still has a seed in the old place, so `get` MIGRATES it on
+// first read — copy into the keystore, then delete the plaintext copy. Skipping that step would
+// silently log every existing user out of an account only their seed can recover.
 class WalletStore {
   static const _k = 'xchat_seed';
-  static Future<String?> get() async => (await SharedPreferences.getInstance()).getString(_k);
-  static Future<void> save(String s) async =>
-      (await SharedPreferences.getInstance()).setString(_k, s);
-  static Future<void> clear() async =>
-      (await SharedPreferences.getInstance()).remove(_k);
+  // Android: EncryptedSharedPreferences, with the master key held in the Keystore. iOS: Keychain.
+  static const _secure = FlutterSecureStorage(
+      aOptions: AndroidOptions(encryptedSharedPreferences: true));
+
+  static Future<String?> get() async {
+    final s = await _secure.read(key: _k);
+    if (s != null && s.isNotEmpty) return s;
+    final prefs = await SharedPreferences.getInstance();
+    final legacy = prefs.getString(_k);
+    if (legacy == null || legacy.isEmpty) return null;
+    await _secure.write(key: _k, value: legacy);
+    await prefs.remove(_k);                       // only after the keystore copy is committed
+    return legacy;
+  }
+
+  static Future<void> save(String s) async => _secure.write(key: _k, value: s);
+
+  static Future<void> clear() async {
+    await _secure.delete(key: _k);
+    await (await SharedPreferences.getInstance()).remove(_k);
+  }
 }
 
 String genSeed() {
@@ -202,7 +235,9 @@ class _RootGateState extends State<RootGate> {
 
   Future<void> _init() async {
     final s = await WalletStore.get();
-    if (s != null) await Api.setWallet(s);
+    if (s != null) {
+      gWallet = NanoWallet(s);        // build the on-device signer; the seed is NEVER sent to the node
+    }
     setState(() {
       _seed = s;
       _loading = false;
@@ -211,12 +246,13 @@ class _RootGateState extends State<RootGate> {
 
   Future<void> _onDone(String seed) async {
     await WalletStore.save(seed);
-    await Api.setWallet(seed);
+    gWallet = NanoWallet(seed);       // seedless node: nothing to activate server-side
     setState(() => _seed = seed);
   }
 
   Future<void> _logout() async {
     await WalletStore.clear();
+    gWallet = null;
     setState(() => _seed = null);
   }
 
@@ -470,30 +506,101 @@ class Api {
         (c['relays_total'] ?? 0) as int);
   }
 
-  // settle the batched off-chain tip tally. The tip is SPLIT immutably on-chain: the
-  // creator gets the rest, the relay that served the media gets split%, and whoever
-  // reposted it gets rsplit% — split percentages come from Settings.
+  // settle the batched off-chain tip tally. The tip is SPLIT immutably on-chain: the creator gets
+  // the rest, the relay that served the media gets split%, and whoever reposted it gets rsplit%.
+  // ON-DEVICE SIGNED: the app computes the split, signs each send block locally, and the node only
+  // adds PoW + broadcasts. The seed never leaves the phone.
   static Future<Map<String, dynamic>?> settle(String to, String amount,
       {int split = 10, int rsplit = 5, String media = '', String reposter = ''}) async {
-    final r = await http.post(Uri.parse('$kBase/api/settle'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'to': to,
-          'amount': amount,
-          'split': '$split',
-          'rsplit': '$rsplit',
-          'media': media,
-          'reposter': reposter,
-        }));
+    final w = gWallet;
+    if (w == null) return null;
     try {
-      return jsonDecode(r.body);
+      final amtRaw = _xnoToRaw(amount);
+      final st = await accountState(w.account);
+      if (st == null || st['opened'] != true) return {'ok': false, 'error': 'wallet empty'};
+      if (amtRaw <= BigInt.zero || BigInt.parse('${st['balance']}') < amtRaw) {
+        return {'ok': false, 'error': 'insufficient balance'};
+      }
+      // find a relay that serves this post's media, to reward it (public read via the node)
+      String relay = '';
+      if (media.isNotEmpty) {
+        try {
+          final mr = await http.get(Uri.parse('$kBase/api/media_relay?cid=$media'));
+          relay = (jsonDecode(mr.body)['account'] as String?) ?? '';
+        } catch (_) {}
+      }
+      final sp = split.clamp(0, 50), rp = rsplit.clamp(0, 50);
+      final relayRaw = relay.isNotEmpty ? amtRaw * BigInt.from(sp) ~/ BigInt.from(100) : BigInt.zero;
+      final reposterRaw = reposter.isNotEmpty ? amtRaw * BigInt.from(rp) ~/ BigInt.from(100) : BigInt.zero;
+      final creatorRaw = amtRaw - relayRaw - reposterRaw;
+      // sequential on-device sends (each consumes the frontier)
+      final ch = await _sendRaw(w, to, creatorRaw);
+      if (relay.isNotEmpty && relayRaw > BigInt.zero) await _sendRaw(w, relay, relayRaw);
+      if (reposter.isNotEmpty && reposterRaw > BigInt.zero) await _sendRaw(w, reposter, reposterRaw);
+      return {
+        'ok': ch != null, 'to': to, 'amount': amount, 'hash': ch,
+        'creator_xno': creatorRaw / BigInt.from(10).pow(30),
+        'relay': relay.isEmpty ? null : relay, 'relay_xno': relayRaw / BigInt.from(10).pow(30),
+        'reposter': reposter.isEmpty ? null : reposter, 'reposter_xno': reposterRaw / BigInt.from(10).pow(30),
+        'split_pct': sp, 'repost_pct': rp, 'work_delegated': true,
+      };
+    } catch (e) {
+      return {'ok': false, 'error': '$e'};
+    }
+  }
+
+  // ---- on-device Nano money primitives (shared by send / settle / receive / rep-change) ----
+
+  // XNO decimal string -> raw (×10^30), exact via BigInt (a double would overflow int64 at ~1e28).
+  static BigInt _xnoToRaw(String amount) {
+    final parts = amount.trim().split('.');
+    final whole = parts[0].isEmpty ? '0' : parts[0];
+    var frac = parts.length > 1 ? parts[1] : '';
+    if (frac.length > 30) frac = frac.substring(0, 30);
+    frac = frac.padRight(30, '0');
+    return BigInt.parse(whole) * BigInt.from(10).pow(30) + BigInt.parse(frac);
+  }
+
+  // read an account's ledger state — a public RPC read (no seed): {opened, frontier, balance, representative}
+  static Future<Map<String, dynamic>?> accountState(String account) async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/account_state?account=$account'));
+      return jsonDecode(r.body) as Map<String, dynamic>;
     } catch (_) {
       return null;
     }
   }
 
+  // broadcast an app-signed state block; the node adds delegated PoW and processes it (no seed)
+  static Future<Map<String, dynamic>?> blockProcess(Map<String, dynamic> block, String subtype) async {
+    try {
+      final r = await http.post(Uri.parse('$kBase/api/block_process'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'block': block, 'subtype': subtype}));
+      return jsonDecode(r.body) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // one on-device send of a raw amount to an address; returns the block hash (null on failure)
+  static Future<String?> _sendRaw(NanoWallet w, String toAddr, BigInt raw) async {
+    final st = await accountState(w.account);
+    if (st == null || st['opened'] != true) return null;
+    final bal = BigInt.parse('${st['balance']}');
+    if (raw <= BigInt.zero || bal < raw) return null;
+    final block = w.signStateBlock(
+        previous: '${st['frontier']}', representative: '${st['representative']}',
+        balance: bal - raw, link: w.pubOf(toAddr));
+    final r = await blockProcess(block, 'send');
+    if (r?['ok'] == true) return r?['hash'] as String?;
+    return null;
+  }
+
+  // identity: the app already holds the account (on-device key); the node only reads the balance.
   static Future<Map<String, dynamic>> me() async {
-    final r = await http.get(Uri.parse('$kBase/api/me'));
+    final acct = gWallet?.account ?? '';
+    final r = await http.get(Uri.parse('$kBase/api/me?account=$acct'));
     return jsonDecode(r.body);
   }
 
@@ -508,22 +615,25 @@ class Api {
     }
   }
 
-  // set/restore the wallet on the engine from a seed (funds a new account)
-  static Future<Map<String, dynamic>?> setWallet(String seed) async {
-    try {
-      final r = await http.post(Uri.parse('$kBase/api/wallet'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'seed': seed}));
-      return jsonDecode(r.body);
-    } catch (_) {
-      return null;
-    }
-  }
+  // (Api.setWallet removed — the seed never leaves the device; there is no /api/wallet anymore.)
 
-  // republish our head so it stays live past its TTL and reaches newly-joined relays
+  // republish our head so it stays live past its TTL and reaches newly-joined relays.
+  // ON-DEVICE: fetch our current head (seq+cid), re-sign it with a fresh expiry locally, and push it
+  // via the same submit path a post uses. The seed never leaves the device.
   static Future<void> republish() async {
+    final w = gWallet;
+    if (w == null) return;
     try {
-      await http.get(Uri.parse('$kBase/api/republish'));
+      final hr = await http.get(Uri.parse('$kBase/api/head?account=${w.account}'));
+      final head = (jsonDecode(hr.body)['head'] as Map?)?.cast<String, dynamic>();
+      if (head == null) return;                            // nothing posted yet — nothing to refresh
+      final seq = head['seq'] as int, cid = '${head['cid']}';
+      final expires = DateTime.now().millisecondsSinceEpoch ~/ 1000 + kHeadTtl;
+      final hs = w.signMsg(w.headMsg(seq, cid, expires));
+      await http.post(Uri.parse('$kBase/api/post_submit'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'author': w.account, 'handle': '${head['handle'] ?? 'you.xno'}',
+                            'seq': seq, 'cid': cid, 'expires': expires, 'sig': hs['sig'], 'pub': hs['pub']}));
     } catch (_) {}
   }
 
@@ -645,107 +755,218 @@ class Api {
     return out;
   }
 
-  // returns the new post's id (empty string on failure) so a thread can chain reply_to
-  static Future<String> post(String text, {String media = '', String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = ''}) async {
-    final r = await http.post(Uri.parse('$kBase/api/post'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'text': text, 'media': media, 'mediakind': mediaKind, 'quote': quote, 'reply_to': replyTo, 'title': title, 'poll': poll}));
+  // returns the new post's id (empty string on failure) so a thread can chain reply_to.
+  // ON-DEVICE SIGNED, two-step: (1) sign the post event locally + POST it to /api/post_prepare — the
+  // node assembles the thread, pins it, and returns the content CID + head seq; (2) sign the head
+  // "account|seq|cid|expires" locally + POST to /api/post_submit — the node verifies + gossips it.
+  // The seed never leaves the device; the node only assembles content and relays signed records.
+  static Future<String> post(String text, {String handle = 'you.xno', String media = '', String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = ''}) async {
+    final w = gWallet;
+    if (w == null) return '';
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final mk = (mediaKind == 'photo' || mediaKind == 'movie') ? mediaKind : 'movie';
+    final kind = poll.isNotEmpty ? 'poll' : (title.isNotEmpty ? 'article' : (media.isNotEmpty ? mk : 'post'));
+    final id = 'u$ts';
+    final pollOpts = poll.isEmpty ? <String>[] : poll.split('|').where((o) => o.trim().isNotEmpty).toList();
+    final es = w.signMsg(w.postEventMsg(handle, kind, text, ts));   // sign the post event on-device
     try {
-      final d = jsonDecode(r.body);
-      return d['ok'] == true ? (d['post']?['id'] ?? 'ok') as String : '';
+      // 1) prepare — node verifies the event, builds + pins the thread, returns the CID/seq to sign
+      final pr = await http.post(Uri.parse('$kBase/api/post_prepare'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'id': id, 'handle': handle, 'account': w.account, 'kind': kind, 'text': text,
+                            'ts': ts, 'media': media, 'title': title, 'quote': quote, 'reply_to': replyTo,
+                            'poll': pollOpts, 'sig': es['sig'], 'pub': es['pub']}));
+      final pj = jsonDecode(pr.body);
+      if (pj['ok'] != true) return '';
+      final seq = pj['seq'] as int, expires = pj['expires'] as int;
+      final cid = pj['cid'] as String;
+      // 2) submit — sign the head over the returned CID on-device, node verifies + gossips
+      final hs = w.signMsg(w.headMsg(seq, cid, expires));
+      final sr = await http.post(Uri.parse('$kBase/api/post_submit'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'author': w.account, 'handle': handle, 'seq': seq, 'cid': cid,
+                            'expires': expires, 'sig': hs['sig'], 'pub': hs['pub']}));
+      return jsonDecode(sr.body)['ok'] == true ? id : '';
     } catch (_) {
       return '';
     }
   }
 
-  // wallet: send Nano to any address (dev network, feeless, PoW delegated)
+  // wallet: send Nano to any address (dev network, feeless, PoW delegated).
+  // ON-DEVICE SIGNED: builds + signs the send block locally; the node only adds PoW + broadcasts.
   static Future<Map<String, dynamic>?> send(String to, String amount) async {
+    final w = gWallet;
+    if (w == null) return null;
     try {
-      final r = await http.post(Uri.parse('$kBase/api/send'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'to': to, 'amount': amount}));
-      return jsonDecode(r.body);
-    } catch (_) {
-      return null;
+      final amtRaw = _xnoToRaw(amount);
+      final hash = await _sendRaw(w, to, amtRaw);
+      if (hash != null) return {'ok': true, 'to': to, 'amount': amount, 'hash': hash};
+      final st = await accountState(w.account);
+      final bal = st == null ? BigInt.zero : BigInt.parse('${st['balance'] ?? '0'}');
+      return {'ok': false, 'to': to, 'amount': amount,
+              'error': (st?['opened'] != true) ? 'wallet empty' : (bal < amtRaw ? 'insufficient balance' : 'send failed')};
+    } catch (e) {
+      return {'ok': false, 'to': to, 'amount': amount, 'error': '$e'};
     }
   }
 
-  // wallet: claim any pending receivable blocks into the account
+  // wallet: claim any pending receivable blocks into the account.
+  // ON-DEVICE SIGNED: each receive/open block is built + signed locally, sequentially.
   static Future<Map<String, dynamic>?> receive() async {
+    final w = gWallet;
+    if (w == null) return null;
+    int received = 0;
     try {
-      final r = await http.get(Uri.parse('$kBase/api/receive'));
-      return jsonDecode(r.body);
-    } catch (_) {
-      return null;
-    }
+      final rc = await http.get(Uri.parse('$kBase/api/receivables?account=${w.account}'));
+      final list = ((jsonDecode(rc.body)['receivables'] as List?) ?? []).cast<Map<String, dynamic>>();
+      for (final item in list) {
+        final srcHash = '${item['hash']}';                 // the send block we're receiving
+        final amt = BigInt.parse('${item['amount']}');
+        final st = await accountState(w.account);
+        if (st == null) break;
+        final opened = st['opened'] == true;
+        final prev = opened ? '${st['frontier']}' : '0' * 64;
+        final rep = opened ? '${st['representative']}' : w.account;   // self-represent on open
+        final bal = opened ? BigInt.parse('${st['balance']}') : BigInt.zero;
+        final block = w.signStateBlock(previous: prev, representative: rep, balance: bal + amt, link: srcHash);
+        final r = await blockProcess(block, opened ? 'receive' : 'open');
+        if (r?['ok'] == true) received++;
+      }
+    } catch (_) {}
+    final st = await accountState(w.account);
+    return {'ok': true, 'received': received, 'balance': st?['balance'] ?? '0'};
   }
 
-  // wallet: read the account's current Nano representative
+  // wallet: read the account's current Nano representative (public RPC read)
   static Future<Map<String, dynamic>?> repGet() async {
-    try {
-      final r = await http.get(Uri.parse('$kBase/api/rep_get'));
-      return jsonDecode(r.body);
-    } catch (_) {
-      return null;
-    }
+    final w = gWallet;
+    if (w == null) return null;
+    final st = await accountState(w.account);
+    if (st == null) return null;
+    final rep = st['representative'] as String?;
+    return {'ok': true, 'account': w.account, 'representative': rep, 'self': rep == w.account};
   }
 
-  // wallet: change the representative (a change block — no value moves)
+  // wallet: change the representative (a change block — no value moves).
+  // ON-DEVICE SIGNED: builds + signs the change block locally; the node only adds PoW + broadcasts.
   static Future<Map<String, dynamic>?> repSet(String rep) async {
+    final w = gWallet;
+    if (w == null) return null;
     try {
-      final r = await http.post(Uri.parse('$kBase/api/rep_set'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'representative': rep}));
-      return jsonDecode(r.body);
-    } catch (_) {
-      return null;
+      w.pubOf(rep);                                        // validate the nano_ address shape
+      final st = await accountState(w.account);
+      if (st == null || st['opened'] != true) {
+        return {'ok': false, 'error': 'account not opened yet — receive some XNO first'};
+      }
+      final bal = BigInt.parse('${st['balance']}');
+      final block = w.signStateBlock(previous: '${st['frontier']}', representative: rep, balance: bal, link: '0' * 64);
+      final r = await blockProcess(block, 'change');
+      return {'ok': r?['ok'] == true, 'representative': rep, 'hash': r?['hash'], 'error': r?['error']};
+    } catch (e) {
+      return {'ok': false, 'representative': rep, 'error': '$e'};
     }
   }
 
   // portable follows: publish the signed follow-list to relays (survives a restore)
-  static Future<void> followsSet(String csv) async {
+  // on-device signed: the app builds + signs the follow record; the node only verifies + relays.
+  static Future<void> followsPub(Map<String, dynamic> rec) async {
     try {
       await http.post(Uri.parse('$kBase/api/follows_set'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'follows': csv}));
+          headers: {'Content-Type': 'application/json'}, body: jsonEncode(rec));
     } catch (_) {}
   }
 
   // polls: read the signed, per-account tally / cast a vote
   static Future<Map<String, dynamic>?> pollGet(String pollId) async {
+    final acct = gWallet?.account ?? '';
     try {
-      final r = await http.get(Uri.parse('$kBase/api/poll_get?poll=$pollId'));
+      final r = await http.get(Uri.parse('$kBase/api/poll_get?poll=$pollId&account=$acct'));
       return jsonDecode(r.body);
     } catch (_) {
       return null;
     }
   }
 
+  // on-device signed: the app signs the vote locally; the node only verifies + relays.
   static Future<void> pollVote(String pollId, int option) async {
+    final w = gWallet;
+    if (w == null) return;
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final s = w.signMsg(w.pollMsg(pollId, '$option', ts));
     try {
       await http.post(Uri.parse('$kBase/api/poll_vote'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'poll_id': pollId, 'option': '$option'}));
+          body: jsonEncode({'poll_id': pollId, 'account': w.account, 'option': option,
+                            'ts': ts, 'sig': s['sig'], 'pub': s['pub']}));
     } catch (_) {}
   }
 
-  // encrypted DMs: send (engine encrypts with the recipient's published X25519 key)
-  static Future<Map<String, dynamic>?> dmSend(String to, String text) async {
+  // publish our SIGNED DM public-key record so peers can encrypt to us (idempotent; call on boot)
+  static Future<void> dmKeyRegister() async {
+    final w = gWallet;
+    if (w == null) return;
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final s = w.signMsg(w.dmKeyMsg(ts, w.dmPub));
     try {
-      final r = await http.post(Uri.parse('$kBase/api/dm_send'),
+      await http.post(Uri.parse('$kBase/api/dm_key_set'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'to': to, 'text': text}));
-      return jsonDecode(r.body);
+          body: jsonEncode({'account': w.account, 'dm_pk': w.dmPub, 'ts': ts, 'sig': s['sig'], 'pub': s['pub']}));
+    } catch (_) {}
+  }
+
+  // fetch + verify a peer's DM public key (signed by their Nano key)
+  static Future<String?> dmKeyGet(String account) async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/dm_key_get?account=$account'));
+      return jsonDecode(r.body)['dm_pk'] as String?;
     } catch (_) {
       return null;
     }
   }
 
-  // encrypted DMs: the decrypted inbox, grouped into conversations
-  static Future<List<Map<String, dynamic>>> dmInbox() async {
+  // encrypted DMs: seal ON-DEVICE (NaCl crypto_box), relay only the ciphertext — the node never
+  // sees plaintext or any secret.
+  static Future<Map<String, dynamic>?> dmSend(String to, String text) async {
+    final w = gWallet;
+    if (w == null) return null;
+    final peer = await dmKeyGet(to);
+    if (peer == null) return {'ok': false, 'error': 'recipient has not enabled DMs yet'};
+    final ct = w.dmSeal(peer, text);
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     try {
-      final r = await http.get(Uri.parse('$kBase/api/dm_inbox'));
-      return ((jsonDecode(r.body)['conversations'] as List?) ?? []).cast<Map<String, dynamic>>();
+      final r = await http.post(Uri.parse('$kBase/api/dm_send'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'to': to, 'from': w.account, 'from_pk': w.dmPub, 'to_pk': peer, 'ct': ct, 'ts': ts}));
+      return {'ok': jsonDecode(r.body)['ok'] == true, 'ts': ts};
+    } catch (_) {
+      return {'ok': false, 'error': 'send failed'};
+    }
+  }
+
+  // encrypted DMs: fetch RAW ciphertext records, DECRYPT ON-DEVICE, group into conversations
+  static Future<List<Map<String, dynamic>>> dmInbox() async {
+    final w = gWallet;
+    if (w == null) return [];
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'));
+      final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
+      final convos = <String, List<Map<String, dynamic>>>{};
+      for (final m in dms) {
+        final outgoing = m['from'] == w.account;
+        final peerAcc = '${outgoing ? m['to'] : m['from']}';
+        final peerPk = '${outgoing ? m['to_pk'] : m['from_pk']}';
+        final plain = w.dmOpen(peerPk, '${m['ct']}');      // decrypts locally; null if not ours
+        if (plain == null) continue;
+        (convos[peerAcc] ??= []).add({'from': m['from'], 'outgoing': outgoing, 'text': plain, 'ts': m['ts']});
+      }
+      for (final lst in convos.values) {
+        lst.sort((a, b) => (a['ts'] as int).compareTo(b['ts'] as int));
+      }
+      final out = convos.entries
+          .map((e) => {'peer': e.key, 'messages': e.value, 'last_ts': e.value.last['ts']})
+          .toList();
+      out.sort((a, b) => (b['last_ts'] as int).compareTo(a['last_ts'] as int));
+      return out.cast<Map<String, dynamic>>();
     } catch (_) {
       return [];
     }
@@ -761,11 +982,17 @@ class Api {
     }
   }
 
+  // on-device signed: the app signs the profile record locally; the node only verifies + relays.
   static Future<Map<String, dynamic>?> profileSet(String display, String bio, String avatar, String banner) async {
+    final w = gWallet;
+    if (w == null) return null;
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final s = w.signMsg(w.profileMsg(ts, display, bio, avatar, banner));
     try {
       final r = await http.post(Uri.parse('$kBase/api/profile_set'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'display': display, 'bio': bio, 'avatar': avatar, 'banner': banner}));
+          body: jsonEncode({'account': w.account, 'display': display, 'bio': bio, 'avatar': avatar,
+                            'banner': banner, 'ts': ts, 'sig': s['sig'], 'pub': s['pub']}));
       return jsonDecode(r.body);
     } catch (_) {
       return null;
@@ -794,11 +1021,17 @@ class Api {
     }
   }
 
+  // on-device signed: the app signs the reply locally; the node only verifies + relays.
   static Future<Map<String, dynamic>?> comment(String postId, String text, String handle, {String parent = ''}) async {
+    final w = gWallet;
+    if (w == null) return null;
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final s = w.signMsg(w.commentMsg(postId, ts, text, parent));
     try {
       final r = await http.post(Uri.parse('$kBase/api/comment_post'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'post_id': postId, 'text': text, 'handle': handle, 'parent': parent}));
+          body: jsonEncode({'post_id': postId, 'account': w.account, 'handle': handle, 'text': text,
+                            'parent': parent, 'ts': ts, 'sig': s['sig'], 'pub': s['pub']}));
       return jsonDecode(r.body);
     } catch (_) {
       return null;
@@ -834,9 +1067,9 @@ class Api {
     }
   }
 
-  static Future<List<String>> followsGet() async {
+  static Future<List<String>> followsGet(String account) async {
     try {
-      final r = await http.get(Uri.parse('$kBase/api/follows_get'));
+      final r = await http.get(Uri.parse('$kBase/api/follows_get?account=$account'));
       final f = jsonDecode(r.body)['follows'];
       if (f is List) return f.map((e) => '$e').where((e) => e.isNotEmpty).toList();
       if (f is String && f.isNotEmpty) return f.split(',').where((e) => e.isNotEmpty).toList();
@@ -1022,6 +1255,7 @@ class FeedScreen extends StatefulWidget {
 }
 
 class _FeedScreenState extends State<FeedScreen> {
+  NanoWallet? _wallet; // on-device signer, built from the local seed — never sent to the node
   List<Post> _posts = [];
   List<Labeler> _labelers = [];
   final Set<String> _shown = {}; // posts the viewer chose to reveal
@@ -1067,12 +1301,12 @@ class _FeedScreenState extends State<FeedScreen> {
   @override
   void initState() {
     super.initState();
+    _bootWallet();
     _load();
     _initDevice();
     SettingsStore.get().then((s) {
       if (mounted) setState(() => _settings = s);
     });
-    _initFollows();
     _initProfile();
     MuteStore.get().then((m) { if (mounted) setState(() => _muted = m); });
     BlockStore.get().then((b) { if (mounted) setState(() => _blocked = b); });
@@ -1791,12 +2025,22 @@ class _FeedScreenState extends State<FeedScreen> {
         content: Text('flagged & hidden from your feed — fed to reputation-weighted moderation (reversible)')));
   }
 
+  // build the on-device signer from the local seed, then load follows (needs the account).
+  Future<void> _bootWallet() async {
+    final seed = await WalletStore.get();
+    if (seed != null && mounted) setState(() => _wallet = NanoWallet(seed));
+    Api.dmKeyRegister();   // publish our signed DM public key so peers can encrypt to us
+    _initFollows();
+  }
+
   // load local follows, then merge the portable (signed, relay-published) list so a
   // restore on another phone brings the graph back. Republish the union.
   Future<void> _initFollows() async {
     final local = await FollowStore.get();
     if (mounted) setState(() => _follows = local);
-    final remote = (await Api.followsGet()).toSet();
+    final acc = _wallet?.account;
+    if (acc == null) return;
+    final remote = (await Api.followsGet(acc)).toSet();
     if (remote.isEmpty) return;
     final union = {...local, ...remote};
     if (union.length != local.length) {
@@ -1805,9 +2049,15 @@ class _FeedScreenState extends State<FeedScreen> {
     }
   }
 
-  void _publishFollows() {
-    FollowStore.save(_follows);
-    Api.followsSet(_follows.join(',')); // signed head on relays — portable across devices
+  // on-device signed: the app signs the follow list locally; the node only verifies + relays.
+  Future<void> _publishFollows() async {
+    await FollowStore.save(_follows);
+    final w = _wallet;
+    if (w == null) return;
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final follows = _follows.toList()..sort();
+    final s = w.signMsg(w.followMsg(ts, follows));
+    await Api.followsPub({'account': w.account, 'follows': follows, 'ts': ts, 'sig': s['sig'], 'pub': s['pub']});
   }
 
   void _toggleFollow(String account) {
@@ -2568,8 +2818,7 @@ class _FeedScreenState extends State<FeedScreen> {
                   if (!url.startsWith('http')) return;
                   kBase = url;
                   await (await SharedPreferences.getInstance()).setString('xchat_endpoint', url);
-                  final seed = await WalletStore.get();
-                  if (seed != null) await Api.setWallet(seed); // re-activate wallet on the new node
+                  // seedless node: nothing to activate — the app keeps the key, the node just relays.
                   if (!mounted) return;
                   Navigator.pop(context);
                   await _load();
@@ -3066,7 +3315,7 @@ class _FeedScreenState extends State<FeedScreen> {
     String prev = '';
     bool ok = true;
     for (int i = 0; i < res.segments.length; i++) {
-      final id = await Api.post(res.segments[i],
+      final id = await Api.post(res.segments[i], handle: _handle,
           media: i == 0 ? mediaCid : '', mediaKind: i == 0 ? res.mediaKind : '',
           quote: i == 0 ? res.quote : '', replyTo: i == 0 ? '' : prev,
           title: i == 0 ? res.title : '',
@@ -3887,9 +4136,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
                   child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Transform.translate(
-                      offset: const Offset(0, -34),
-                      child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                    const SizedBox(height: 14),
+                    Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
                         Container(
                           padding: const EdgeInsets.all(3),
                           decoration: const BoxDecoration(color: kBg, shape: BoxShape.circle),
@@ -3924,11 +4172,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20))),
                               child: Text(widget.isFollowing ? 'Following' : 'Follow', style: const TextStyle(fontWeight: FontWeight.w800))),
                         ],
-                      ]),
-                    ),
-                    Transform.translate(
-                      offset: const Offset(0, -22),
-                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    ]),
+                    const SizedBox(height: 12),
+                    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                         Row(children: [
                           Text(name, style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 20)),
                           const SizedBox(width: 6),
@@ -3947,15 +4193,12 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           const SizedBox(width: 20),
                           _count(mine.length, 'Posts'),
                         ]),
-                      ]),
-                    ),
-                    Transform.translate(
-                      offset: const Offset(0, -8),
-                      child: Row(children: [
-                        _tabBtn('Posts', 0),
-                        _tabBtn('Media', 1),
-                      ]),
-                    ),
+                    ]),
+                    const SizedBox(height: 10),
+                    Row(children: [
+                      _tabBtn('Posts', 0),
+                      _tabBtn('Media', 1),
+                    ]),
                   ]),
                 ),
               ),
@@ -4037,11 +4280,6 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
       if (p.account == account) s += ((widget.engage[p.id]?['tips_xno'] ?? 0) as num).toDouble();
     }
     return s;
-  }
-
-  Map<String, dynamic> _pe(String pid) {
-    final e = widget.engage[pid];
-    return e is Map ? Map<String, dynamic>.from(e) : {};
   }
 
   Widget _card(Post p) => widget.cardBuilder(p); // reuse the parent's fully-wired card (quote/thread/etc)
