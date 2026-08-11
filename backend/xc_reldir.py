@@ -110,11 +110,8 @@ def engine():  # machine-readable form for the engine's /api/relaydir endpoint
            'active': active,                            # relays this node reads from right now
            'source': 'xno-scan' if onchain else ('bootstrap' if active else 'none'),
            'health': health}
-    if onchain:
-        try:
-            open('/tmp/xchat_bootstrap.txt', 'w').write('\n'.join(onchain) + '\n')
-        except Exception:
-            pass
+    # NB: do NOT overwrite the bootstrap file with only the ledger set — that would drop this node's
+    # own co-located relay. onchain_relays() already caches the discovered set; _bootstrap unions them.
     with open('/tmp/xc_relaydir.json', 'w') as f:
         json.dump(doc, f)
     print(json.dumps(doc))

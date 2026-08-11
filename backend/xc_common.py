@@ -391,20 +391,16 @@ def known_relays():  # the persisted list — used to reconnect directly before 
 # relay URL, no directory owner) -> the persisted "known relays" list (resilient reconnect if a scan
 # momentarily fails) -> an explicit override file / env -> the local dev relays.
 def _bootstrap():
-    oc = onchain_relays()
-    if oc:
-        return oc
-    known = known_relays()
-    if known:
-        return known
+    # UNION of every source, ledger first — a node keeps its own co-located relay AND adds the ones
+    # it discovers on-chain, instead of a discovery replacing (and starving) the local set.
+    s = list(onchain_relays()) + list(known_relays())
     try:
-        f = [l.strip() for l in open('/tmp/xchat_bootstrap.txt') if l.strip()]
-        if f:
-            return f
+        s += [l.strip() for l in open('/tmp/xchat_bootstrap.txt') if l.strip()]
     except Exception:
         pass
-    env = [u for u in os.environ.get('XCHAT_BOOTSTRAP', '').split(',') if u]
-    return env or ['http://127.0.0.1:7401', 'http://127.0.0.1:7402', 'http://127.0.0.1:7403']
+    s += [u for u in os.environ.get('XCHAT_BOOTSTRAP', '').split(',') if u]
+    s = [u.rstrip('/') for u in dict.fromkeys(s) if u]
+    return s or ['http://127.0.0.1:7401', 'http://127.0.0.1:7402', 'http://127.0.0.1:7403']
 BOOTSTRAP = _bootstrap()
 HEAD_TTL = 3600                          # a head is live for this long; must be republished
 
