@@ -49,6 +49,17 @@ ts, sig}`) that points to their current content, addressed by hash (CID). Heads 
 - Encrypted 1:1 DMs use a separate X25519 keypair derived from the same seed; relays hold only
   ciphertext.
 
+**Retention — a relay is a cache, not an archive.** A head expires on a TTL (its author republishes
+it while active); content blobs (media) are held under a byte cap and evicted **value-weighted**:
+under memory pressure a relay drops the *least-valuable* content first — old and untipped before
+tipped, well-tipped content last — so a relay can never grow without bound, yet it keeps what the
+network values. A blob's value is the tip total of the post that carries it, propagated with the
+content. Availability is therefore **economic, not eternal**: content survives because it is worth
+keeping, and **pay-to-pin** (§6) lets anyone pay a relay to protect a specific item from eviction for
+a span proportional to the amount. Content nobody values and nobody pins is eventually dropped — the
+honest alternative to unbounded storage or a central archive. (Popular content is also *replicated*
+to more relays; the weak stays single-copy; nothing is force-kept.)
+
 Because authenticity comes from the signature rather than from *where* the bytes came from,
 content is host-independent by construction.
 
@@ -92,13 +103,26 @@ a *reputation-weighted* threshold **it chooses** to hide or flag content. Differ
 trust different labelers; nothing is ever deleted from the network — "Show anyway" always reveals.
 This is subjective, user-controlled moderation, not global censorship.
 
-## 6. Funding — batched, non-custodial tips
+## 6. Funding — tips reward creators, pay-to-pin keeps content alive
 
-The only value that touches Nano is **tips**, and they are **batched**: the client tallies tips
+Two — and only two — kinds of value touch Nano, and they are **different flows to different parties**:
+
+**Tips** reward the **creator** (to their wallet). They are **batched**: the client tallies tips
 off-chain and settles the total in one **direct** send per creator — no payment-channel hub (a
-chokepoint), no custodian. A tip can be split immutably on-chain between the creator, the relay
-that served the media, and whoever reposted it. Everything else — the entire social graph — never
-touches the ledger, so the network stays light no matter how busy it gets.
+chokepoint), no custodian. A tip can be split immutably on-chain between the creator, the relay that
+served the media, and whoever reposted it. (A tip is refused if the wallet can't cover it, so a tally
+is never a promise the network can't keep.)
+
+**Pay-to-pin** pays a **relay** to *keep content alive*. A pinner sends a small XNO amount to a
+relay's own account; the relay verifies that payment on-chain — a public ledger read, so it never
+holds a key or moves funds — and protects that CID from eviction for a duration proportional to the
+amount (each payment consumed once). This makes availability a **market**: valued content is paid to
+persist; unpaid content evicts (§3). An author can pin their own posts to outlive their activity; a
+fan can pin content they want kept. Even without an explicit pin, eviction is value-weighted by tips,
+so popular content survives longer for free.
+
+Everything else — the entire social graph — never touches the ledger, so the network stays light no
+matter how busy it gets.
 
 **Minimal custody.** The in-app wallet is a *tip float*, not a bank. A safety cap (2 XNO in the
 alpha) plus an optional auto-sweep to an external savings address the app cannot spend from bound
@@ -263,6 +287,12 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
 ### Denial of service
 - **Spam floods relays.** → Signed events tie spam to a key (block/mute it); relay-side rate limits
   and optional proof-of-work on posts are 🗺️.
+- **Storage exhaustion — flood a relay with content until it falls over.** → A relay is a **cache,
+  not an archive**: heads expire on a TTL, and content blobs are held under a byte cap and evicted
+  **value-weighted** (old + untipped first, tipped and pay-to-pinned last), so no amount of unpaid
+  content can grow a relay without bound. Keeping content alive costs XNO (§6), which prices the
+  attack. Read/aggregation load is bounded per node (a short feed cache) and scales by adding nodes
+  and relays; measured capacity and the scaling path are in `docs/SCALING.md`.
 
 **The irreducible trust roots stay three:** your seed (on your device), the publisher's *public*
 key (pinned, verify-only), and the rendezvous addresses (keyless, plural). Everything else is
@@ -276,9 +306,9 @@ derived, signed, replicated, and swappable.
         ▼
    backend node (Python, pure, any OS) ──► reads the XNO ledger ──► discovers relays
         │                                     (scan keyless rendezvous)
-        └─ forwards signed events to ──► plural relays  (signed bytes + blob cache)
+        └─ forwards signed events to ──► plural relays  (cache: byte-cap + value-weighted eviction)
                                               ▲
-                    tips settle ──► Nano ledger (batched, direct, signed on-device)
+       tips → creators · pay-to-pin → relays ──► Nano ledger (batched, direct, signed on-device)
 ```
 
 **Your key never leaves your device.** The app signs every post, event, and tip locally; the node
@@ -292,8 +322,13 @@ because none of them ever hold a key. The node is pure Python and runs on any OS
 This is an **alpha**.
 
 **Done.** The node is **pure Python** (`nanopy` ed25519-blake2b) and runs on any OS. Relay discovery
-is **verified against the live mainnet ledger** (read path). The self-update path is signature +
-on-device SHA-256 verified. And the two items this section used to list as pending are now shipped:
+is **verified end-to-end against the live mainnet ledger**: a second independent relay was announced
+on-chain (operator-signed, URL committed in the block) and a fresh install **discovered it by itself
+at first load** — no hardcoded URL. The **money paths are verified live on mainnet**: a real receive
+(on-device-signed open block, delegated PoW), a real creator settlement, and **pay-to-pin** (a relay
+confirmed a real payment on-chain and protected the content from eviction). The self-update path is
+signature + on-device SHA-256 verified. And the two items this section used to list as pending are
+now shipped:
 
 - **On-device signing, everywhere.** Every write path — posts and their heads, comments, follows,
   profiles, poll votes, DM keys, and every Nano state block (send, receive, open, change) — is
@@ -305,6 +340,10 @@ on-device SHA-256 verified. And the two items this section used to list as pendi
   used to be derived from a constant in the source, which meant anyone could sign a release the app
   would accept; with no publisher pinned, in-app updates now refuse to run rather than trust a
   record from a stranger.
+- **Bounded, economic availability.** Relays are caches with a byte cap and **value-weighted
+  eviction** (old + untipped dropped first), and **pay-to-pin** lets anyone pay a relay to keep a
+  specific item — verified on-chain, no key held by the relay. So storage can't grow without bound,
+  and content survives because it is valued, not because a host promises to keep it forever.
 
 **How that claim is tested.** `test/interop_test.py` signs one canonical message per write path with
 the *shipped* app wallet (Dart/nanodart) and verifies each with the *shipped* node verifier
