@@ -7,7 +7,7 @@
 # Wallet state is namespaced per instance (XC_NS = port): one node = one identity ("run your own node").
 #
 #   python3 kt_server.py 8790            # serve on :8790 (binds 0.0.0.0 so a phone/relay can reach it)
-import os, sys, json, subprocess, urllib.parse, urllib.request
+import os, sys, json, subprocess, urllib.parse, urllib.request, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,8 +69,23 @@ def api_me(acct):
             bal = '0'
     return json.dumps({'handle': 'you.xno', 'account': acct, 'balance': bal})
 
+# The feed aggregation (spawn a helper, pull every relay, verify sigs) is far too heavy to run per
+# request — that made /api/feed the whole node's bottleneck (~4 req/s). Cache it for a few seconds:
+# clients read the cached JSON, and at most one thread re-aggregates per window (others serve stale
+# rather than pile on). A social feed being a few seconds behind is invisible; the throughput is not.
+FEED_TTL = float(os.environ.get('XC_FEED_TTL', '5'))
+_feed_ts = [0.0]
+_feed_lock = threading.Lock()
+
 def api_feed():
-    spawn('xc_feed.py')
+    now = time.time()
+    if (now - _feed_ts[0] > FEED_TTL or not os.path.exists('/tmp/xc_feed_agg.json')) \
+            and _feed_lock.acquire(blocking=False):
+        try:
+            _feed_ts[0] = now                                # claim the window before the slow spawn
+            spawn('xc_feed.py')
+        finally:
+            _feed_lock.release()
     content = read('/tmp/xc_feed_agg.json', '{}')
     blocks = read('/tmp/xc_onchain_count.txt', '0') or '0'
     return ('{"onchain_blocks":' + blocks +
