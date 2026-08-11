@@ -39,21 +39,35 @@ for r in RELAYS:
     except Exception:
         pass
 
-cids = set()
-for h in best.values():
-    cids.add(h['cid'])                                   # the thread JSON
+# Carry the post's VALUE (tips) with each blob, so the relay's value-weighted eviction keeps the
+# tipped and drops the old + untipped. Tip totals per post, aggregated across relays (max wins).
+engage = {}
+for r in RELAYS:
+    try:
+        e = json.loads(urllib.request.urlopen(r + '/engagement', timeout=4).read()).get('engage', {})
+        for pid, v in e.items():
+            engage[pid] = max(engage.get(pid, 0), v.get('tips_raw', 0))
+    except Exception:
+        pass
+
+cids = {}                                                # cid -> tips (XNO): media = its post's tips,
+for h in best.values():                                  # the thread = the sum of its posts' tips
     data = fetch(h['cid'])
+    thread_tips = 0.0
     if data:
         try:
             for p in json.loads(data).get('posts', []):
+                pt = engage.get(p.get('id', ''), 0) / 1e30
+                thread_tips += pt
                 for k in ('thumb', 'media'):
                     if p.get(k):
-                        cids.add(p[k])                   # referenced media
+                        cids[p[k]] = max(cids.get(p[k], 0.0), pt)   # referenced media
         except Exception:
             pass
+    cids[h['cid']] = max(cids.get(h['cid'], 0.0), thread_tips)      # the thread JSON
 
 blobs = 0; backfilled = 0
-for cid in cids:
+for cid, tips in cids.items():
     data = fetch(cid)
     if not data or len(data) > CAP:
         continue
@@ -61,7 +75,8 @@ for cid in cids:
     for r in RELAYS:
         try:
             resp = json.loads(urllib.request.urlopen(urllib.request.Request(
-                r + '/blob', json.dumps({'cid': cid, 'b64': b64}).encode(), {'Content-Type': 'application/json'}), timeout=5).read())
+                r + '/blob', json.dumps({'cid': cid, 'b64': b64, 'tips': tips}).encode(),
+                {'Content-Type': 'application/json'}), timeout=5).read())
             if resp.get('stored'):
                 backfilled += 1                          # this relay was missing it — now pinned
         except Exception:

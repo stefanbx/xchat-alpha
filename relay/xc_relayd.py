@@ -225,7 +225,8 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/haveblob'):
             cid = qs(self.path).get('cid', '')
             self._send(200, json.dumps({'cid': cid, 'have': cid in blobs,
-                                        'pinned_until': int(pinned.get(cid, 0))}))
+                                        'pinned_until': int(pinned.get(cid, 0)),
+                                        'tips': (blob_meta.get(cid) or {}).get('tips', 0.0)}))
         elif self.path.startswith('/followers'):
             # count how many stored follow-records include this account (for a profile's follower tally)
             acc = qs(self.path).get('account', '')
