@@ -423,6 +423,16 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
 }
 
 // ---- data ----
+// Issuer head-extension: keep OUR head (and thus our posts) visible past the 1h TTL, until this epoch,
+// even while the app is closed. Set when the author pins their own post; persisted per account.
+class HeadKeep {
+  static String _k(String acct) => 'xchat_headkeep_$acct';
+  static Future<int> get(String acct) async =>
+      (await SharedPreferences.getInstance()).getInt(_k(acct)) ?? 0;
+  static Future<void> set(String acct, int epoch) async =>
+      (await SharedPreferences.getInstance()).setInt(_k(acct), epoch);
+}
+
 class Post {
   final String id, handle, account, kind, text;
   final String? title, media, thumb, dur;
@@ -664,6 +674,19 @@ class Api {
 
   // (Api.setWallet removed — the seed never leaves the device; there is no /api/wallet anymore.)
 
+  // the issuer can keep their own post VISIBLE past the head TTL: republish signs the head with an
+  // expiry at least this far out (epoch s). Set when you pin your own post; persisted per account.
+  static int headKeepUntil = 0;
+
+  // issuer head-extension: keep our head (and thus our posts) visible until `untilEpoch`, even offline.
+  // Only the author can do this — the head is signed with their key.
+  static Future<void> extendHead(String account, int untilEpoch) async {
+    if (untilEpoch <= headKeepUntil) return;
+    headKeepUntil = untilEpoch;
+    await HeadKeep.set(account, untilEpoch);
+    await republish();   // push a head signed with the long expiry NOW, so it survives the app closing
+  }
+
   // republish our head so it stays live past its TTL and reaches newly-joined relays.
   // ON-DEVICE: fetch our current head (seq+cid), re-sign it with a fresh expiry locally, and push it
   // via the same submit path a post uses. The seed never leaves the device.
@@ -675,7 +698,8 @@ class Api {
       final head = (jsonDecode(hr.body)['head'] as Map?)?.cast<String, dynamic>();
       if (head == null) return;                            // nothing posted yet — nothing to refresh
       final seq = head['seq'] as int, cid = '${head['cid']}';
-      final expires = DateTime.now().millisecondsSinceEpoch ~/ 1000 + kHeadTtl;
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final expires = math.max(now + kHeadTtl, headKeepUntil);   // honour an issuer head-extension
       final hs = w.signMsg(w.headMsg(seq, cid, expires));
       await http.post(Uri.parse('$kBase/api/post_submit'),
           headers: {'Content-Type': 'application/json'},
@@ -825,7 +849,8 @@ class Api {
                             'poll': pollOpts, 'sig': es['sig'], 'pub': es['pub']}));
       final pj = jsonDecode(pr.body);
       if (pj['ok'] != true) return '';
-      final seq = pj['seq'] as int, expires = pj['expires'] as int;
+      final seq = pj['seq'] as int;
+      final expires = math.max(pj['expires'] as int, headKeepUntil);   // don't drop below an issuer head-extension
       final cid = pj['cid'] as String;
       // 2) submit — sign the head over the returned CID on-device, node verifies + gossips
       final hs = w.signMsg(w.headMsg(seq, cid, expires));
@@ -2216,6 +2241,7 @@ class _FeedScreenState extends State<FeedScreen> {
                 Text(
                     result!['ok'] == true
                         ? '📌 pinned on ${result!['pinned']}/${result!['relays']} relay(s) for ~${((result!['days'] ?? 0) as num).toStringAsFixed(0)} days'
+                            '${p.account == _account ? ' · your post stays visible that long, even offline' : ''}'
                         : 'pin failed: ${result!['error'] ?? 'unknown'}',
                     style: TextStyle(
                         color: result!['ok'] == true ? const Color(0xFF4DD0A7) : const Color(0xFFEF6C9B),
@@ -2227,6 +2253,12 @@ class _FeedScreenState extends State<FeedScreen> {
                     onPressed: pinning ? null : () async {
                       setSheet(() => pinning = true);
                       final r = await Api.pin(cid, xno);
+                      // issuer head-extension: on YOUR OWN post, also keep its head (so the post stays
+                      // VISIBLE, not just its media kept) for the pinned span — even while you're offline.
+                      if (r?['ok'] == true && p.account == _account) {
+                        final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+                        await Api.extendHead(_account, now + (days * 86400).round());
+                      }
                       if (!ctx.mounted) return;
                       setSheet(() { pinning = false; result = r; });
                       await _load();
@@ -2302,7 +2334,11 @@ class _FeedScreenState extends State<FeedScreen> {
   // build the on-device signer from the local seed, then load follows (needs the account).
   Future<void> _bootWallet() async {
     final seed = await WalletStore.get();
-    if (seed != null && mounted) setState(() => _wallet = NanoWallet(seed));
+    if (seed != null) {
+      final w = NanoWallet(seed);
+      if (mounted) setState(() => _wallet = w);
+      Api.headKeepUntil = await HeadKeep.get(w.account);   // resume any active keep-alive (issuer pin)
+    }
     Api.dmKeyRegister();   // publish our signed DM public key so peers can encrypt to us
     _initFollows();
   }
