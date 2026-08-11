@@ -43,6 +43,7 @@ profiles = {}                        # account -> signed profile record (display
 dmkeys = {}                          # account -> signed X25519 DM public key record (E2E encryption)
 dms = []                             # list of encrypted direct messages (ciphertext only; relay can't read)
 pollvotes = {}                       # poll_id -> {account: signed vote record} (one vote per account)
+reports = {}                         # post_id -> {account: signed report} (community moderation signal)
 known = {SELF}                       # relays this relay knows about
 
 # --- anti-spam / DoS hardening ------------------------------------------------
@@ -93,7 +94,20 @@ PIN_DAYS_PER_XNO = float(os.environ.get('XC_PIN_DAYS_PER_XNO', '30000'))       #
 _PIN_S_PER_RAW = PIN_DAYS_PER_XNO * 86400.0 / 1e30
 pinned = {}                          # cid -> pin-expiry epoch (paid); survives eviction until then
 pins_paid = {}                       # payment block hash -> cid (consumed once; audit + no double-claim)
-blob_meta = {}                       # cid -> {'size','last','tips'} — small RAM index for eviction only
+blob_meta = {}                       # cid -> {'size','last','tips','reports'} — small RAM eviction index
+
+# Moderation as a NEGATIVE value signal. A signed community report cancels some of a post's tip-value,
+# so ONE score — tips minus reports — ranks EVERYTHING: eviction (low score drops first), sync-the-best
+# (high score replicates first; reported content isn't propagated), and a hard takedown once distinct
+# reporters cross the threshold (the media is deleted; the post drops from the feed for everyone).
+REPORT_WEIGHT   = float(os.environ.get('XC_REPORT_WEIGHT', '0.05'))   # XNO-equiv value each report cancels
+REPORT_TAKEDOWN = int(os.environ.get('XC_REPORT_TAKEDOWN', '3'))      # distinct reporters -> priority drop
+REPORT_POSTS    = int(os.environ.get('XC_REPORT_POSTS', '50000'))     # cap distinct reported posts
+REPORT_PER_POST = int(os.environ.get('XC_REPORT_PER_POST', '1000'))   # cap reporters stored per post
+_blob_reporters = {}                 # cid -> set(reporter accounts) (dedupe + count; rebuilt on load)
+
+def blob_score(m):                   # the universal value: tips earned minus the moderation penalty
+    return float(m.get('tips', 0.0)) - int(m.get('reports', 0)) * REPORT_WEIGHT
 
 _DB = os.path.join(os.path.dirname(os.path.abspath(STORE)) or '.', 'blobs.db')
 _db = sqlite3.connect(_DB, check_same_thread=False)
@@ -120,9 +134,25 @@ def blob_put(cid, b64, tips=0.0):
         t = max(float(tips or 0), float((blob_meta.get(cid) or {}).get('tips', 0)))   # value ratchets up
         _db.execute('INSERT OR REPLACE INTO blob (cid,b64,size,last,tips) VALUES (?,?,?,?,?)',
                     (cid, b64, len(b64 or ''), now, t))
-        blob_meta[cid] = {'size': len(b64 or ''), 'last': now, 'tips': t}
+        blob_meta[cid] = {'size': len(b64 or ''), 'last': now, 'tips': t,
+                          'reports': len(_blob_reporters.get(cid, ()))}   # carry any existing reports
         _evict_locked()
         _db.commit()
+
+def blob_report(cid, account):
+    # a signed community report referencing this media: a NEGATIVE term in blob_score, and a hard
+    # PRIORITY TAKEDOWN (delete now, ignore the cap) once distinct reporters cross REPORT_TAKEDOWN —
+    # unless the content is paid-pinned (paying still protects; the viewer's filter hides it anyway).
+    if not cid:
+        return
+    with _blob_lock:
+        s = _blob_reporters.setdefault(cid, set()); s.add(account)
+        m = blob_meta.get(cid)
+        if m:
+            m['reports'] = len(s)
+        if m and len(s) >= REPORT_TAKEDOWN and pinned.get(cid, 0) <= time.time():
+            _db.execute('DELETE FROM blob WHERE cid=?', (cid,)); _db.commit()
+            blob_meta.pop(cid, None)
 
 def blob_touch(cid):                 # a read counts as use; RAM-only (avoids a write per read)
     m = blob_meta.get(cid)
@@ -134,9 +164,9 @@ def _evict_locked():                 # called with _blob_lock held; drops least-
     if total <= BLOB_CAP:
         return
     now = time.time()
-    victims = sorted((m.get('tips', 0.0), m['last'], c)
+    victims = sorted((blob_score(m), m['last'], c)          # lowest score first (reported + untipped)
                      for c, m in blob_meta.items() if pinned.get(c, 0) <= now)
-    for _tips, _last, c in victims:
+    for _score, _last, c in victims:
         if total <= BLOB_CAP:
             break
         total -= blob_meta[c]['size']
@@ -146,7 +176,7 @@ def _evict_locked():                 # called with _blob_lock held; drops least-
 def blob_load_meta():                # startup: rebuild the small RAM index from the SQLite table
     with _blob_lock:
         for cid, size, last, tips in _db.execute('SELECT cid,size,last,tips FROM blob'):
-            blob_meta[cid] = {'size': size, 'last': last, 'tips': tips or 0.0}
+            blob_meta[cid] = {'size': size, 'last': last, 'tips': tips or 0.0, 'reports': 0}
 
 def grant_pin(cid, payhash):
     # PAY-TO-PIN: verify payhash is a confirmed Nano send TO this relay's account, then protect cid
@@ -173,7 +203,7 @@ def grant_pin(cid, payhash):
 # --- persistence: the WHOLE relay state survives a restart, not just heads ---
 # (in-memory before this meant comments, uploaded media, likes, poll votes vanished on restart)
 _STATE_KEYS = ('engage', 'notifs', 'supporters', 'follows', 'comments',   # blobs now live in SQLite
-               'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'pinned', 'pins_paid')
+               'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'reports', 'pinned', 'pins_paid')
 
 def load_state():
     global heads
@@ -214,6 +244,14 @@ load_state()
 blob_load_meta()
 for _m in dms:                                       # rebuild the DM dedup index from the loaded mailbox
     _dm_seen.add((_m.get('from'), _m.get('ts')))
+for _pid, _recs in reports.items():                  # rebuild per-cid reporter sets -> blob report counts
+    for _acc, _rec in (_recs or {}).items():
+        _c = (_rec or {}).get('cid')
+        if _c:
+            _blob_reporters.setdefault(_c, set()).add(_acc)
+for _c, _s in _blob_reporters.items():
+    if _c in blob_meta:
+        blob_meta[_c]['reports'] = len(_s)
 
 def prune():
     # Actively DROP expired heads (not just hide them on read), so a Sybil flood can't grow `heads`
@@ -312,6 +350,10 @@ class H(BaseHTTPRequestHandler):
             acc = qs(self.path).get('account', '')
             n = sum(1 for rec in follows.values() if acc in (rec.get('follows') or []))
             self._send(200, json.dumps({'account': acc, 'followers': n}))
+        elif self.path.startswith('/reports'):
+            # community moderation signal: post_id -> {account: signed report}. The relay stores and
+            # serves; the NODE verifies signatures + counts distinct reporters (relay verifies nothing).
+            self._send(200, json.dumps({'reports': reports}))
         elif self.path.startswith('/follows'):
             acc = qs(self.path).get('account', '')
             self._send(200, json.dumps({'account': acc, 'record': follows.get(acc)}))
@@ -491,6 +533,21 @@ class H(BaseHTTPRequestHandler):
                     lst.append(m)
                 releases[pub] = lst[-24:]                 # cap; real record survives forged noise
                 self._send(200, json.dumps({'ok': True, 'stored': len(releases[pub])}))
+            except Exception as ex:
+                self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
+        elif self.path.startswith('/report'):
+            # a signed community report {post_id, account, ts, sig, pub, cid?}. One per account per post;
+            # the relay stores it (verifies nothing — the node checks sigs on aggregate) and applies the
+            # moderation penalty to the referenced media (lower eviction/sync score, hard takedown at N).
+            try:
+                m = json.loads(raw); pid = m['post_id']; acc = m['account']
+                recs = reports.setdefault(pid, {})
+                fresh = acc not in recs and (pid in reports or len(reports) <= REPORT_POSTS) and len(recs) < REPORT_PER_POST
+                if fresh:
+                    recs[acc] = {'ts': m.get('ts', 0), 'sig': m.get('sig', ''),
+                                 'pub': m.get('pub', ''), 'cid': m.get('cid', '')}
+                    blob_report(m.get('cid', ''), acc)          # penalise + maybe take down the media
+                self._send(200, json.dumps({'ok': True, 'reports': len(recs)}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         elif self.path.startswith('/comment'):

@@ -50,30 +50,63 @@ for r in RELAYS:
     except Exception:
         pass
 
+# COMMUNITY REPORTS as a NEGATIVE value: the same score the relay evicts by (tips minus reports) also
+# ranks what we replicate. Reported content sinks; taken-down content (>= TAKEDOWN verified reporters)
+# is NOT propagated at all — a bad post must not be spread to more relays. Sign-checked so one relay
+# can't suppress content by fabricating reports.
+REPORT_WEIGHT = float(os.environ.get('XC_REPORT_WEIGHT', '0.05'))
+TAKEDOWN = int(os.environ.get('XC_REPORT_TAKEDOWN', '3'))
+def _rv(pub, msg, sig):
+    try:
+        return xc.verify_msg(pub, msg, sig)
+    except Exception:
+        return False
+post_reports = {}                                        # post_id -> distinct valid reporter count
+for r in RELAYS:
+    try:
+        d = json.loads(urllib.request.urlopen(r + '/reports', timeout=4).read()).get('reports', {})
+        for pid, recs in d.items():
+            accs = {acc for acc, rec in (recs or {}).items()
+                    if xc.pub_to_addr(rec.get('pub', '')) == acc
+                    and _rv(rec.get('pub', ''), f"report|{acc}|{pid}|{rec.get('ts', 0)}", rec.get('sig', ''))}
+            if accs:
+                post_reports[pid] = max(post_reports.get(pid, 0), len(accs))
+    except Exception:
+        pass
+
 cids = {}                                                # cid -> tips (XNO): media = its post's tips,
+cid_reports = {}                                         # cid -> reporter count of the post using it
 for h in best.values():                                  # the thread = the sum of its posts' tips
     data = fetch(h['cid'])
-    thread_tips = 0.0
+    thread_tips = 0.0; thread_rep = 0
     if data:
         try:
             for p in json.loads(data).get('posts', []):
-                pt = engage.get(p.get('id', ''), 0) / 1e30
-                thread_tips += pt
+                pid = p.get('id', '')
+                pt = engage.get(pid, 0) / 1e30
+                pr = post_reports.get(pid, 0)
+                thread_tips += pt; thread_rep = max(thread_rep, pr)
                 for k in ('thumb', 'media'):
                     if p.get(k):
-                        cids[p[k]] = max(cids.get(p[k], 0.0), pt)   # referenced media
+                        cids[p[k]] = max(cids.get(p[k], 0.0), pt)          # referenced media
+                        cid_reports[p[k]] = max(cid_reports.get(p[k], 0), pr)
         except Exception:
             pass
-    cids[h['cid']] = max(cids.get(h['cid'], 0.0), thread_tips)      # the thread JSON
+    cids[h['cid']] = max(cids.get(h['cid'], 0.0), thread_tips)             # the thread JSON
+    cid_reports[h['cid']] = max(cid_reports.get(h['cid'], 0), thread_rep)
 
-# SYNC THE BEST: replicate content to every relay in VALUE order, most-tipped first, within a byte
-# budget per round. The best content reaches all relays (durable, multi-copy); when the budget runs
-# out the weak (low-value) content is left single-copy on its origin — synced ≠ everything. A supporter
-# does this outbound-only, so replication stays client-driven and decentralised.
+# SYNC THE BEST: replicate content to every relay in SCORE order (tips minus reports), best first,
+# within a byte budget per round. The best reaches all relays (durable, multi-copy); the weak stays
+# single-copy; taken-down content isn't replicated at all. Outbound-only, so it stays decentralised.
+def score(c):
+    return cids[c] - cid_reports.get(c, 0) * REPORT_WEIGHT
 SYNC_BUDGET = int(float(os.environ.get('XC_SYNC_BUDGET_MB', '32')) * 1024 * 1024)
-ranked = sorted(cids.items(), key=lambda kv: -kv[1])     # highest tips first
-spent = 0; blobs = 0; backfilled = 0; skipped = 0
-for cid, tips in ranked:
+ranked = sorted(cids.keys(), key=lambda c: -score(c))    # highest score (tips - reports) first
+spent = 0; blobs = 0; backfilled = 0; skipped = 0; suppressed = 0
+for cid in ranked:
+    if cid_reports.get(cid, 0) >= TAKEDOWN:              # community takedown — do not propagate
+        suppressed += 1
+        continue
     data = fetch(cid)
     if not data or len(data) > CAP:
         continue
@@ -85,12 +118,12 @@ for cid, tips in ranked:
     for r in RELAYS:
         try:
             resp = json.loads(urllib.request.urlopen(urllib.request.Request(
-                r + '/blob', json.dumps({'cid': cid, 'b64': b64, 'tips': tips}).encode(),
+                r + '/blob', json.dumps({'cid': cid, 'b64': b64, 'tips': cids[cid]}).encode(),
                 {'Content-Type': 'application/json'}), timeout=5).read())
             if resp.get('stored'):
                 backfilled += 1                          # this relay was missing it — now replicated
         except Exception:
             pass
 json.dump({"ok": True, "blobs": blobs, "relays": len(RELAYS), "backfilled": backfilled,
-           "skipped_lowvalue": skipped, "synced_bytes": spent},
+           "skipped_lowvalue": skipped, "suppressed_reported": suppressed, "synced_bytes": spent},
           open('/tmp/xc_pin_result.json', 'w'))

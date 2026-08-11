@@ -69,6 +69,7 @@ class NanoWallet {
   String profileMsg(int ts, String display, String bio, String avatar, String banner) =>
       '$account|$ts|$display|$bio|$avatar|$banner';
   String dmKeyMsg(int ts, String dmPub) => '$account|$ts|$dmPub';
+  String reportMsg(String postId, int ts) => 'report|$account|$postId|$ts';
 
   // ---- encrypted DMs (on-device): a SEPARATE X25519 keypair derived from the seed, sealing with
   // NaCl crypto_box (pinenacl) — byte-compatible with the node's PyNaCl. The relays only ever see

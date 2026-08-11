@@ -825,7 +825,7 @@ class Api {
       for (final x in (list['labels'] as List? ?? [])) {
         final pid = x['post'];
         if (pid == null) continue;
-        flags[pid] = {'verdict': x['verdict'], 'reason': x['reason'], 'ts': x['ts'] ?? 0};
+        flags[pid] = {'verdict': x['verdict'], 'reason': x['reason'], 'ts': x['ts'] ?? 0, 'frac': x['frac']};
         final t = (x['ts'] ?? 0) as int;
         if (t > lastTs) lastTs = t;
       }
@@ -833,6 +833,26 @@ class Api {
           double.tryParse('${le['reputation']}') ?? 0, lastTs, flags));
     }
     return out;
+  }
+
+  // Publish a SIGNED community report — "report|account|postId|ts" signed on-device — to the relays.
+  // cid (the post's media, if any) lets the relays penalise/take-down the content by the same score.
+  static Future<Map<String, dynamic>?> report(String postId, String cid) async {
+    final w = gWallet;
+    if (w == null) return {'ok': false, 'error': 'no wallet'};
+    try {
+      final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final s = w.signMsg(w.reportMsg(postId, ts));
+      final r = await http
+          .post(Uri.parse('$kBase/api/report'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({'post_id': postId, 'account': w.account, 'ts': ts,
+                                'sig': s['sig'], 'pub': s['pub'], 'cid': cid}))
+          .timeout(const Duration(seconds: 20));
+      return jsonDecode(r.body) as Map<String, dynamic>;
+    } catch (e) {
+      return {'ok': false, 'error': '$e'};
+    }
   }
 
   // returns the new post's id (empty string on failure) so a thread can chain reply_to.
@@ -1467,6 +1487,10 @@ class _FeedScreenState extends State<FeedScreen> {
           _posts = _posts.where((p) => live.contains(p.id)).toList();   // drop expired/removed
           _newPosts.removeWhere((p) => !live.contains(p.id));
         }
+      });
+      if (reconcile) _refreshLabels();   // pick up others' community reports for the shield filter
+      if (!mounted) return;
+      setState(() {
         if (fresh.isNotEmpty) {
           _newPosts.addAll(fresh);
           _newPosts.sort((a, b) => b.ts.compareTo(a.ts));  // newest first, ready to prepend
@@ -1838,18 +1862,24 @@ class _FeedScreenState extends State<FeedScreen> {
     if (th > 1) return PostMod([], 0, false, '', ''); // moderation off
     final flaggers =
         _labelers.where((l) => l.flags.containsKey(postId)).toList();
-    final tot = _labelers.fold<double>(0, (a, l) => a + _eff(l));
-    final frac =
-        tot > 0 ? flaggers.fold<double>(0, (a, l) => a + _eff(l)) / tot : 0.0;
-    final hide = th <= 1 &&
-        flaggers.isNotEmpty &&
-        frac >= th &&
-        !_shown.contains(postId);
-    final v = flaggers.isEmpty ? '' : flaggers.first.flags[postId]!['verdict'];
-    final reason = flaggers
-        .map((l) =>
-            '${l.name} ${(_eff(l) / (tot == 0 ? 1 : tot) * 100).round()}%: ${l.flags[postId]!['reason']}')
-        .join(' · ');
+    if (flaggers.isEmpty) return PostMod([], 0, false, '', '');
+    // Community reports carry a per-post fraction (distinct reporters / quorum); use the strongest.
+    // Fall back to the reputation-weighted labeler share for any labeler that doesn't provide one.
+    final perPost = flaggers
+        .map((l) => (l.flags[postId]!['frac'] as num?)?.toDouble())
+        .whereType<double>()
+        .toList();
+    double frac;
+    if (perPost.isNotEmpty) {
+      frac = perPost.reduce((a, b) => a > b ? a : b);
+    } else {
+      final tot = _labelers.fold<double>(0, (a, l) => a + _eff(l));
+      frac = tot > 0 ? flaggers.fold<double>(0, (a, l) => a + _eff(l)) / tot : 0.0;
+    }
+    final hide = frac >= th && !_shown.contains(postId);
+    final v = flaggers.first.flags[postId]!['verdict'];
+    final reason =
+        flaggers.map((l) => '${l.flags[postId]!['reason']}').where((s) => s.isNotEmpty).join(' · ');
     return PostMod(flaggers, frac, hide, v ?? '', reason);
   }
 
@@ -2411,10 +2441,21 @@ class _FeedScreenState extends State<FeedScreen> {
 
   // Report = a trust-scoped, reversible flag (NOT a dislike/downvote). Feeds moderation.
   void _reportPost(Post p) {
-    setState(() => _reported.add(p.id));
+    setState(() => _reported.add(p.id));                 // hide on this device immediately
+    Api.report(p.id, p.media ?? '').then((_) {           // publish the signed report to the relays
+      if (mounted) Future.delayed(const Duration(seconds: 1), () { if (mounted) _refreshLabels(); });
+    });
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
         backgroundColor: kCard,
-        content: Text('flagged & hidden from your feed — fed to reputation-weighted moderation (reversible)')));
+        content: Text('reported to the community + hidden from your feed — enough reports take it '
+            'down for everyone (reversible)')));
+  }
+
+  Future<void> _refreshLabels() async {                  // pull the updated community-report labels
+    try {
+      final l = await Api.labels();
+      if (mounted) setState(() => _labelers = l);
+    } catch (_) {}
   }
 
   // build the on-device signer from the local seed, then load follows (needs the account).
@@ -3884,7 +3925,7 @@ class _FeedScreenState extends State<FeedScreen> {
           Padding(
             padding: const EdgeInsets.only(right: 6),
             child: InkWell(
-              onTap: _labelers.isEmpty ? null : _cycleMod,
+              onTap: _cycleMod,          // always tappable: set your filter strength; it bites as reports land
               borderRadius: BorderRadius.circular(20),
               child: Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),

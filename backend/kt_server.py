@@ -106,8 +106,23 @@ def api_feed(query=None):
     return ('{"onchain_blocks":' + blocks +
             ',"transport":"plural relays + signed mutable heads","content":' + content + '}')
 
-def api_labels():                                            # moderation labels (ported lazily; empty = off)
-    return '{"labelers":[]}'
+LABELS_TTL = float(os.environ.get('XC_LABELS_TTL', '15'))    # community-report aggregation cache (s)
+_labels_ts = [0.0]
+_labels_lock = threading.Lock()
+
+def api_labels():
+    # Moderation = COMMUNITY REPORTS. Aggregate signed reports across the relays into one "community"
+    # labeler: verify each report's signature, count distinct reporters per post, and expose a per-post
+    # fraction (reporters / quorum) the app filters against. Cached like the feed.
+    now = time.time()
+    if (now - _labels_ts[0] > LABELS_TTL or not os.path.exists('/tmp/xc_labels.json')) \
+            and _labels_lock.acquire(blocking=False):
+        try:
+            _labels_ts[0] = now
+            spawn('xc_labels.py')
+        finally:
+            _labels_lock.release()
+    return read('/tmp/xc_labels.json', '{"labelers":[]}')
 
 # ---- on-device money: PUBLIC ledger reads (no seed) that let the app build + sign its own blocks ----
 def api_account_state(acct):
@@ -233,6 +248,7 @@ def route(path, query, body):
         put('/tmp/xc_block_in.json', json.dumps(body)); spawn('xc_blockproc.py')   # app-signed block; node adds PoW + broadcasts
         return read('/tmp/xc_block_result.json', '{}')
 
+    if path.startswith('/api/report'):       put('/tmp/xc_report_rec.json', json.dumps(body)); spawn('xc_report.py'); return read('/tmp/xc_report_result.json', '{}')
     if path.startswith('/api/follows_set'):  put('/tmp/xc_follows_rec.json', json.dumps(body)); spawn('xc_follows.py','pub'); return read('/tmp/xc_follows_result.json','{}')
     if path.startswith('/api/follows_get'):  put('/tmp/xc_follows_acct.txt', q('account')); spawn('xc_follows.py', 'get');  return read('/tmp/xc_follows_result.json', '{}')
 

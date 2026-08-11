@@ -96,13 +96,25 @@ Consequences:
 explorer, and you will see the relay accounts' dust check-ins; open a relay account and you will
 see the block whose contents encode that relay's URL. The app is doing exactly this read.
 
-## 5. Moderation — subjective labels, nothing globally deleted
+## 5. Moderation — community reports feed one value score
 
-Moderation is a set of **signed labels** published by labelers (each a keypair) whose weight is
-their on-chain stake, decayed if they go inactive and scaled by their accuracy. A client applies
-a *reputation-weighted* threshold **it chooses** to hide or flag content. Different viewers can
-trust different labelers; nothing is ever deleted from the network — "Show anyway" always reveals.
-This is subjective, user-controlled moderation, not global censorship.
+Moderation is **community reports**. A report is a signed record — `report|account|postId|ts`, signed
+on-device — fanned out to the relays. The relays store it (verifying nothing); an aggregator verifies
+each signature and the key↔author binding and counts **distinct reporters** per post. A viewer sets a
+threshold **they choose** (≥10% / ≥50% / ≥90% of a small quorum) and posts above it are hidden — "Show
+anyway" always reveals, so per-viewer filtering stays subjective and reversible.
+
+What's new is that reports are a **negative value signal in the same score that governs retention**.
+Every stored item is ranked by `score = tips − reports`, and that one number drives *everything*:
+eviction (lowest score drops first, so reported-and-untipped goes before anything), **sync between
+relays** (highest score replicates first; reported content is not propagated), and the feed. Once a
+post crosses a hard **takedown** threshold of distinct, signature-verified reporters, it is dropped
+from the feed for everyone and its media is deleted from the relays — a **community-consensus takedown**,
+not a per-viewer hide. Paying to pin still protects content from eviction, and every report is signed,
+so a single relay cannot suppress content by fabricating reports. This is a deliberate shift from
+"nothing is ever deleted": the network now removes what a quorum flags, while individuals keep a
+finer, reversible filter on top. *Honest limit:* reporters are counted, not yet reputation-weighted, so
+Sybil resistance is limited — many cheap accounts could push a takedown; stake-weighting is the fix. 🔨
 
 ## 6. Funding — tips reward creators, pay-to-pin keeps content alive
 

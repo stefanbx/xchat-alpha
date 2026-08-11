@@ -56,12 +56,30 @@ for h in heads:
     if cur is None or h['seq'] > cur['seq'] or (h['seq'] == cur['seq'] and exp > cur.get('expires', 0)):
         best[h['author']] = h                      # highest valid seq (mutable head), freshest TTL
 
+# COMMUNITY TAKEDOWN: a post flagged by >= REPORT_TAKEDOWN distinct, signature-verified accounts is
+# dropped from the feed for everyone (not just the reporter's client filter). Sign-checked so a single
+# relay can't censor by fabricating reports.
+TAKEDOWN = int(os.environ.get('XC_REPORT_TAKEDOWN', '3'))
+taken = set()
+_rep = {}                                              # post_id -> set(valid reporter accounts)
+for r in RELAYS:
+    try:
+        d = json.loads(urllib.request.urlopen(r + '/reports', timeout=4).read()).get('reports', {})
+        for pid, recs in d.items():
+            for acc, rec in (recs or {}).items():
+                pub, sig, ts = rec.get('pub', ''), rec.get('sig', ''), rec.get('ts', 0)
+                if xc.pub_to_addr(pub) == acc and verify(pub, f"report|{acc}|{pid}|{ts}", sig):
+                    _rep.setdefault(pid, set()).add(acc)
+    except Exception:
+        pass
+taken = {pid for pid, accs in _rep.items() if len(accs) >= TAKEDOWN}
+
 posts = []
 for h in best.values():
     data = get_content(h['cid'])
     if data:
         try:
-            posts += json.loads(data).get('posts', [])
+            posts += [p for p in json.loads(data).get('posts', []) if p.get('id') not in taken]
         except Exception:
             pass
 posts.sort(key=lambda p: p.get('ts', 0), reverse=True)
