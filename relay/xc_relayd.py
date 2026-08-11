@@ -61,10 +61,13 @@ _blob_lock = threading.Lock()
 def _blob_total():
     return sum(m['size'] for m in blob_meta.values())
 
-def blob_put(cid, b64):
+def blob_put(cid, b64, tips=0.0):
     with _blob_lock:
         blobs[cid] = b64
-        blob_meta[cid] = {'size': len(b64 or ''), 'last': time.time()}
+        m = blob_meta.get(cid) or {}
+        m.update({'size': len(b64 or ''), 'last': time.time(),
+                  'tips': max(float(tips or 0), float(m.get('tips', 0)))})   # value only ratchets up
+        blob_meta[cid] = m
         _evict_locked()
 
 def blob_touch(cid):                 # a read counts as use, so popular content isn't the first evicted
@@ -72,13 +75,18 @@ def blob_touch(cid):                 # a read counts as use, so popular content 
     if m:
         m['last'] = time.time()
 
-def _evict_locked():                 # drop least-recently-used UNPINNED blobs until under the cap
+def _evict_locked():
+    # Keep everything until the cap is reached, then drop the LEAST-VALUABLE unpinned blobs first:
+    # untipped before tipped, and within a tip level the least-recently-used. So old + untipped go
+    # first, well-tipped content stays longest, and paid pins are never touched. (Sync, elsewhere,
+    # replicates the most-valued; the weak stay single-copy; evicted is gone.)
     total = _blob_total()
     if total <= BLOB_CAP:
         return
     now = time.time()
-    victims = sorted((m['last'], c) for c, m in blob_meta.items() if pinned.get(c, 0) <= now)
-    for _, c in victims:
+    victims = sorted((m.get('tips', 0.0), m['last'], c)
+                     for c, m in blob_meta.items() if pinned.get(c, 0) <= now)   # low value + old first
+    for _tips, _last, c in victims:
         if total <= BLOB_CAP:
             break
         total -= blob_meta[c]['size']
@@ -88,7 +96,7 @@ def _evict_locked():                 # drop least-recently-used UNPINNED blobs u
 def blob_rebuild_meta():             # after a restart, rebuild sizes from the loaded blobs
     now = time.time()
     for c, b in list(blobs.items()):
-        blob_meta.setdefault(c, {'size': len(b or ''), 'last': now})
+        blob_meta.setdefault(c, {'size': len(b or ''), 'last': now, 'tips': 0.0})
 
 def grant_pin(cid, payhash):
     # PAY-TO-PIN: verify payhash is a confirmed Nano send TO this relay's account, then protect cid
@@ -295,7 +303,7 @@ class H(BaseHTTPRequestHandler):
             # a supporter caches content here (content-addressed — cid names the bytes); byte-capped + LRU
             try:
                 m = json.loads(raw); cid = m['cid']; new = cid not in blobs
-                blob_put(cid, m['b64'])
+                blob_put(cid, m['b64'], tips=m.get('tips', 0))   # tips = the post's value, ranks eviction
                 self._send(200, json.dumps({'ok': True, 'stored': new, 'cache_bytes': _blob_total()}))
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
