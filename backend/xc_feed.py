@@ -12,7 +12,7 @@ RELAYS = xc.discover_relays()          # find the relay set from a bootstrap —
 
 def get_content(cid):                  # content by CID: IPFS origin, else a relay CACHE (survives origin loss)
     try:
-        return subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': '/tmp/ipfsB'}, timeout=8)
+        return subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': xc.IPFS_PATH}, timeout=8)
     except Exception:
         pass
     for r in RELAYS:

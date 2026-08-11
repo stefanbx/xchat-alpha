@@ -7,6 +7,9 @@ WORKDIR /app
 COPY app/ /app/
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-ENV XC_NANO_RPC=https://rpc.nano.to IPFS_PATH=/tmp/ipfsB XC_FUND_NEW=0
+# A comma-separated list: rpc() tries them in order and fails over, so one datacenter-blocked or
+# throttled public RPC can't make every balance read 0. (Lead with the highest published limit.)
+# IPFS_PATH is set by entrypoint.sh (onto the persistent volume), so it's intentionally not fixed here.
+ENV XC_NANO_RPC=https://nanoslo.0x.no/proxy,https://rpc.nano.to,https://rainstorm.city/api,https://node.somenano.com/proxy XC_FUND_NEW=0
 EXPOSE 8790
 CMD ["/entrypoint.sh"]

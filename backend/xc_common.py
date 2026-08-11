@@ -1,18 +1,66 @@
 #!/usr/bin/env python3
 # Shared helpers for the ӾChat per-user-thread backend (dev Nano network + IPFS).
 import json, subprocess, urllib.request, base64, hashlib, os, time
-# Nano RPC endpoint. Defaults to the local dev node; set XC_NANO_RPC to a public mainnet RPC
-# (e.g. https://rpc.nano.to) to run relay discovery against the REAL XNO ledger.
-R = os.environ.get('XC_NANO_RPC', 'http://127.0.0.1:17076')
+# Nano RPC endpoint(s). XC_NANO_RPC may be ONE url or a comma-separated list; defaults to the local
+# dev node. When a PUBLIC mainnet RPC is configured, known-good public fallbacks are appended —
+# because any single datacenter-hosted RPC (rpc.nano.to did, from Fly) can throttle or block a
+# hosting provider's egress IP, and one point of failure for ledger reads makes EVERY balance
+# silently read 0 (the handler can't tell "unreachable" from "unopened"). rpc() tries endpoints in
+# turn, remembers the last that worked, and RAISES if none answer so callers report the truth.
+_RPC_ENV = os.environ.get('XC_NANO_RPC', 'http://127.0.0.1:17076')
+RPCS = [u.strip().rstrip('/') for u in _RPC_ENV.split(',') if u.strip()] or ['http://127.0.0.1:17076']
+R = RPCS[0]                                                  # back-compat: some logs read R
+_PUBLIC_FALLBACKS = ['https://rpc.nano.to', 'https://nanoslo.0x.no/proxy',
+                     'https://rainstorm.city/api', 'https://node.somenano.com/proxy']
 GEN = '34F0A37AAD20F4A260F0A5B3CB3D7FB50673212263E58A380BC10474BB039CE4'
 GPUB = 'b0311ea55708d6a53c75cdbf88300259c6d018522fe3d4d0a242e431f9e8b6d0'
 NANO_ALPH = "13456789abcdefghijkmnopqrstuwxyz"
 
+def _rpc_endpoints():
+    eps = list(RPCS)
+    # only fall back to public nodes when the operator already chose a public (non-loopback) RPC —
+    # a dev/local setup (and the e2e test's dead port) must stay isolated, never reach mainnet.
+    if any(('127.0.0.1' not in u and 'localhost' not in u) for u in eps):
+        for f in _PUBLIC_FALLBACKS:
+            if f not in eps:
+                eps.append(f)
+    return eps
+
+# genuine ledger answers that must be RETURNED as-is, not retried as if the endpoint were broken.
+_NANO_ERRS = ('account not found', 'block not found', 'bad account', 'old block',
+              'fork', 'gap', 'unreceivable', 'insufficient balance')
+_rpc_good = [0]                                             # index of the last endpoint that answered
+
+def _transport_err(r):
+    # a rate-limit / forbidden / proxy error dict means "try the next endpoint"; a real Nano error
+    # (e.g. account not found) is a valid answer and must pass through.
+    if not isinstance(r, dict):
+        return True
+    e = str(r.get('error', '')).lower()
+    if not e:
+        return False
+    return not any(k in e for k in _NANO_ERRS)
+
 def rpc(o):
     # public mainnet RPCs (e.g. rpc.nano.to) reject the default python User-Agent with 403 — send one.
-    return json.loads(urllib.request.urlopen(
-        urllib.request.Request(R, json.dumps(o).encode(),
-                               {'Content-Type': 'application/json', 'User-Agent': 'xchat-node/0.1'}), timeout=30).read())
+    eps = _rpc_endpoints()
+    g = _rpc_good[0] if _rpc_good[0] < len(eps) else 0
+    order = [g] + [i for i in range(len(eps)) if i != g]
+    last = None
+    for i in order:
+        try:
+            r = json.loads(urllib.request.urlopen(
+                urllib.request.Request(eps[i], json.dumps(o).encode(),
+                    {'Content-Type': 'application/json', 'User-Agent': 'xchat-node/0.1'}), timeout=20).read())
+        except Exception as e:
+            last = e
+            continue
+        if _transport_err(r):
+            last = RuntimeError(f'{eps[i]} unusable: {str(r)[:100]}')
+            continue
+        _rpc_good[0] = i
+        return r
+    raise last if last is not None else RuntimeError('no Nano RPC endpoint reachable')
 
 IPFS_PATH = os.environ.get('IPFS_PATH', '/tmp/ipfsB')
 
@@ -131,7 +179,7 @@ def read_thread(account):  # account frontier -> link (thread CID) -> IPFS -> pa
     link = bi['contents']['link']
     cid = 'b' + base64.b32encode(bytes([1, 112, 18, 32]) + bytes.fromhex(link)).decode().lower().rstrip('=')
     try:
-        out = subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': '/tmp/ipfsB'}, timeout=20)
+        out = subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': IPFS_PATH}, timeout=20)
         return json.loads(out)
     except Exception:
         return None
@@ -208,7 +256,7 @@ def _relay_url(account):  # a relay account -> the URL it announced on its own c
             if not link or link == '0' * 64 or link.upper() in rv_links:
                 continue
             out = subprocess.check_output(['ipfs', 'cat', digest_to_cid(link)],
-                                          env={**os.environ, 'IPFS_PATH': '/tmp/ipfsB'}, timeout=5)
+                                          env={**os.environ, 'IPFS_PATH': IPFS_PATH}, timeout=5)
             u = json.loads(out).get('url')
             if u:
                 return u

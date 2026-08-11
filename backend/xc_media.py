@@ -9,7 +9,7 @@ xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
 cid = open('/tmp/xc_media_cid.txt').read().strip()
 data = None
 try:
-    data = subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': '/tmp/ipfsB'}, timeout=10)
+    data = subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': xc.IPFS_PATH}, timeout=10)
 except Exception:
     for r in xc.discover_relays():
         try:

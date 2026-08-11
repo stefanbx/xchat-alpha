@@ -14,7 +14,7 @@ CAP = 6_000_000   # pin media up to ~6MB (covers the small movies) so it survive
 
 def fetch(cid):                       # get bytes for a cid: IPFS origin, else a relay cache
     try:
-        return subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': '/tmp/ipfsB'}, timeout=8)
+        return subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': xc.IPFS_PATH}, timeout=8)
     except Exception:
         pass
     for r in RELAYS:

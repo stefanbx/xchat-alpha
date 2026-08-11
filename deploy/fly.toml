@@ -11,3 +11,10 @@ primary_region = "iad"
   cpu_kind = "shared"
   cpus = 1
   memory = "512mb"
+
+# Persistent disk for the relay store, so restarts/redeploys keep the history.
+# One volume ↔ one machine; a second machine would need its own volume and would hold separate
+# state (relays are meant to be plural + independent — clients verify every signature anyway).
+[mounts]
+  source = "xchat_data"
+  destination = "/data"
