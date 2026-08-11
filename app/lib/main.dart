@@ -1391,7 +1391,7 @@ class _FeedScreenState extends State<FeedScreen> {
   int _supporters = 0;
   final Battery _battery = Battery();
   StreamSubscription? _batSub, _connSub;
-  Timer? _republishTimer, _gossipTimer;
+  Timer? _republishTimer, _gossipTimer, _feedTimer;
   int _relayed = 0; // signed heads this phone has propagated (backfilled) this session
   bool get _supporterActive => _supporterOn && _charging && _wifi;
 
@@ -1410,6 +1410,8 @@ class _FeedScreenState extends State<FeedScreen> {
     BookmarkStore.get().then((b) { if (mounted) setState(() => _bookmarks = b); });
     // keep our own head alive on the relays (republish < TTL); also backfills new relays
     _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) => Api.republish());
+    // quietly poll the feed so posts from OTHER devices appear on their own (no manual refresh)
+    _feedTimer = Timer.periodic(const Duration(seconds: 12), (_) => _refreshFeedQuiet());
   }
 
   @override
@@ -1418,7 +1420,27 @@ class _FeedScreenState extends State<FeedScreen> {
     _connSub?.cancel();
     _republishTimer?.cancel();
     _gossipTimer?.cancel();
+    _feedTimer?.cancel();
     super.dispose();
+  }
+
+  // A lightweight, silent feed poll — refreshes the timeline in place so posts from other devices
+  // show up on their own, WITHOUT the full-screen loading state or the wallet side-effects (sweep,
+  // profile, supporter sync) that _load() carries. On a transient error it keeps the last good feed.
+  Future<void> _refreshFeedQuiet() async {
+    if (_loading) return;                         // a full _load() is already in flight
+    try {
+      final results = await Future.wait([Api.feed(), Api.engagement()]);
+      final fd = results[0] as FeedData;
+      if (!mounted) return;
+      setState(() {
+        _posts = fd.posts;
+        _onchainBlocks = fd.onchainBlocks;
+        _relaysUp = fd.relaysUp;
+        _relaysTotal = fd.relaysTotal;
+        _engage = results[1] as Map<String, dynamic>;
+      });
+    } catch (_) {/* transient — keep showing the last good timeline */}
   }
 
   // start/stop the actual serving work as the charging+wifi gate flips
@@ -3712,6 +3734,9 @@ class _FeedScreenState extends State<FeedScreen> {
                               : 'signed & posted off-chain · 0 Nano blocks')));
     }
     await _load();
+    // the node caches the feed for ~5s, so a just-posted item can miss the immediate reload —
+    // a quiet follow-up once the cache expires makes your own post appear without a manual pull.
+    Future.delayed(const Duration(seconds: 6), () { if (mounted) _refreshFeedQuiet(); });
   }
 
   // quote a post (opens compose with the post embedded)
@@ -3934,7 +3959,9 @@ class _FeedScreenState extends State<FeedScreen> {
                     ? const _DiscoverHint()
                     : const _LedgerFooter();
               }
-              return _profileCard(posts[i]);
+              // stable identity per post so a feed refresh matches elements by post, not by slot —
+              // without this the list recycles cards across posts and their media gets mismatched
+              return KeyedSubtree(key: ValueKey(posts[i].id), child: _profileCard(posts[i]));
             },
           ),
         ),
@@ -5137,18 +5164,62 @@ class _KindBadge extends StatelessWidget {
   }
 }
 
-// a content-addressed image fetched via the engine (IPFS or relay cache)
-class MediaImage extends StatelessWidget {
+// A content-addressed image fetched via the engine (IPFS or relay cache). Content-addressed means
+// the CID *is* the bytes, so bytes can be cached forever by CID. This is stateful + per-CID cached
+// on purpose: a plain FutureBuilder re-fetches on every rebuild, and in a recycling ListView it would
+// show a PREVIOUS slot's image (gaplessPlayback keeps stale bytes) while the new one loads — so images
+// "jump" between posts. Here, bytes are keyed to a CID and a stale fetch result is dropped if the
+// widget was recycled to a different CID, so a slot only ever shows its own image.
+class MediaImage extends StatefulWidget {
   final String cid;
   final BoxFit fit;
   const MediaImage({super.key, required this.cid, this.fit = BoxFit.cover});
   @override
-  Widget build(BuildContext context) => FutureBuilder<Uint8List?>(
-        future: Api.media(cid),
-        builder: (_, snap) => (snap.hasData && snap.data != null)
-            ? Image.memory(snap.data!, fit: fit, gaplessPlayback: true)
-            : Container(color: kCard),
-      );
+  State<MediaImage> createState() => _MediaImageState();
+}
+
+class _MediaImageState extends State<MediaImage> {
+  static final Map<String, Uint8List> _cache = {};   // CID -> bytes, shared app-wide (bounded)
+  static const int _cacheMax = 48;
+  Uint8List? _bytes;
+  bool _loading = false;
+
+  @override
+  void initState() { super.initState(); _resolve(); }
+
+  @override
+  void didUpdateWidget(MediaImage old) {
+    super.didUpdateWidget(old);
+    if (old.cid != widget.cid) { _bytes = null; _loading = false; _resolve(); }  // recycled for another image
+  }
+
+  Future<void> _resolve() async {
+    final cid = widget.cid;
+    final hit = _cache[cid];
+    if (hit != null) { setState(() { _bytes = hit; _loading = false; }); return; }
+    setState(() => _loading = true);
+    final data = await Api.media(cid);
+    if (!mounted || cid != widget.cid) return;   // widget moved to a different CID → drop this result
+    if (data != null) {
+      _cache[cid] = data;
+      if (_cache.length > _cacheMax) _cache.remove(_cache.keys.first);  // evict oldest
+    }
+    setState(() { _bytes = data; _loading = false; });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_bytes != null) return Image.memory(_bytes!, fit: widget.fit, gaplessPlayback: true);
+    // loading → spinner (reads as loading, not broken); resolved-but-null → a plain dark tile
+    return Container(
+      color: kCard,
+      child: _loading
+          ? const Center(
+              child: SizedBox(width: 22, height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: kDim)))
+          : null,
+    );
+  }
 }
 
 class _MoviePreview extends StatelessWidget {
