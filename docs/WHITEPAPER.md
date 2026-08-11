@@ -50,10 +50,11 @@ ts, sig}`) that points to their current content, addressed by hash (CID). Heads 
   ciphertext.
 
 **Retention — a relay is a cache, not an archive.** A head expires on a TTL (its author republishes
-it while active); content blobs (media) are held under a byte cap and evicted **value-weighted**:
-under memory pressure a relay drops the *least-valuable* content first — old and untipped before
-tipped, well-tipped content last — so a relay can never grow without bound, yet it keeps what the
-network values. A blob's value is the tip total of the post that carries it, propagated with the
+it while active); content blobs (media) live **on disk in an embedded SQLite store** (so the cache
+survives a relay restart instead of vanishing with the process, and is bounded by disk rather than
+RAM) and are evicted **value-weighted**: under storage pressure a relay drops the *least-valuable*
+content first — old and untipped before tipped, well-tipped content last — so a relay can never grow
+without bound, yet it keeps what the network values. A blob's value is the tip total of the post that carries it, propagated with the
 content. Availability is therefore **economic, not eternal**: content survives because it is worth
 keeping, and **pay-to-pin** (§6) lets anyone pay a relay to protect a specific item from eviction for
 a span proportional to the amount. Content nobody values and nobody pins is eventually dropped — the
@@ -264,6 +265,12 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   ✅ (cap + auto-sweep, verified: 4.07 → 2.0 XNO, excess auto-moved out) · 🔨 (prevention side)
 - **A node redirects your tip to the attacker.** → **On-device signing**: you sign the exact
   recipient and amount locally; the node cannot alter it. 🔨
+- **Over-committing funds you don't have** (tips tallied off-chain, then a pin or a send drains the
+  balance, so settlement fails and a creator was never actually paid). → **Cross-path reservation**:
+  the un-settled tip tally is subtracted from available balance before a tip is accepted *and* before
+  a pay-to-pin or a wallet send — no path can spend XNO another has already claimed. An over-commit is
+  refused up front with the reason, not discovered at settle time. ✅ (verified live: with 0.48 XNO
+  and 0.01 tallied, a 0.475 send is refused — "0.01 reserved for pending tips")
 - **Reshare-payment gaming** (reshare after a tip to claim the split). → Attribution is **locked at
   tip time**. ✅
 - **Double-spend / balance forgery.** → Handled by Nano mainnet consensus, outside our trust surface. ✅
@@ -285,14 +292,29 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   🗺️; the alpha does **not** hide network metadata — treat it as public.
 
 ### Denial of service
-- **Spam floods relays.** → Signed events tie spam to a key (block/mute it); relay-side rate limits
-  and optional proof-of-work on posts are 🗺️.
-- **Storage exhaustion — flood a relay with content until it falls over.** → A relay is a **cache,
-  not an archive**: heads expire on a TTL, and content blobs are held under a byte cap and evicted
-  **value-weighted** (old + untipped first, tipped and pay-to-pinned last), so no amount of unpaid
-  content can grow a relay without bound. Keeping content alive costs XNO (§6), which prices the
-  attack. Read/aggregation load is bounded per node (a short feed cache) and scales by adding nodes
-  and relays; measured capacity and the scaling path are in `docs/SCALING.md`.
+
+*Can the network go down by spam? — the whole network, no; a single un-hardened relay, partly, today.*
+
+- **Storage exhaustion — flood a relay with media until it falls over.** → **Stopped.** Content blobs
+  live in a **byte-capped, value-weighted** on-disk cache (old + untipped evicted first, tipped and
+  pay-to-pinned last), so no volume of unpaid media grows a relay without bound, and keeping content
+  alive costs XNO (§6), which prices the attack. ✅
+- **Metadata / Sybil flood — mint unlimited keypairs and push a head (or a mention, or a DM) each.**
+  → **Partly bounded, honestly.** Heads and per-account records (follows, profiles, poll votes,
+  releases—capped at 24/author) are *filtered on read* (expired heads aren't served) and clients
+  **verify every signature**, so forged spam is inert junk that can never appear in a feed or
+  impersonate anyone. But today a relay does **not** actively prune expired heads, cap the number of
+  authors, or bound the notification/DM lists, and it does **not** rate-limit or require proof-of-work
+  on writes — so an unauthenticated Sybil flood *can* bloat one relay's RAM and slow it down. Fixes
+  are scoped and small (prune expired heads, cap/evict notifs+DMs, a cheap per-write PoW stamp or
+  per-IP rate limit, and drop the redundant per-write state flush in favor of the 5 s autosave). 🗺️🔨
+- **Why the *network* still doesn't go down.** → Relays **don't sync**, so poisoning one doesn't
+  spread; clients read the **union** of relays and drop any that misbehave; and anyone can stand up a
+  fresh relay in minutes. The worst case is "one relay gets slow or OOMs and restarts — clients keep
+  using the others." Availability is **plural by construction**, not dependent on any single host. ✅
+- **Request-rate DoS against a node.** → Read/aggregation load is bounded per node (a short feed
+  cache) and scales horizontally by adding nodes and relays; measured capacity and the scaling path
+  are in `docs/SCALING.md`. Per-node request rate-limiting is 🗺️.
 
 **The irreducible trust roots stay three:** your seed (on your device), the publisher's *public*
 key (pinned, verify-only), and the rendezvous addresses (keyless, plural). Everything else is
@@ -343,7 +365,10 @@ now shipped:
 - **Bounded, economic availability.** Relays are caches with a byte cap and **value-weighted
   eviction** (old + untipped dropped first), and **pay-to-pin** lets anyone pay a relay to keep a
   specific item — verified on-chain, no key held by the relay. So storage can't grow without bound,
-  and content survives because it is valued, not because a host promises to keep it forever.
+  and content survives because it is valued, not because a host promises to keep it forever. Media
+  blobs live in an **on-disk SQLite cache** that survives a relay restart (they used to sit in RAM and
+  vanish on redeploy) — verified live: the cache persisted a restart and a real photo posted from the
+  app landed in it and served back.
 
 **How that claim is tested.** `test/interop_test.py` signs one canonical message per write path with
 the *shipped* app wallet (Dart/nanodart) and verifies each with the *shipped* node verifier
@@ -357,8 +382,12 @@ hardware-backed — a rooted or physically compromised phone can read it (moving
 keystore is the next step). Moderation labeling is minimal. Network metadata is **not** private (no
 onion routing yet — treat your IP as visible). The node is single-identity-per-instance for the
 state it caches, though it no longer holds an identity that can sign. A relay's one-time on-chain
-*announcement* is a real (tiny) mainnet transaction the operator makes with a funded wallet. See the
-README for how to run a node, run a relay, announce it on-chain, and verify discovery yourself.
+*announcement* is a real (tiny) mainnet transaction the operator makes with a funded wallet. **Relay
+anti-spam is not finished**: media storage is byte-capped and forged content is inert (clients verify
+on read), but a single relay does not yet prune expired heads, bound its notification/DM lists, or
+rate-limit writes — so an un-hardened relay can be degraded by a Sybil flood even though the plural
+network routes around it (§9). See the README for how to run a node, run a relay, announce it
+on-chain, and verify discovery yourself.
 
 ---
 
