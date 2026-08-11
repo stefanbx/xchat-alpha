@@ -1047,13 +1047,20 @@ class Api {
   }
 
   // upload an image; returns its content-addressed cid (pinned to the relays)
+  static String? lastBlobErr;
   static Future<String?> blobPut(Uint8List bytes) async {
     try {
       final r = await http.post(Uri.parse('$kBase/api/blob_put'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'b64': base64Encode(bytes)}));
-      return jsonDecode(r.body)['cid'] as String?;
-    } catch (_) {
+          body: jsonEncode({'b64': base64Encode(bytes)})).timeout(const Duration(seconds: 45));
+      final cid = jsonDecode(r.body)['cid'] as String?;
+      if (cid == null || cid.isEmpty) {
+        final b = r.body;
+        lastBlobErr = 'HTTP ${r.statusCode}: ${b.length > 100 ? b.substring(0, 100) : b}';
+      }
+      return cid;
+    } catch (e) {
+      lastBlobErr = '$e';
       return null;
     }
   }
@@ -3609,8 +3616,9 @@ class _FeedScreenState extends State<FeedScreen> {
           duration: Duration(milliseconds: 1200), backgroundColor: kCard, content: Text('uploading media…')));
       mediaCid = await Api.blobPut(res.mediaBytes!) ?? '';
       if (mediaCid.isEmpty) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-            backgroundColor: kCard, content: Text('media upload failed — post not sent')));
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            duration: const Duration(seconds: 6),
+            backgroundColor: kCard, content: Text('media upload failed: ${Api.lastBlobErr ?? '?'}')));
         return;
       }
     }
