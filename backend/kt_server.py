@@ -134,6 +134,22 @@ def api_media_relay(cid):
             pass
     return json.dumps({'account': ''})
 
+def api_pin_targets():
+    # PUBLIC relays the app can pay + POST /pin to directly (skip the node's loopback relay), each with
+    # the account a pinner sends to. The app: send XNO to account -> POST relay/pin {cid, payhash}.
+    out, seen = [], set()
+    for r in xc.discover_relays():
+        if '127.0.0.1' in r or 'localhost' in r or not r.startswith('https'):
+            continue
+        try:
+            acct = json.loads(urllib.request.urlopen(r + '/relayacct', timeout=3).read()).get('account')
+            if acct and acct not in seen:
+                seen.add(acct)
+                out.append({'url': r.rstrip('/'), 'account': acct})
+        except Exception:
+            pass
+    return json.dumps({'relays': out})
+
 def api_head(acct):
     # the account's current signed head (seq + cid) across relays — the app re-signs it with a fresh
     # expiry to republish (keep it alive past TTL). A public read; no seed.
@@ -163,6 +179,7 @@ def route(path, query, body):
 
     if path.startswith('/api/feed'):        return api_feed()
     if path.startswith('/api/relaydir'):     spawn('xc_reldir.py', 'engine');                     return read('/tmp/xc_relaydir.json', '{}')
+    if path.startswith('/api/pin_targets'):  return api_pin_targets()
     # prefix collisions: /api/media_relay must precede /api/media, which must precede /api/me.
     if path.startswith('/api/media_relay'):   return api_media_relay(q('cid'))
     if path.startswith('/api/media'):        put('/tmp/xc_media_cid.txt', q('cid')); spawn('xc_media.py');    return read('/tmp/xc_media_result.json', '{}')

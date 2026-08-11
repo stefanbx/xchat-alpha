@@ -550,6 +550,52 @@ class Api {
     }
   }
 
+  // pay-to-pin: keep a post's content alive on the independent public relays. For each relay, send a
+  // little XNO to its account (on-device signed), then hand the payment hash to the relay so it protects
+  // the CID from eviction for a span proportional to what was paid. The seed never leaves the phone.
+  static Future<List<Map<String, dynamic>>> pinTargets() async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/pin_targets')).timeout(const Duration(seconds: 20));
+      return (((jsonDecode(r.body))['relays'] as List?) ?? [])
+          .map((e) => Map<String, dynamic>.from(e)).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  static Future<Map<String, dynamic>?> pin(String cid, double xno) async {
+    final w = gWallet;
+    if (w == null || cid.isEmpty) return {'ok': false, 'error': 'no content to pin'};
+    try {
+      final targets = await pinTargets();
+      if (targets.isEmpty) return {'ok': false, 'error': 'no public relay to pin on yet'};
+      final raw = _xnoToRaw(xno.toStringAsFixed(6));
+      final st = await accountState(w.account);
+      if (st == null || st['opened'] != true) return {'ok': false, 'error': 'wallet empty'};
+      if (BigInt.parse('${st['balance']}') < raw * BigInt.from(targets.length)) {
+        return {'ok': false, 'error': 'need ${(xno * targets.length).toStringAsFixed(3)} XNO for ${targets.length} relay(s)'};
+      }
+      int pinned = 0;
+      double days = 0;
+      String? err;
+      for (final t in targets) {
+        final payhash = await _sendRaw(w, '${t['account']}', raw);   // pay this relay, on-device signed
+        if (payhash == null) { err ??= 'payment failed'; continue; }
+        try {
+          final r = await http.post(Uri.parse('${t['url']}/pin'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({'cid': cid, 'payhash': payhash})).timeout(const Duration(seconds: 30));
+          final j = jsonDecode(r.body);
+          if (j['ok'] == true) { pinned++; days = (j['days'] ?? days).toDouble(); }
+          else { err ??= (j['error'] ?? 'pin refused').toString(); }
+        } catch (e) { err ??= '$e'; }
+      }
+      return {'ok': pinned > 0, 'pinned': pinned, 'relays': targets.length, 'days': days, 'error': err};
+    } catch (e) {
+      return {'ok': false, 'error': '$e'};
+    }
+  }
+
   // ---- on-device Nano money primitives (shared by send / settle / receive / rep-change) ----
 
   // XNO decimal string -> raw (×10^30), exact via BigInt (a double would overflow int64 at ~1e28).
@@ -1819,6 +1865,7 @@ class _FeedScreenState extends State<FeedScreen> {
         blocked: _blocked.contains(post.account),
         bookmarked: _bookmarks.contains(post.id),
         onBookmark: () => _toggleBookmark(post),
+        onPin: (post.media != null && post.media!.isNotEmpty) ? () => _pinPost(post) : null,
         onMute: post.account == _account ? null : () => _toggleMute(post.account, post.handle),
         onBlock: post.account == _account ? null : () => _toggleBlock(post.account, post.handle));
   }
@@ -2106,6 +2153,96 @@ class _FeedScreenState extends State<FeedScreen> {
         content: Text(on
             ? 'Unblocked @$handle'
             : 'Blocked @$handle — hidden, unfollowed, and their DMs won’t reach you')));
+  }
+
+  // pay-to-pin a post's media: pay the independent public relays so they keep it from being evicted.
+  // The payment (a real XNO send per relay) is the user's tap — the app signs it on-device.
+  void _pinPost(Post p) {
+    final cid = p.media ?? '';
+    if (cid.isEmpty) return;
+    double xno = 0.01;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kBg,
+      isScrollControlled: true,
+      builder: (_) {
+        bool pinning = false;
+        Map<String, dynamic>? result;
+        return StatefulBuilder(builder: (ctx, setSheet) {
+          final days = xno * 30000; // mirrors the relay's XC_PIN_DAYS_PER_XNO default
+          return Padding(
+            padding: EdgeInsets.fromLTRB(18, 16, 18, 22 + MediaQuery.of(ctx).viewInsets.bottom),
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: const [
+                Icon(Icons.push_pin, color: kAccent, size: 20),
+                SizedBox(width: 8),
+                Text('Keep this alive', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+              ]),
+              const SizedBox(height: 4),
+              const Text('Pay the independent relays a little XNO and they protect this content from '
+                  'eviction — pay-to-pin. The more you pay, the longer it stays. Unpaid content is dropped '
+                  'as the cache fills; this is how the network keeps what people value.',
+                  style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+              const SizedBox(height: 14),
+              const Text('Amount per relay', style: TextStyle(color: kDim, fontSize: 12)),
+              const SizedBox(height: 6),
+              Wrap(spacing: 8, children: [0.01, 0.05, 0.10].map((o) {
+                final on = (o - xno).abs() < 1e-9;
+                return GestureDetector(
+                  onTap: () => setSheet(() => xno = o),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                    decoration: BoxDecoration(
+                        color: on ? kAccent : kCard,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(color: on ? kAccent : kLine)),
+                    child: Text('${o.toStringAsFixed(2)} XNO',
+                        style: TextStyle(color: on ? Colors.black : kText, fontWeight: FontWeight.w700, fontSize: 13)),
+                  ),
+                );
+              }).toList()),
+              const SizedBox(height: 10),
+              Text('≈ ${days.toStringAsFixed(0)} days of pinning per relay',
+                  style: const TextStyle(color: kAccent, fontSize: 12.5, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 16),
+              if (result != null)
+                Text(
+                    result!['ok'] == true
+                        ? '📌 pinned on ${result!['pinned']}/${result!['relays']} relay(s) for ~${((result!['days'] ?? 0) as num).toStringAsFixed(0)} days'
+                        : 'pin failed: ${result!['error'] ?? 'unknown'}',
+                    style: TextStyle(
+                        color: result!['ok'] == true ? const Color(0xFF4DD0A7) : const Color(0xFFEF6C9B),
+                        fontSize: 13, fontWeight: FontWeight.w600))
+              else
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: pinning ? null : () async {
+                      setSheet(() => pinning = true);
+                      final r = await Api.pin(cid, xno);
+                      if (!ctx.mounted) return;
+                      setSheet(() { pinning = false; result = r; });
+                      await _load();
+                    },
+                    style: FilledButton.styleFrom(
+                        backgroundColor: kAccent, foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24))),
+                    child: pinning
+                        ? const SizedBox(height: 20, width: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
+                        : const Text('Pin & pay', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+                  ),
+                ),
+              const SizedBox(height: 8),
+              Text(pinning ? 'signing on-device · delegating proof-of-work…'
+                          : 'mainnet · real XNO · one send per relay · PoW delegated',
+                  textAlign: TextAlign.center, style: const TextStyle(color: kDim, fontSize: 11)),
+            ]),
+          );
+        });
+      },
+    );
   }
 
   // ---- private bookmarks (on-device) ----
@@ -4594,7 +4731,7 @@ class PostCard extends StatefulWidget {
   final bool liked, reposted;
   final int commentCount;
   final VoidCallback onTip, onLike, onRepost, onReport, onComment;
-  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark;
+  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin;
   final bool muted, blocked, bookmarked;
   final Post? quoted; // resolved quoted post (for a quote-post), rendered inline
   final bool inThread; // part of an author thread → show a thread affordance
@@ -4619,6 +4756,7 @@ class PostCard extends StatefulWidget {
       this.onMute,
       this.onBlock,
       this.onBookmark,
+      this.onPin,
       this.muted = false,
       this.blocked = false,
       this.bookmarked = false,
@@ -4804,6 +4942,14 @@ class _PostCardState extends State<PostCard> {
                   : 'hide them, unfollow, and drop their DMs (your view only)',
                   style: const TextStyle(color: kDim, fontSize: 11)),
               onTap: () { Navigator.pop(context); widget.onBlock!(); },
+            ),
+          if (widget.onPin != null)
+            ListTile(
+              leading: const Icon(Icons.push_pin_outlined, color: kAccent),
+              title: const Text('Pin content', style: TextStyle(color: kText, fontWeight: FontWeight.w600)),
+              subtitle: const Text('pay a little XNO so the relays keep this alive — pay-to-pin',
+                  style: TextStyle(color: kDim, fontSize: 11)),
+              onTap: () { Navigator.pop(context); widget.onPin!(); },
             ),
           ListTile(
             leading: const Icon(Icons.flag_outlined, color: Color(0xFFEF6C9B)),
