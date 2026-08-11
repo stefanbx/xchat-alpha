@@ -100,14 +100,14 @@ blob_meta = {}                       # cid -> {'size','last','tips','reports'} �
 # so ONE score — tips minus reports — ranks EVERYTHING: eviction (low score drops first), sync-the-best
 # (high score replicates first; reported content isn't propagated), and a hard takedown once distinct
 # reporters cross the threshold (the media is deleted; the post drops from the feed for everyone).
-REPORT_WEIGHT   = float(os.environ.get('XC_REPORT_WEIGHT', '0.05'))   # XNO-equiv value each report cancels
-REPORT_TAKEDOWN = int(os.environ.get('XC_REPORT_TAKEDOWN', '3'))      # distinct reporters -> priority drop
+REPORT_WEIGHT   = float(os.environ.get('XC_REPORT_WEIGHT', '0.05'))   # XNO-equiv value one rep-unit cancels
+TAKEDOWN_WEIGHT = float(os.environ.get('XC_TAKEDOWN_WEIGHT', '2'))    # reputation-weighted reporters -> drop
 REPORT_POSTS    = int(os.environ.get('XC_REPORT_POSTS', '50000'))     # cap distinct reported posts
 REPORT_PER_POST = int(os.environ.get('XC_REPORT_PER_POST', '1000'))   # cap reporters stored per post
-_blob_reporters = {}                 # cid -> set(reporter accounts) (dedupe + count; rebuilt on load)
+_blob_reporters = {}                 # cid -> {account: reputation} (dedupe + weight; rebuilt on load)
 
-def blob_score(m):                   # the universal value: tips earned minus the moderation penalty
-    return float(m.get('tips', 0.0)) - int(m.get('reports', 0)) * REPORT_WEIGHT
+def blob_score(m):                   # the universal value: tips earned minus the reputation-weighted penalty
+    return float(m.get('tips', 0.0)) - float(m.get('reports', 0.0)) * REPORT_WEIGHT
 
 _DB = os.path.join(os.path.dirname(os.path.abspath(STORE)) or '.', 'blobs.db')
 _db = sqlite3.connect(_DB, check_same_thread=False)
@@ -135,22 +135,24 @@ def blob_put(cid, b64, tips=0.0):
         _db.execute('INSERT OR REPLACE INTO blob (cid,b64,size,last,tips) VALUES (?,?,?,?,?)',
                     (cid, b64, len(b64 or ''), now, t))
         blob_meta[cid] = {'size': len(b64 or ''), 'last': now, 'tips': t,
-                          'reports': len(_blob_reporters.get(cid, ()))}   # carry any existing reports
+                          'reports': sum(_blob_reporters.get(cid, {}).values())}   # carry existing report weight
         _evict_locked()
         _db.commit()
 
-def blob_report(cid, account):
-    # a signed community report referencing this media: a NEGATIVE term in blob_score, and a hard
-    # PRIORITY TAKEDOWN (delete now, ignore the cap) once distinct reporters cross REPORT_TAKEDOWN —
-    # unless the content is paid-pinned (paying still protects; the viewer's filter hides it anyway).
-    if not cid:
+def blob_report(cid, account, rep):
+    # a signed, reputation-WEIGHTED community report referencing this media: a NEGATIVE term in
+    # blob_score, and a hard PRIORITY TAKEDOWN (delete now, ignore the cap) once the weighted sum of
+    # distinct reporters crosses TAKEDOWN_WEIGHT — unless the content is paid-pinned. Weighting by
+    # account_rep is what stops a pile of empty throwaway accounts from forcing a takedown.
+    if not cid or rep <= 0:
         return
     with _blob_lock:
-        s = _blob_reporters.setdefault(cid, set()); s.add(account)
+        s = _blob_reporters.setdefault(cid, {}); s[account] = rep     # dedupe by account, keep its weight
+        w = sum(s.values())
         m = blob_meta.get(cid)
         if m:
-            m['reports'] = len(s)
-        if m and len(s) >= REPORT_TAKEDOWN and pinned.get(cid, 0) <= time.time():
+            m['reports'] = w
+        if m and w >= TAKEDOWN_WEIGHT and pinned.get(cid, 0) <= time.time():
             _db.execute('DELETE FROM blob WHERE cid=?', (cid,)); _db.commit()
             blob_meta.pop(cid, None)
 
@@ -176,7 +178,7 @@ def _evict_locked():                 # called with _blob_lock held; drops least-
 def blob_load_meta():                # startup: rebuild the small RAM index from the SQLite table
     with _blob_lock:
         for cid, size, last, tips in _db.execute('SELECT cid,size,last,tips FROM blob'):
-            blob_meta[cid] = {'size': size, 'last': last, 'tips': tips or 0.0, 'reports': 0}
+            blob_meta[cid] = {'size': size, 'last': last, 'tips': tips or 0.0, 'reports': 0.0}
 
 def grant_pin(cid, payhash):
     # PAY-TO-PIN: verify payhash is a confirmed Nano send TO this relay's account, then protect cid
@@ -244,14 +246,14 @@ load_state()
 blob_load_meta()
 for _m in dms:                                       # rebuild the DM dedup index from the loaded mailbox
     _dm_seen.add((_m.get('from'), _m.get('ts')))
-for _pid, _recs in reports.items():                  # rebuild per-cid reporter sets -> blob report counts
+for _pid, _recs in reports.items():                  # rebuild per-cid reporter weights -> blob penalty
     for _acc, _rec in (_recs or {}).items():
-        _c = (_rec or {}).get('cid')
-        if _c:
-            _blob_reporters.setdefault(_c, set()).add(_acc)
+        _c = (_rec or {}).get('cid'); _rp = float((_rec or {}).get('rep', 0) or 0)
+        if _c and _rp > 0:
+            _blob_reporters.setdefault(_c, {})[_acc] = _rp
 for _c, _s in _blob_reporters.items():
     if _c in blob_meta:
-        blob_meta[_c]['reports'] = len(_s)
+        blob_meta[_c]['reports'] = sum(_s.values())
 
 def prune():
     # Actively DROP expired heads (not just hide them on read), so a Sybil flood can't grow `heads`
@@ -536,17 +538,23 @@ class H(BaseHTTPRequestHandler):
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         elif self.path.startswith('/report'):
-            # a signed community report {post_id, account, ts, sig, pub, cid?}. One per account per post;
-            # the relay stores it (verifies nothing — the node checks sigs on aggregate) and applies the
-            # moderation penalty to the referenced media (lower eviction/sync score, hard takedown at N).
+            # a signed community report {post_id, account, ts, sig, pub, cid?}. Moderation has real
+            # consequences (a takedown), so unlike other writes the relay VERIFIES the signature +
+            # key↔author binding here — otherwise a spoofer could attribute weight to a high-reputation
+            # account that never reported. One per account per post; weighted by the reporter's on-chain
+            # reputation (snapshot stored so a restart needs no re-RPC).
             try:
                 m = json.loads(raw); pid = m['post_id']; acc = m['account']
+                pub, sig, ts = m.get('pub', ''), m.get('sig', ''), m.get('ts', 0)
+                if xc is None or xc.pub_to_addr(pub) != acc \
+                        or not xc.verify_msg(pub, 'report|%s|%s|%s' % (acc, pid, ts), sig):
+                    self._send(400, json.dumps({'ok': False, 'error': 'bad report signature'})); return
                 recs = reports.setdefault(pid, {})
                 fresh = acc not in recs and (pid in reports or len(reports) <= REPORT_POSTS) and len(recs) < REPORT_PER_POST
                 if fresh:
-                    recs[acc] = {'ts': m.get('ts', 0), 'sig': m.get('sig', ''),
-                                 'pub': m.get('pub', ''), 'cid': m.get('cid', '')}
-                    blob_report(m.get('cid', ''), acc)          # penalise + maybe take down the media
+                    rep = xc.account_rep(acc)                   # Sybil-resistant weight (0 for a throwaway)
+                    recs[acc] = {'ts': ts, 'sig': sig, 'pub': pub, 'cid': m.get('cid', ''), 'rep': rep}
+                    blob_report(m.get('cid', ''), acc, rep)     # penalise + maybe take down the media
                 self._send(200, json.dumps({'ok': True, 'reports': len(recs)}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))

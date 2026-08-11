@@ -50,29 +50,13 @@ for r in RELAYS:
     except Exception:
         pass
 
-# COMMUNITY REPORTS as a NEGATIVE value: the same score the relay evicts by (tips minus reports) also
-# ranks what we replicate. Reported content sinks; taken-down content (>= TAKEDOWN verified reporters)
-# is NOT propagated at all — a bad post must not be spread to more relays. Sign-checked so one relay
-# can't suppress content by fabricating reports.
+# COMMUNITY REPORTS as a NEGATIVE value: the same score the relay evicts by (tips minus reputation-
+# weighted reports) also ranks what we replicate. Reported content sinks; taken-down content (weighted
+# reports >= TAKEDOWN_WEIGHT) is NOT propagated at all — a bad post must not be spread to more relays.
+# Verified + reputation-weighted in xc_common.aggregate_reports (Sybil-resistant).
 REPORT_WEIGHT = float(os.environ.get('XC_REPORT_WEIGHT', '0.05'))
-TAKEDOWN = int(os.environ.get('XC_REPORT_TAKEDOWN', '3'))
-def _rv(pub, msg, sig):
-    try:
-        return xc.verify_msg(pub, msg, sig)
-    except Exception:
-        return False
-post_reports = {}                                        # post_id -> distinct valid reporter count
-for r in RELAYS:
-    try:
-        d = json.loads(urllib.request.urlopen(r + '/reports', timeout=4).read()).get('reports', {})
-        for pid, recs in d.items():
-            accs = {acc for acc, rec in (recs or {}).items()
-                    if xc.pub_to_addr(rec.get('pub', '')) == acc
-                    and _rv(rec.get('pub', ''), f"report|{acc}|{pid}|{rec.get('ts', 0)}", rec.get('sig', ''))}
-            if accs:
-                post_reports[pid] = max(post_reports.get(pid, 0), len(accs))
-    except Exception:
-        pass
+TAKEDOWN_W = float(os.environ.get('XC_TAKEDOWN_WEIGHT', '2'))
+post_reports = {pid: e['weight'] for pid, e in xc.aggregate_reports(RELAYS).items()}   # post_id -> weight
 
 cids = {}                                                # cid -> tips (XNO): media = its post's tips,
 cid_reports = {}                                         # cid -> reporter count of the post using it
@@ -104,7 +88,7 @@ SYNC_BUDGET = int(float(os.environ.get('XC_SYNC_BUDGET_MB', '32')) * 1024 * 1024
 ranked = sorted(cids.keys(), key=lambda c: -score(c))    # highest score (tips - reports) first
 spent = 0; blobs = 0; backfilled = 0; skipped = 0; suppressed = 0
 for cid in ranked:
-    if cid_reports.get(cid, 0) >= TAKEDOWN:              # community takedown — do not propagate
+    if cid_reports.get(cid, 0) >= TAKEDOWN_W:           # community takedown — do not propagate
         suppressed += 1
         continue
     data = fetch(cid)

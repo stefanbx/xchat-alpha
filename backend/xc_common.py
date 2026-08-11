@@ -145,6 +145,56 @@ def pub_to_addr(pubhex):  # 32-byte pubkey hex -> nano_ address (binds a head's 
     csbits = ''.join(bin(b)[2:].zfill(8) for b in cs)
     return 'nano_' + _b32enc(pkbits) + _b32enc(csbits)
 
+# --- Sybil-resistant moderation weight -----------------------------------------------------------
+# A community report counts for its author's ON-CHAIN reputation, not one-account-one-vote, so a
+# takedown needs reporters with real skin in the game, not a pile of empty throwaway keypairs.
+REP_BAL_FULL = float(os.environ.get('XC_REP_BAL_FULL', '1'))    # XNO balance for full balance credit
+REP_BLK_FULL = float(os.environ.get('XC_REP_BLK_FULL', '10'))   # chain blocks for full activity credit
+REP_TTL      = float(os.environ.get('XC_REP_TTL', '300'))       # cache an account's reputation this long
+_rep_cache = {}
+
+def account_rep(account):
+    # Reputation in [0,1]. An UNOPENED account (a fresh throwaway) weighs 0. An opened account gets a
+    # small floor plus credit for balance and chain height — both need real, costly on-chain activity
+    # to fake at scale. Cached (moderation is infrequent; this keeps the aggregation cheap).
+    now = time.time()
+    c = _rep_cache.get(account)
+    if c and now - c[1] < REP_TTL:
+        return c[0]
+    rep = 0.0
+    try:
+        info = rpc({'action': 'account_info', 'account': account})
+        if info and 'balance' in info and 'error' not in info:
+            bal = int(info.get('balance', '0')) / 1e30
+            blocks = int(info.get('block_count', '0'))
+            rep = min(1.0, 0.2 + 0.4 * min(1.0, bal / REP_BAL_FULL) + 0.4 * min(1.0, blocks / REP_BLK_FULL))
+    except Exception:
+        rep = 0.0
+    _rep_cache[account] = (rep, now)
+    return rep
+
+def aggregate_reports(relays):
+    # Read /reports from every relay, VERIFY each signature + key<->author binding, dedupe by account,
+    # and weight each reporter by account_rep. Returns post_id -> {'weight', 'count', 'cid'} where
+    # weight is the reputation-weighted sum that drives the labeler fraction, feed takedown, and sync.
+    per = {}
+    for r in relays:
+        try:
+            d = json.loads(urllib.request.urlopen(r + '/reports', timeout=4).read()).get('reports', {})
+        except Exception:
+            continue
+        for pid, recs in (d or {}).items():
+            for acc, rec in (recs or {}).items():
+                pub, sig, ts = rec.get('pub', ''), rec.get('sig', ''), rec.get('ts', 0)
+                if pub_to_addr(pub) != acc or not verify_msg(pub, 'report|%s|%s|%s' % (acc, pid, ts), sig):
+                    continue
+                e = per.setdefault(pid, {'accts': {}, 'cid': ''})
+                e['accts'][acc] = account_rep(acc)          # dedupe by account across relays
+                if rec.get('cid'):
+                    e['cid'] = rec.get('cid')
+    return {pid: {'weight': round(sum(e['accts'].values()), 4), 'count': len(e['accts']), 'cid': e['cid']}
+            for pid, e in per.items()}
+
 def gsend(dst_pub, amt):  # genesis -> dst_pub, returns the send hash
     gi = rpc({'action': 'account_info', 'account': derive(GEN)[0]}); nb = str(int(gi['balance']) - amt)
     d = sign(GEN, gi['frontier'], GPUB, nb, dst_pub); wk = rpc({'action': 'work_generate', 'hash': gi['frontier']})['work']

@@ -113,8 +113,17 @@ from the feed for everyone and its media is deleted from the relays — a **comm
 not a per-viewer hide. Paying to pin still protects content from eviction, and every report is signed,
 so a single relay cannot suppress content by fabricating reports. This is a deliberate shift from
 "nothing is ever deleted": the network now removes what a quorum flags, while individuals keep a
-finer, reversible filter on top. *Honest limit:* reporters are counted, not yet reputation-weighted, so
-Sybil resistance is limited — many cheap accounts could push a takedown; stake-weighting is the fix. 🔨
+finer, reversible filter on top.
+
+**Reputation-weighted, not one-account-one-vote.** Each report counts for its author's **on-chain
+reputation** — an *unopened* throwaway account weighs **0**, and an opened account earns weight from
+its balance and chain activity (both costly to fake at scale). The takedown threshold and the shield
+fraction are over this **weighted** sum, so a pile of empty keypairs can't force anything: it takes
+reporters with real skin in the game. The weight is verified from the ledger (`account_rep`) and one
+score — `tips − weighted_reports` — still drives eviction, sync, and takedown alike. ✅ *Residual:* the
+weight is a fixed balance+activity formula, not yet decayed-by-inactivity or accuracy-scored, and a
+genuinely wealthy adversary is not priced out — the knobs (`XC_REP_*`, `XC_TAKEDOWN_WEIGHT`) are how
+you tune it. 🔨
 
 ## 6. Funding — tips reward creators, pay-to-pin keeps content alive
 
