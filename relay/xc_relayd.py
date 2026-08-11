@@ -3,7 +3,7 @@
 # gossips relay membership (bootstrap + /relays), and expires stale heads (TTL). Independent
 # and swappable — run several; clients DISCOVER the set from a bootstrap, no hardcoding.
 # Usage: xc_relayd.py <port> <store.json> [bootstrap_url ...]
-import json, sys, os, time, threading, urllib.request
+import json, sys, os, time, threading, sqlite3, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import importlib.util
@@ -36,7 +36,6 @@ BOOTSTRAPS = sys.argv[3:]
 heads = {}
 notifs = {}
 supporters = {}
-blobs = {}                           # cid -> base64 content (a relay is also a content cache)
 follows = {}                         # account -> signed follow-list record (portable follow graph)
 comments = {}                        # post_id -> list of signed comment events (off-chain replies)
 releases = {}                        # publisher account -> signed release record (self-update head)
@@ -46,57 +45,71 @@ dms = []                             # list of encrypted direct messages (cipher
 pollvotes = {}                       # poll_id -> {account: signed vote record} (one vote per account)
 known = {SELF}                       # relays this relay knows about
 
-# --- content cache: a relay is a CACHE, not an archive ---
-# Blobs are held under a byte cap and evicted least-recently-used, so the store can't grow without
-# bound and OOM the box. Pay-to-pin (below) is the exception: a CID someone has PAID to keep is
-# protected from eviction until the paid span elapses. Heads already expire on their own TTL.
-BLOB_CAP = int(float(os.environ.get('XC_BLOB_CAP_MB', '128')) * 1024 * 1024)   # cache size ceiling
+# --- content cache: a relay is a CACHE, not an archive, and blobs live on DISK ---
+# Media blobs are held in an embedded SQLite table (not RAM, not the JSON store), so the relay's
+# memory stays small and the cache can be as large as the disk, and writes are INCREMENTAL (one row
+# per put/evict) instead of re-serialising the whole state every few seconds. A byte cap + eviction
+# still apply: keep everything until full, then drop the LEAST-VALUABLE unpinned blobs first —
+# untipped before tipped, least-recently-used within a level. Pay-to-pin protects a CID until paid.
+BLOB_CAP = int(float(os.environ.get('XC_BLOB_CAP_MB', '512')) * 1024 * 1024)   # disk cache ceiling
 PIN_DAYS_PER_XNO = float(os.environ.get('XC_PIN_DAYS_PER_XNO', '30000'))       # 0.001 XNO ≈ 30 days pinned
 _PIN_S_PER_RAW = PIN_DAYS_PER_XNO * 86400.0 / 1e30
 pinned = {}                          # cid -> pin-expiry epoch (paid); survives eviction until then
 pins_paid = {}                       # payment block hash -> cid (consumed once; audit + no double-claim)
-blob_meta = {}                       # cid -> {'size': bytes, 'last': epoch}  (LRU bookkeeping; rebuilt on load)
-_blob_lock = threading.Lock()
+blob_meta = {}                       # cid -> {'size','last','tips'} — small RAM index for eviction only
+
+_DB = os.path.join(os.path.dirname(os.path.abspath(STORE)) or '.', 'blobs.db')
+_db = sqlite3.connect(_DB, check_same_thread=False)
+_db.execute('PRAGMA journal_mode=WAL')
+_db.execute('CREATE TABLE IF NOT EXISTS blob (cid TEXT PRIMARY KEY, b64 TEXT NOT NULL, '
+            'size INTEGER, last REAL, tips REAL)')
+_db.commit()
+_blob_lock = threading.Lock()        # serialises all SQLite access (fine at relay throughput)
 
 def _blob_total():
     return sum(m['size'] for m in blob_meta.values())
 
+def blob_get(cid):                   # serve content from disk
+    with _blob_lock:
+        r = _db.execute('SELECT b64 FROM blob WHERE cid=?', (cid,)).fetchone()
+    return r[0] if r else None
+
+def blob_has(cid):
+    return cid in blob_meta
+
 def blob_put(cid, b64, tips=0.0):
     with _blob_lock:
-        blobs[cid] = b64
-        m = blob_meta.get(cid) or {}
-        m.update({'size': len(b64 or ''), 'last': time.time(),
-                  'tips': max(float(tips or 0), float(m.get('tips', 0)))})   # value only ratchets up
-        blob_meta[cid] = m
+        now = time.time()
+        t = max(float(tips or 0), float((blob_meta.get(cid) or {}).get('tips', 0)))   # value ratchets up
+        _db.execute('INSERT OR REPLACE INTO blob (cid,b64,size,last,tips) VALUES (?,?,?,?,?)',
+                    (cid, b64, len(b64 or ''), now, t))
+        blob_meta[cid] = {'size': len(b64 or ''), 'last': now, 'tips': t}
         _evict_locked()
+        _db.commit()
 
-def blob_touch(cid):                 # a read counts as use, so popular content isn't the first evicted
+def blob_touch(cid):                 # a read counts as use; RAM-only (avoids a write per read)
     m = blob_meta.get(cid)
     if m:
         m['last'] = time.time()
 
-def _evict_locked():
-    # Keep everything until the cap is reached, then drop the LEAST-VALUABLE unpinned blobs first:
-    # untipped before tipped, and within a tip level the least-recently-used. So old + untipped go
-    # first, well-tipped content stays longest, and paid pins are never touched. (Sync, elsewhere,
-    # replicates the most-valued; the weak stay single-copy; evicted is gone.)
+def _evict_locked():                 # called with _blob_lock held; drops least-valuable unpinned first
     total = _blob_total()
     if total <= BLOB_CAP:
         return
     now = time.time()
     victims = sorted((m.get('tips', 0.0), m['last'], c)
-                     for c, m in blob_meta.items() if pinned.get(c, 0) <= now)   # low value + old first
+                     for c, m in blob_meta.items() if pinned.get(c, 0) <= now)
     for _tips, _last, c in victims:
         if total <= BLOB_CAP:
             break
         total -= blob_meta[c]['size']
-        blobs.pop(c, None)
+        _db.execute('DELETE FROM blob WHERE cid=?', (c,))
         blob_meta.pop(c, None)
 
-def blob_rebuild_meta():             # after a restart, rebuild sizes from the loaded blobs
-    now = time.time()
-    for c, b in list(blobs.items()):
-        blob_meta.setdefault(c, {'size': len(b or ''), 'last': now, 'tips': 0.0})
+def blob_load_meta():                # startup: rebuild the small RAM index from the SQLite table
+    with _blob_lock:
+        for cid, size, last, tips in _db.execute('SELECT cid,size,last,tips FROM blob'):
+            blob_meta[cid] = {'size': size, 'last': last, 'tips': tips or 0.0}
 
 def grant_pin(cid, payhash):
     # PAY-TO-PIN: verify payhash is a confirmed Nano send TO this relay's account, then protect cid
@@ -122,7 +135,7 @@ def grant_pin(cid, payhash):
 
 # --- persistence: the WHOLE relay state survives a restart, not just heads ---
 # (in-memory before this meant comments, uploaded media, likes, poll votes vanished on restart)
-_STATE_KEYS = ('engage', 'notifs', 'supporters', 'blobs', 'follows', 'comments',
+_STATE_KEYS = ('engage', 'notifs', 'supporters', 'follows', 'comments',   # blobs now live in SQLite
                'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'pinned', 'pins_paid')
 
 def load_state():
@@ -142,6 +155,9 @@ def load_state():
                 g.update(v)
             elif isinstance(g, list) and isinstance(v, list):
                 g.extend(v)
+        for cid, b64 in (d.get('blobs') or {}).items():   # one-time migration: legacy in-JSON blobs -> SQLite
+            if b64:
+                blob_put(cid, b64)
     except Exception:
         pass
 
@@ -158,7 +174,7 @@ def save():
         pass
 
 load_state()
-blob_rebuild_meta()
+blob_load_meta()
 
 def _autosave():                                     # flush every few seconds so a restart loses ≤5s
     while True:
@@ -217,14 +233,14 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/blob'):
             cid = qs(self.path).get('cid', '')
             blob_touch(cid)                                             # a read is use → LRU keeps it longer
-            self._send(200, json.dumps({'cid': cid, 'b64': blobs.get(cid)}))   # serve cached content
+            self._send(200, json.dumps({'cid': cid, 'b64': blob_get(cid)}))   # serve cached content from disk
         elif self.path.startswith('/cache'):                           # cache health: size vs cap, pins
             now = time.time()
-            self._send(200, json.dumps({'relay': PORT, 'blobs': len(blobs), 'bytes': _blob_total(),
+            self._send(200, json.dumps({'relay': PORT, 'blobs': len(blob_meta), 'bytes': _blob_total(),
                                         'cap': BLOB_CAP, 'pinned': sum(1 for e in pinned.values() if e > now)}))
         elif self.path.startswith('/haveblob'):
             cid = qs(self.path).get('cid', '')
-            self._send(200, json.dumps({'cid': cid, 'have': cid in blobs,
+            self._send(200, json.dumps({'cid': cid, 'have': blob_has(cid),
                                         'pinned_until': int(pinned.get(cid, 0)),
                                         'tips': (blob_meta.get(cid) or {}).get('tips', 0.0)}))
         elif self.path.startswith('/followers'):
@@ -303,7 +319,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/blob'):
             # a supporter caches content here (content-addressed — cid names the bytes); byte-capped + LRU
             try:
-                m = json.loads(raw); cid = m['cid']; new = cid not in blobs
+                m = json.loads(raw); cid = m['cid']; new = not blob_has(cid)
                 blob_put(cid, m['b64'], tips=m.get('tips', 0))   # tips = the post's value, ranks eviction
                 self._send(200, json.dumps({'ok': True, 'stored': new, 'cache_bytes': _blob_total()}))
             except Exception as e:
