@@ -792,7 +792,7 @@ class Api {
     }
   }
 
-  // wallet: send Nano to any address (dev network, feeless, PoW delegated).
+  // wallet: send Nano to any address (mainnet, feeless, PoW delegated).
   // ON-DEVICE SIGNED: builds + signs the send block locally; the node only adds PoW + broadcasts.
   static Future<Map<String, dynamic>?> send(String to, String amount) async {
     final w = gWallet;
@@ -1382,8 +1382,31 @@ class _FeedScreenState extends State<FeedScreen> {
     return '';
   }
 
+  // spendable balance (XNO) and the off-chain tally waiting to be settled
+  double _walletXno() => (double.tryParse(_balance) ?? 0) / 1e30;
+  double _pendingTotal() => _pending.values.fold(0.0, (a, b) => a + b);
+
+  // A tip is a promise to pay in real XNO at settle time. Tallying one the wallet can't cover
+  // misleads the user into thinking a creator was paid when settlement will simply fail — so a tip
+  // is refused whenever it would push the total tally past the wallet balance (0 funds is just the
+  // first case of that). Balance and tally are both in XNO.
+  bool _guardTip(double amt) {
+    final have = _walletXno();
+    if (_pendingTotal() + amt <= have + 1e-9) return true;
+    _load(); // balance may be stale (e.g. funds just received) — refresh so the next tap can pass
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: kCard,
+        duration: const Duration(milliseconds: 2600),
+        content: Text(have <= 0
+            ? 'Your wallet has 0 XNO — receive some before you can tip'
+            : 'Not enough XNO: ${have.toStringAsFixed(3)} in wallet, '
+                '${(_pendingTotal() + amt).toStringAsFixed(2)} would be tallied')));
+    return false;
+  }
+
   void _tallyTip(Post p) {
     final amt = _settings.defaultTip;
+    if (!_guardTip(amt)) return;
     setState(() {
       _pending[p.account] = (_pending[p.account] ?? 0) + amt;
       _handleOf[p.account] = p.handle;
@@ -1431,6 +1454,11 @@ class _FeedScreenState extends State<FeedScreen> {
           backgroundColor: kCard,
           content: Text(
               '⚡ auto-settled ${amt.toStringAsFixed(2)} XNO → @$handle · 1 block (policy ≥${_autoThreshold.toStringAsFixed(2)})')));
+    } else if (r != null && mounted) {
+      // a failed auto-settle must not fail silently — the tally stays pending and the user is told why
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          backgroundColor: kCard,
+          content: Text('auto-settle held: ${r['error'] ?? 'failed'} — still pending')));
     }
   }
 
@@ -1500,20 +1528,29 @@ class _FeedScreenState extends State<FeedScreen> {
 
   Future<void> _settle() async {
     final entries = _pending.entries.toList();
-    int blocks = 0;
+    int blocks = 0, failedCount = 0;
+    String? err;
     for (final e in entries) {
       final r = await Api.settle(e.key, e.value.toStringAsFixed(2),
           split: _settings.relaySplit, rsplit: _settings.reposterSplit,
           reposter: _reposterOf[e.key] ?? '', media: _mediaOf[e.key] ?? '');
-      if (r != null && r['ok'] == true) blocks++;
+      if (r != null && r['ok'] == true) {
+        blocks++;
+        // clear ONLY what actually settled — an unpaid tally must stay pending, not silently vanish
+        setState(() { _pending.remove(e.key); _reposterOf.remove(e.key); _mediaOf.remove(e.key); });
+      } else {
+        failedCount++;
+        err ??= r?['error']?.toString();
+      }
     }
-    setState(() { _pending.clear(); _reposterOf.clear(); _mediaOf.clear(); });
     await _load(); // refresh the footprint meter
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        backgroundColor: kCard,
-        content: Text(
-            'settled ${entries.length} creator${entries.length == 1 ? '' : 's'} in $blocks Nano block${blocks == 1 ? '' : 's'} · ⚙ PoW delegated (0 ms on device)')));
+    final msg = failedCount == 0
+        ? 'settled ${entries.length} creator${entries.length == 1 ? '' : 's'} in $blocks Nano block${blocks == 1 ? '' : 's'} · ⚙ PoW delegated (0 ms on device)'
+        : blocks > 0
+            ? 'settled $blocks of ${entries.length} · $failedCount unpaid (${err ?? 'failed'}) — still pending'
+            : 'nothing settled — ${err ?? 'settle failed'}. Your tips are still pending.';
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(backgroundColor: kCard, content: Text(msg)));
   }
 
   // ---- reputation-weighted, earned + decaying (ported from the KeelTube client) ----
@@ -1929,6 +1966,7 @@ class _FeedScreenState extends State<FeedScreen> {
   // tip a COMMENT: tally to the comment's author, stat on the comment's own id, notify.
   void _tallyCommentTip(Map<String, dynamic> c) {
     final amt = _settings.defaultTip;
+    if (!_guardTip(amt)) return;
     final acct = (c['account'] ?? '') as String;
     final handle = (c['handle'] ?? '') as String;
     final cid = (c['cid'] ?? '') as String;
@@ -2200,7 +2238,7 @@ class _FeedScreenState extends State<FeedScreen> {
               ]),
             ),
             const SizedBox(height: 16),
-            // send / receive Nano (dev network — valueless test tokens)
+            // send / receive Nano (mainnet — real XNO)
             Row(children: [
               Expanded(
                 child: FilledButton.icon(
@@ -2232,7 +2270,7 @@ class _FeedScreenState extends State<FeedScreen> {
               ),
             ]),
             const SizedBox(height: 6),
-            Text('dev network · valueless test tokens · feeless · PoW delegated · safety cap ${kWalletCapXno.toStringAsFixed(0)} XNO',
+            Text('mainnet · real XNO · feeless · PoW delegated · safety cap ${kWalletCapXno.toStringAsFixed(0)} XNO',
                 style: const TextStyle(color: kDim, fontSize: 11)),
             const SizedBox(height: 12),
             // safety: auto-forward anything above the cap to an external savings address (app holds no key for it)
@@ -2441,7 +2479,7 @@ class _FeedScreenState extends State<FeedScreen> {
                     : const Text('Change representative', style: TextStyle(fontWeight: FontWeight.w800)),
               )),
               const SizedBox(height: 8),
-              const Text('dev network · a change block moves no value', style: TextStyle(color: kDim, fontSize: 11)),
+              const Text('mainnet · a change block moves no value', style: TextStyle(color: kDim, fontSize: 11)),
             ]),
           ),
         );
@@ -2449,7 +2487,7 @@ class _FeedScreenState extends State<FeedScreen> {
     );
   }
 
-  // send Nano to any address (dev network). Validation + result handled by the engine.
+  // send Nano to any address (mainnet). Validation + result handled by the node.
   void _showSend() {
     final toCtl = TextEditingController();
     final amtCtl = TextEditingController(text: _settings.defaultTip.toStringAsFixed(2));
@@ -2524,7 +2562,7 @@ class _FeedScreenState extends State<FeedScreen> {
                 ),
               ),
               const SizedBox(height: 8),
-              const Text('dev network · valueless test tokens · feeless',
+              const Text('mainnet · real XNO · feeless · double-check the address',
                   style: TextStyle(color: kDim, fontSize: 11)),
             ]),
           ),
