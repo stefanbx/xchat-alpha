@@ -35,7 +35,7 @@ source" once). **Verify it first:**
 
 ```
 sha256sum xchat-alpha.apk
-# expected: 2ca5af0f2243a2c7d08b0eb92b4dd0a1b32ff12884247e7d299df0f8bc647421
+# expected: 8d95343a25819f50cff74f4cf0663056c84793f29c3538ef3820bc0706384527
 ```
 
 Signing certificate SHA-256: `3cc918358c69a37a84be1f048dccfc3a7c1edf74f2a0790cb28b5ccacd15f393`
