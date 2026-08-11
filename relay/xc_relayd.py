@@ -45,6 +45,43 @@ dms = []                             # list of encrypted direct messages (cipher
 pollvotes = {}                       # poll_id -> {account: signed vote record} (one vote per account)
 known = {SELF}                       # relays this relay knows about
 
+# --- anti-spam / DoS hardening ------------------------------------------------
+# A relay verifies nothing and stores signed bytes; clients verify on read, so forged spam is inert
+# junk — it can never appear in a feed or impersonate. These bounds stop an UNAUTHENTICATED flood
+# from growing one relay's RAM/CPU without limit. (The plural network already routes around a bad
+# relay; this keeps each individual relay standing.)
+HEAD_TTL    = int(os.environ.get('XC_HEAD_TTL', '3600'))      # a head lives at most this long (s)
+HEAD_SKEW   = 900                                             # clock-skew slack on the max expiry
+MAX_HEADS   = int(os.environ.get('XC_MAX_HEADS', '50000'))    # hard cap on live authors (backstop)
+NOTIF_MAX   = int(os.environ.get('XC_NOTIF_MAX', '200'))      # per-recipient notification cap
+NOTIF_ACCTS = int(os.environ.get('XC_NOTIF_ACCTS', '20000'))  # cap on distinct notified accounts
+DM_MAX      = int(os.environ.get('XC_DM_MAX', '20000'))       # global ciphertext mailbox cap
+# Per-IP WRITE throttle. Note a shared node proxies many users under ONE IP, so this must be well
+# above legit aggregate node traffic — it's a coarse CPU throttle against a naive single-source
+# flood, NOT the memory guarantee. Memory is bounded regardless of rate by the caps + prune above.
+RATE_MAX    = int(os.environ.get('XC_RATE_MAX', '600'))       # writes per window per client IP (~60/s)
+RATE_WINDOW = int(os.environ.get('XC_RATE_WINDOW', '10'))     # rate-limit window (s)
+
+_heads_lock = threading.Lock()                                # guards heads across prune + /push
+_dm_seen = set()                                              # (from, ts) O(1) dedup for the mailbox
+
+_dirty = False                                                # state changed since the last flush
+def mark_dirty():
+    global _dirty
+    _dirty = True
+
+_rate = {}                                                    # client-ip -> [window_start, count]
+_rate_lock = threading.Lock()
+def rate_ok(ip):                                              # fixed-window per-IP write throttle
+    now = time.time()
+    with _rate_lock:
+        w = _rate.get(ip)
+        if not w or now - w[0] >= RATE_WINDOW:
+            _rate[ip] = [now, 1]; return True
+        if w[1] >= RATE_MAX:
+            return False
+        w[1] += 1; return True
+
 # --- content cache: a relay is a CACHE, not an archive, and blobs live on DISK ---
 # Media blobs are held in an embedded SQLite table (not RAM, not the JSON store), so the relay's
 # memory stays small and the cache can be as large as the disk, and writes are INCREMENTAL (one row
@@ -130,7 +167,7 @@ def grant_pin(cid, payhash):
     pins_paid[payhash] = cid
     exp = max(pinned.get(cid, 0.0), time.time()) + amt * _PIN_S_PER_RAW
     pinned[cid] = exp
-    save()
+    mark_dirty()                         # persisted by the autosave within ≤5s (no per-write flush)
     return exp
 
 # --- persistence: the WHOLE relay state survives a restart, not just heads ---
@@ -175,11 +212,37 @@ def save():
 
 load_state()
 blob_load_meta()
+for _m in dms:                                       # rebuild the DM dedup index from the loaded mailbox
+    _dm_seen.add((_m.get('from'), _m.get('ts')))
+
+def prune():
+    # Actively DROP expired heads (not just hide them on read), so a Sybil flood can't grow `heads`
+    # forever; enforce a hard author cap as a backstop; and forget idle rate-limit buckets. Returns
+    # True if anything changed (so the autosave flushes).
+    now = time.time()
+    changed = False
+    with _heads_lock:
+        dead = [a for a, h in heads.items() if h.get('expires', 9e18) < now]
+        for a in dead:
+            heads.pop(a, None)
+        if len(heads) > MAX_HEADS:                   # backstop: keep the freshest-expiring authors
+            keep = dict(sorted(heads.items(), key=lambda kv: kv[1].get('expires', 0),
+                               reverse=True)[:MAX_HEADS])
+            heads.clear(); heads.update(keep)
+            changed = True
+    changed = changed or bool(dead)
+    with _rate_lock:
+        for ip in [ip for ip, w in _rate.items() if now - w[0] >= RATE_WINDOW]:
+            _rate.pop(ip, None)
+    return changed
 
 def _autosave():                                     # flush every few seconds so a restart loses ≤5s
+    global _dirty
     while True:
         time.sleep(5)
-        save()
+        changed = prune()                            # expire heads / trim buckets each tick
+        if _dirty or changed:                        # only rewrite state when something changed
+            save(); _dirty = False
 threading.Thread(target=_autosave, daemon=True).start()
 
 def qs(path):
@@ -206,7 +269,8 @@ def bootstrap():
 
 def live_heads():
     now = time.time()
-    return [h for h in heads.values() if h.get('expires', 9e18) >= now]   # drop expired pointers
+    with _heads_lock:                                                     # snapshot; prune may be popping
+        return [h for h in list(heads.values()) if h.get('expires', 9e18) >= now]   # drop expired pointers
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -278,16 +342,32 @@ class H(BaseHTTPRequestHandler):
         else:
             self._send(404, '{"error":"not found"}')
     def do_POST(self):
+        # Fly/CDN put the real client IP in a header; fall back to the socket peer for local runs.
+        ip = (self.headers.get('Fly-Client-IP')
+              or self.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+              or self.client_address[0])
+        if not rate_ok(ip):                          # per-IP write throttle — first line against a flood
+            self._send(429, '{"ok":false,"error":"rate limited"}'); return
         n = int(self.headers.get('Content-Length', 0))
         raw = self.rfile.read(n) if n else b'{}'
+        mark_dirty()                                 # any accepted write flushes within ≤5s (see _autosave)
         if self.path.startswith('/push'):
             try:
-                h = json.loads(raw); cur = heads.get(h['author'])
-                if cur is None or h.get('seq', 0) > cur.get('seq', 0) or h.get('expires', 0) > cur.get('expires', 0):
-                    heads[h['author']] = h; save()          # newer seq OR a fresher TTL (republish)
-                    self._send(200, '{"ok":true,"accepted":true}')
-                else:
-                    self._send(200, '{"ok":true,"accepted":false,"reason":"stale"}')
+                h = json.loads(raw)
+                now = time.time()
+                # clamp expiry so no head can be made eternal (a Sybil head then expires + gets pruned)
+                h['expires'] = min(float(h.get('expires', now + HEAD_TTL)), now + HEAD_TTL + HEAD_SKEW)
+                with _heads_lock:
+                    cur = heads.get(h['author'])
+                    at_cap = h['author'] not in heads and len(heads) >= MAX_HEADS
+                    if at_cap:
+                        resp = '{"ok":false,"error":"relay at head capacity"}'   # hard backstop
+                    elif cur is None or h.get('seq', 0) > cur.get('seq', 0) or h['expires'] > cur.get('expires', 0):
+                        heads[h['author']] = h                                   # newer seq OR fresher TTL
+                        resp = '{"ok":true,"accepted":true}'
+                    else:
+                        resp = '{"ok":true,"accepted":false,"reason":"stale"}'
+                self._send(429 if at_cap else 200, resp)
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/relay_announce'):
@@ -301,8 +381,11 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/notify_push'):
             try:
                 m = json.loads(raw); to = m['to']
-                notifs.setdefault(to, []).append({'from': m.get('from', ''), 'text': m.get('text', ''),
-                                                  'ts': m.get('ts', 0), 'kind': m.get('kind', 'mention')})
+                if to in notifs or len(notifs) < NOTIF_ACCTS:            # cap distinct recipients
+                    lst = notifs.setdefault(to, [])
+                    lst.append({'from': m.get('from', ''), 'text': m.get('text', ''),
+                                'ts': m.get('ts', 0), 'kind': m.get('kind', 'mention')})
+                    del lst[:-NOTIF_MAX]                                 # keep only the most recent N
                 self._send(200, '{"ok":true}')
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
@@ -378,11 +461,16 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/dm'):
-            # store an encrypted DM (dedup by (from, ts)). The relay only holds ciphertext.
+            # store an encrypted DM (O(1) dedup by (from, ts)). The relay only holds ciphertext, and
+            # the mailbox is a bounded ring — oldest ciphertext drops once it's past DM_MAX.
             try:
                 m = json.loads(raw); key = (m.get('from'), m.get('ts'))
-                if not any((x.get('from'), x.get('ts')) == key for x in dms):
-                    dms.append(m)
+                if key not in _dm_seen:
+                    _dm_seen.add(key); dms.append(m)
+                    if len(dms) > DM_MAX:                                # bounded: evict oldest
+                        for x in dms[:-DM_MAX]:
+                            _dm_seen.discard((x.get('from'), x.get('ts')))
+                        del dms[:-DM_MAX]
                 self._send(200, json.dumps({'ok': True, 'stored': len(dms)}))
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))

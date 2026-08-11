@@ -300,14 +300,17 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   pay-to-pinned last), so no volume of unpaid media grows a relay without bound, and keeping content
   alive costs XNO (§6), which prices the attack. ✅
 - **Metadata / Sybil flood — mint unlimited keypairs and push a head (or a mention, or a DM) each.**
-  → **Partly bounded, honestly.** Heads and per-account records (follows, profiles, poll votes,
-  releases—capped at 24/author) are *filtered on read* (expired heads aren't served) and clients
-  **verify every signature**, so forged spam is inert junk that can never appear in a feed or
-  impersonate anyone. But today a relay does **not** actively prune expired heads, cap the number of
-  authors, or bound the notification/DM lists, and it does **not** rate-limit or require proof-of-work
-  on writes — so an unauthenticated Sybil flood *can* bloat one relay's RAM and slow it down. Fixes
-  are scoped and small (prune expired heads, cap/evict notifs+DMs, a cheap per-write PoW stamp or
-  per-IP rate limit, and drop the redundant per-write state flush in favor of the 5 s autosave). 🗺️🔨
+  → **Bounded.** Every mutable table now has a hard ceiling: head **expiries are clamped** (no eternal
+  head) and expired heads are **actively pruned** each tick with a hard author cap as a backstop;
+  notifications are capped **per-recipient and per distinct-account**; the DM mailbox is a **bounded
+  ring** with O(1) dedup; releases stay capped at 24/author; and media blobs are byte-capped on disk.
+  So no volume of writes grows a relay's memory without bound — and because clients **verify every
+  signature on read**, forged spam is inert junk that can never reach a feed regardless. A per-IP
+  write rate-limit adds a coarse CPU throttle, and the redundant per-write state flush was dropped for
+  a dirty-flagged 5 s autosave. ✅ (verified: clamp, author cap→429, prune frees slots, notif+DM caps,
+  rate-limit→429, reads unthrottled, persistence across restart). *Residual:* writes proxied through a
+  shared node share one IP (so the rate-limit is deliberately generous), reads aren't yet throttled,
+  and there's no write-time proof-of-work — memory is bounded by the caps, not by write cost. 🔨
 - **Why the *network* still doesn't go down.** → Relays **don't sync**, so poisoning one doesn't
   spread; clients read the **union** of relays and drop any that misbehave; and anyone can stand up a
   fresh relay in minutes. The worst case is "one relay gets slow or OOMs and restarts — clients keep
@@ -383,11 +386,11 @@ keystore is the next step). Moderation labeling is minimal. Network metadata is 
 onion routing yet — treat your IP as visible). The node is single-identity-per-instance for the
 state it caches, though it no longer holds an identity that can sign. A relay's one-time on-chain
 *announcement* is a real (tiny) mainnet transaction the operator makes with a funded wallet. **Relay
-anti-spam is not finished**: media storage is byte-capped and forged content is inert (clients verify
-on read), but a single relay does not yet prune expired heads, bound its notification/DM lists, or
-rate-limit writes — so an un-hardened relay can be degraded by a Sybil flood even though the plural
-network routes around it (§9). See the README for how to run a node, run a relay, announce it
-on-chain, and verify discovery yourself.
+anti-spam is now bounded but not maximal**: every table has a hard ceiling (clamped + pruned heads,
+capped notifs/DMs, byte-capped blobs) and a per-IP write throttle, so a Sybil flood can no longer grow
+a relay's memory without limit (§9) — but there's no write-time proof-of-work yet, reads aren't
+throttled, and a shared node counts as one IP for the write limit. See the README for how to run a
+node, run a relay, announce it on-chain, and verify discovery yourself.
 
 ---
 
