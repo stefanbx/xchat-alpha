@@ -1554,6 +1554,97 @@ class _FeedScreenState extends State<FeedScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(backgroundColor: kCard, content: Text(msg)));
   }
 
+  // The settle menu: opened deliberately from the header tips icon, not always on screen. Lists the
+  // off-chain tallies, then one tap sends a direct Nano block per creator — with a live spinner so it
+  // never looks frozen while proof-of-work runs, and the result reported when it lands.
+  void _showSettle() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kBg,
+      isScrollControlled: true,
+      builder: (_) {
+        bool settling = false;                           // persists across StatefulBuilder rebuilds
+        return StatefulBuilder(builder: (ctx, setSheet) {
+          final entries = _pending.entries.toList();
+          final total = _pending.values.fold<double>(0, (a, b) => a + b);
+          return Padding(
+            padding: EdgeInsets.fromLTRB(18, 16, 18, 22 + MediaQuery.of(ctx).viewInsets.bottom),
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                const XnoGlyph(size: 20, color: kAccent, weight: 0.16),
+                const SizedBox(width: 8),
+                const Text('Tips to settle', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+                const Spacer(),
+                IconButton(
+                  onPressed: () { Navigator.pop(ctx); _showAutoSettle(); },
+                  icon: Icon(Icons.tune, size: 20, color: _autoSettle ? kAccent : kDim),
+                  tooltip: 'Auto-settle policy',
+                ),
+              ]),
+              Text(
+                  _autoSettle
+                      ? 'Tips tally off-chain. Auto-settle is on (≥${_autoThreshold.toStringAsFixed(2)} XNO each). Settle the rest now, or leave them to accrue.'
+                      : 'Tips tally off-chain — nothing has moved yet. Settling sends one direct Nano block to each creator.',
+                  style: const TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+              const SizedBox(height: 14),
+              if (entries.isEmpty)
+                const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 26),
+                    child: Center(child: Text('No tips waiting — tip a post and it collects here.',
+                        style: TextStyle(color: kDim, fontSize: 13))))
+              else ...[
+                ...entries.map((e) => Padding(
+                      padding: const EdgeInsets.only(bottom: 9),
+                      child: Row(children: [
+                        Expanded(child: Text('@${_handleOf[e.key] ?? 'creator'}',
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: kText, fontSize: 14, fontWeight: FontWeight.w600))),
+                        Text('${e.value.toStringAsFixed(2)} XNO',
+                            style: const TextStyle(color: kAccent, fontWeight: FontWeight.w700, fontSize: 14)),
+                      ]),
+                    )),
+                const Divider(color: kLine, height: 22),
+                Row(children: [
+                  Text('${entries.length} creator${entries.length == 1 ? '' : 's'}',
+                      style: const TextStyle(color: kDim, fontSize: 12)),
+                  const Spacer(),
+                  Text('${total.toStringAsFixed(2)} XNO total',
+                      style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 15)),
+                ]),
+                const SizedBox(height: 14),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: settling
+                        ? null
+                        : () async {
+                            setSheet(() => settling = true);
+                            await _settle();               // shows the result snackbar on the main scaffold
+                            if (ctx.mounted) Navigator.pop(ctx);
+                          },
+                    style: FilledButton.styleFrom(
+                        backgroundColor: kAccent, foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24))),
+                    child: settling
+                        ? const SizedBox(height: 20, width: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
+                        : Text('Settle ${total.toStringAsFixed(2)} XNO',
+                            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(settling ? 'signing on-device · delegating proof-of-work…'
+                              : 'mainnet · real XNO · PoW delegated · one direct send per creator',
+                    textAlign: TextAlign.center, style: const TextStyle(color: kDim, fontSize: 11)),
+              ],
+            ]),
+          );
+        });
+      },
+    );
+  }
+
   // ---- reputation-weighted, earned + decaying (ported from the KeelTube client) ----
   double _recency(Labeler l) {
     if (l.lastTs == 0) return 0.01;
@@ -2162,7 +2253,9 @@ class _FeedScreenState extends State<FeedScreen> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      showDragHandle: true,     // a grab handle to drag down, and a scrim above to tap away
       backgroundColor: kBg,
+      constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.92),
       builder: (_) => StatefulBuilder(builder: (ctx, setSheet) {
         final xno = (double.tryParse(_balance) ?? 0) / 1e30;
         if (rep == null && !repFetching) {
@@ -3472,6 +3565,33 @@ class _FeedScreenState extends State<FeedScreen> {
                 ),
             ]),
           ),
+          // pending tips → the settle menu (only shown when something is waiting, or a policy is on)
+          if (_pending.isNotEmpty || _autoSettle)
+            Padding(
+              padding: const EdgeInsets.only(right: 2),
+              child: Stack(clipBehavior: Clip.none, children: [
+                IconButton(
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints(),
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  onPressed: _showSettle,
+                  tooltip: 'Tips to settle',
+                  icon: const Icon(Icons.paid_outlined, size: 21, color: kAccent),
+                ),
+                if (_pending.isNotEmpty)
+                  Positioned(
+                    right: 1, top: 3,
+                    child: Container(
+                      padding: const EdgeInsets.all(2),
+                      constraints: const BoxConstraints(minWidth: 14, minHeight: 14),
+                      decoration: const BoxDecoration(color: Color(0xFFEF6C9B), shape: BoxShape.circle),
+                      child: Text('${_pending.length}',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w800)),
+                    ),
+                  ),
+              ]),
+            ),
           // supporter mode
           IconButton(
             visualDensity: VisualDensity.compact,
@@ -3536,13 +3656,6 @@ class _FeedScreenState extends State<FeedScreen> {
         child: const Icon(Icons.add, color: Colors.black, size: 30),
       ),
       bottomNavigationBar: Column(mainAxisSize: MainAxisSize.min, children: [
-        if (_tab == 0 && (_pending.isNotEmpty || _autoSettle))
-          _SettleBar(
-              pending: _pending,
-              onSettle: _settle,
-              auto: _autoSettle,
-              threshold: _autoThreshold,
-              onConfigure: _showAutoSettle),
         BottomNavigationBar(
           currentIndex: _tab,
           onTap: (i) => setState(() => _tab = i),
