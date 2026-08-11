@@ -573,7 +573,9 @@ class Api {
     }
   }
 
-  static Future<Map<String, dynamic>?> pin(String cid, double xno) async {
+  // reservedXno: XNO already earmarked for un-settled tips. Subtracted from the balance so a pin
+  // can't spend what a creator was already promised (cross-path reservation — see _guardTip).
+  static Future<Map<String, dynamic>?> pin(String cid, double xno, {double reservedXno = 0}) async {
     final w = gWallet;
     if (w == null || cid.isEmpty) return {'ok': false, 'error': 'no content to pin'};
     try {
@@ -582,8 +584,12 @@ class Api {
       final raw = _xnoToRaw(xno.toStringAsFixed(6));
       final st = await accountState(w.account);
       if (st == null || st['opened'] != true) return {'ok': false, 'error': 'wallet empty'};
-      if (BigInt.parse('${st['balance']}') < raw * BigInt.from(targets.length)) {
-        return {'ok': false, 'error': 'need ${(xno * targets.length).toStringAsFixed(3)} XNO for ${targets.length} relay(s)'};
+      final need = raw * BigInt.from(targets.length);
+      final free = BigInt.parse('${st['balance']}') - _xnoToRaw(reservedXno.toStringAsFixed(6));
+      if (free < need) {
+        return {'ok': false, 'error': reservedXno > 1e-9
+            ? 'need ${(xno * targets.length).toStringAsFixed(3)} XNO free — ${reservedXno.toStringAsFixed(2)} is reserved for pending tips'
+            : 'need ${(xno * targets.length).toStringAsFixed(3)} XNO for ${targets.length} relay(s)'};
       }
       int pinned = 0;
       double days = 0;
@@ -866,11 +872,23 @@ class Api {
 
   // wallet: send Nano to any address (mainnet, feeless, PoW delegated).
   // ON-DEVICE SIGNED: builds + signs the send block locally; the node only adds PoW + broadcasts.
-  static Future<Map<String, dynamic>?> send(String to, String amount) async {
+  // reservedXno: XNO earmarked for un-settled tips. A discretionary send subtracts it so it can't
+  // spend the creators' promised pay (cross-path reservation). The wallet-cap excess return passes 0.
+  static Future<Map<String, dynamic>?> send(String to, String amount, {double reservedXno = 0}) async {
     final w = gWallet;
     if (w == null) return null;
     try {
       final amtRaw = _xnoToRaw(amount);
+      if (reservedXno > 1e-9) {
+        final st = await accountState(w.account);
+        if (st == null || st['opened'] != true) return {'ok': false, 'to': to, 'amount': amount, 'error': 'wallet empty'};
+        final free = BigInt.parse('${st['balance'] ?? '0'}') - _xnoToRaw(reservedXno.toStringAsFixed(6));
+        if (free < amtRaw) {
+          final freeXno = (free < BigInt.zero ? BigInt.zero : free) / BigInt.from(10).pow(30);
+          return {'ok': false, 'to': to, 'amount': amount,
+              'error': 'only ${freeXno.toStringAsFixed(3)} XNO free — ${reservedXno.toStringAsFixed(2)} reserved for pending tips'};
+        }
+      }
       final hash = await _sendRaw(w, to, amtRaw);
       if (hash != null) return {'ok': true, 'to': to, 'amount': amount, 'hash': hash};
       final st = await accountState(w.account);
@@ -2252,7 +2270,7 @@ class _FeedScreenState extends State<FeedScreen> {
                   child: FilledButton(
                     onPressed: pinning ? null : () async {
                       setSheet(() => pinning = true);
-                      final r = await Api.pin(cid, xno);
+                      final r = await Api.pin(cid, xno, reservedXno: _pendingTotal());
                       // issuer head-extension: on YOUR OWN post, also keep its head (so the post stays
                       // VISIBLE, not just its media kept) for the pinned span — even while you're offline.
                       if (r?['ok'] == true && p.account == _account) {
@@ -2837,9 +2855,16 @@ class _FeedScreenState extends State<FeedScreen> {
                       setSheet(() => err = 'enter a valid nano_ address'); return;
                     }
                     if (amt <= 0) { setSheet(() => err = 'enter an amount greater than 0'); return; }
-                    if (amt > xno + 1e-9) { setSheet(() => err = 'amount exceeds your balance'); return; }
+                    // reserve XNO already tallied for un-settled tips, so a send can't spend it
+                    final free = xno - _pendingTotal();
+                    if (amt > free + 1e-9) {
+                      setSheet(() => err = _pendingTotal() > 1e-9
+                          ? 'only ${free.toStringAsFixed(3)} XNO free — ${_pendingTotal().toStringAsFixed(2)} reserved for pending tips'
+                          : 'amount exceeds your balance');
+                      return;
+                    }
                     setSheet(() { sending = true; err = null; });
-                    final r = await Api.send(to, amt.toStringAsFixed(6));
+                    final r = await Api.send(to, amt.toStringAsFixed(6), reservedXno: _pendingTotal());
                     await _load();
                     if (!mounted) return;
                     if (r != null && r['ok'] == true) {
