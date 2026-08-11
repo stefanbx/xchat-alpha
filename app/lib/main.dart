@@ -11,6 +11,7 @@ import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
+import 'package:qr_flutter/qr_flutter.dart';
 import 'package:battery_plus/battery_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -2216,7 +2217,29 @@ class _FeedScreenState extends State<FeedScreen> {
             const SizedBox(height: 4),
             const Text('tap to copy · share it to receive XNO from another wallet',
                 style: TextStyle(color: kDim, fontSize: 11)),
-            const SizedBox(height: 12),
+            const SizedBox(height: 14),
+            // Receive QR: scan with any Nano wallet to send XNO to this account (mainnet).
+            Center(
+              child: Column(children: [
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
+                  child: QrImageView(
+                    data: _account,
+                    version: QrVersions.auto,
+                    size: 176,
+                    backgroundColor: Colors.white,
+                    eyeStyle: const QrEyeStyle(eyeShape: QrEyeShape.square, color: Colors.black),
+                    dataModuleStyle: const QrDataModuleStyle(
+                        dataModuleShape: QrDataModuleShape.square, color: Colors.black),
+                  ),
+                ),
+                const SizedBox(height: 6),
+                const Text('Scan to send XNO to this account · mainnet',
+                    style: TextStyle(color: kDim, fontSize: 11)),
+              ]),
+            ),
+            const SizedBox(height: 14),
             // representative row
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
