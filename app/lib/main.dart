@@ -2726,6 +2726,7 @@ class _FeedScreenState extends State<FeedScreen> {
             final health = (snap.data?['health'] as List?) ?? const [];
             final rvs = (snap.data?['rendezvous'] as List?) ?? const [];
             final up = health.where((h) => h['up'] == true).length;
+            final onLedger = health.where((h) => h['onchain'] == true).length;
             final loading = snap.connectionState != ConnectionState.done;
             return Padding(
               padding: const EdgeInsets.fromLTRB(18, 18, 18, 26),
@@ -2757,7 +2758,11 @@ class _FeedScreenState extends State<FeedScreen> {
                     final ms = r['ms'];
                     final rel = r['reliability'];
                     final samples = r['samples'] ?? 0;
-                    final isPublic = '${r['url']}'.startsWith('https');
+                    final url = '${r['url']}';
+                    final isNode = url.contains('127.0.0.1') || url.contains('localhost');
+                    final onChain = r['onchain'] == true;
+                    final label = isNode ? 'this node’s relay' : host(url);
+                    final badge = onChain ? 'ledger' : (isNode ? 'node' : 'bootstrap');
                     return Container(
                       margin: const EdgeInsets.only(bottom: 10),
                       padding: const EdgeInsets.all(12),
@@ -2780,14 +2785,14 @@ class _FeedScreenState extends State<FeedScreen> {
                         Expanded(
                           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                             Row(children: [
-                              Flexible(child: Text(host('${r['url']}'),
+                              Flexible(child: Text(label,
                                   overflow: TextOverflow.ellipsis,
                                   style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 12, fontWeight: FontWeight.w700))),
                               const SizedBox(width: 6),
                               Container(
                                 padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
                                 decoration: BoxDecoration(color: kBg, borderRadius: BorderRadius.circular(5), border: Border.all(color: kLine)),
-                                child: Text(isPublic ? 'public' : 'local', style: const TextStyle(color: kDim, fontSize: 9, fontWeight: FontWeight.w700)),
+                                child: Text(badge, style: const TextStyle(color: kDim, fontSize: 9, fontWeight: FontWeight.w700)),
                               ),
                             ]),
                             const SizedBox(height: 3),
@@ -2803,8 +2808,15 @@ class _FeedScreenState extends State<FeedScreen> {
                     );
                   }),
                 const SizedBox(height: 4),
-                Text('Found by scanning the XNO ledger · ${rvs.length} keyless rendezvous · strength = latency, reliability = recent uptime.',
+                Text('$up serving you now · $onLedger self-announced on the XNO ledger · ${rvs.length} keyless rendezvous. '
+                    'Strength = latency, reliability = recent uptime.',
                     style: const TextStyle(color: kDim, fontSize: 11, height: 1.4)),
+                if (!loading && onLedger == 0 && up > 0) ...[
+                  const SizedBox(height: 8),
+                  Text('No relay has self-announced on the ledger yet, so discovery isn’t SPOF-free — '
+                      'the app is using this node’s own relay. Announce an independent relay to add resilience.',
+                      style: const TextStyle(color: Color(0xFFE0A83E), fontSize: 11, height: 1.4)),
+                ],
               ]),
             );
           },

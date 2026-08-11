@@ -71,15 +71,25 @@ def resolve():
 
 
 def engine():  # machine-readable form for the engine's /api/relaydir endpoint
-    relays = xc.onchain_relays(ttl=60)
+    onchain = xc.onchain_relays(ttl=60)                 # relays that self-announced on the ledger
+    active = [u.rstrip('/') for u in xc.discover_relays()]   # relays actually serving this node now
+    # The panel used to show ONLY the ledger scan, so it read 0/0 while a bootstrap relay was happily
+    # serving the feed (the header's "1/1"). Report BOTH: the relays serving you, and how many of
+    # those are ledger-announced — 0 announced is a "not SPOF-free yet" state, not "no relays".
+    allr = list(dict.fromkeys(active + onchain))        # de-duped union, active first
+    onchain_set = set(onchain)
+    health = _measure(allr)
+    for h in health:
+        h['onchain'] = h['url'] in onchain_set          # announced on the ledger vs bootstrap-only
     doc = {'rendezvous': xc.rendezvous_accts(),
-           'relays': relays,
-           'count': len(relays),
-           'source': 'xno-scan' if relays else 'none',
-           'health': _measure(relays) if relays else []}
-    if relays:
+           'relays': onchain,                           # kept: the ledger-announced set (back-compat)
+           'count': len(onchain),
+           'active': active,                            # relays this node reads from right now
+           'source': 'xno-scan' if onchain else ('bootstrap' if active else 'none'),
+           'health': health}
+    if onchain:
         try:
-            open('/tmp/xchat_bootstrap.txt', 'w').write('\n'.join(relays) + '\n')
+            open('/tmp/xchat_bootstrap.txt', 'w').write('\n'.join(onchain) + '\n')
         except Exception:
             pass
     with open('/tmp/xc_relaydir.json', 'w') as f:
