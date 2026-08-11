@@ -55,6 +55,29 @@ def announce(urls):
     return 0
 
 
+def announce_mainnet(urls):
+    # MAINNET announce with an OPERATOR's funded key (no dev genesis, URL-in-link as ASCII).
+    # Key comes from the environment so it never lands in a command line or the repo:
+    #   XC_RELAY_OPERATOR_SEED=<64-hex seed>   (index 0)   OR   XC_RELAY_OPERATOR_KEY=<64-hex privkey>
+    import os
+    keyhex = os.environ.get('XC_RELAY_OPERATOR_KEY', '')
+    seed = os.environ.get('XC_RELAY_OPERATOR_SEED', '')
+    if seed and not keyhex:
+        import nanopy
+        keyhex = nanopy.deterministic_key(seed, 0)
+    if not keyhex:
+        print('set XC_RELAY_OPERATOR_SEED (64-hex) or XC_RELAY_OPERATOR_KEY (funded account)'); return 2
+    urls = [u for u in urls if u.strip()]
+    if not urls:
+        print('usage: xc_reldir.py announce-mainnet URL [URL ...]'); return 2
+    for u in urls:
+        acct, url = xc.relay_announce_operator(u, keyhex)
+        print(f'announced {url}\n  operator account {acct}')
+    print('rendezvous:', ', '.join(xc.rendezvous_accts()))
+    print('discovery will see it on the next ledger scan (xc_reldir.py resolve)')
+    return 0
+
+
 def resolve():
     relays = xc.onchain_relays(ttl=0)               # force a fresh ledger scan
     print('rendezvous points :', len(xc.rendezvous_accts()), '(keyless, plural — no SPOF)')
@@ -104,6 +127,8 @@ if __name__ == '__main__':
         print('\n'.join(xc.rendezvous_accts())); sys.exit(0)
     if cmd == 'announce':
         sys.exit(announce(sys.argv[2:]))
+    if cmd == 'announce-mainnet':
+        sys.exit(announce_mainnet(sys.argv[2:]))
     if cmd == 'resolve':
         sys.exit(resolve())
     if cmd == 'engine':

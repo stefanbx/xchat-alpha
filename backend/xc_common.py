@@ -223,6 +223,44 @@ def _self_send(key, link_hex):  # append a send on the account's own chain with 
          'block': {'type': 'state', 'account': d['account'], 'previous': prev, 'representative': d['rep'],
                    'balance': nb, 'link': link_hex, 'signature': d['sig'], 'work': wk}})
 
+def url_norm(url):  # canonical relay URL: no scheme, no trailing slash (the scheme is re-added on read)
+    return url.strip().rstrip('/').split('://', 1)[-1]
+
+def url_to_link(url):  # a relay URL packed into a 32-byte block link as ASCII (mainnet, no IPFS)
+    b = url_norm(url).encode('ascii')
+    if len(b) > 32:
+        raise ValueError(f'relay URL is {len(b)} bytes; the on-chain link holds at most 32 (use a short host)')
+    return (b + bytes(32 - len(b))).hex()
+
+def link_to_url(link_hex):  # inverse: a link that is printable ASCII + looks like a host -> https URL, else None
+    try:
+        b = bytes.fromhex(link_hex).rstrip(b'\x00')
+        s = b.decode('ascii')
+        if s and '.' in s and all(32 < c < 127 for c in b):
+            return 'https://' + s
+    except Exception:
+        pass
+    return None
+
+def relay_announce_operator(url, opkey):
+    # MAINNET announce: an OPERATOR's already-funded account vouches for a relay URL. No dev genesis,
+    # no IPFS — the URL rides in the block link as ASCII, human-verifiable in any block explorer. The
+    # account must already be opened (funded). Dust check-ins let a keyless rendezvous enumerate it;
+    # the URL is committed LAST so the frontier link is the URL (one read resolves it).
+    url = url_norm(url)
+    link = url_to_link(url)                             # validate length up-front, before any send
+    addr, _ = derive(opkey)
+    if 'error' in rpc({'action': 'account_info', 'account': addr}):
+        raise RuntimeError(f'operator account {addr} is not opened/funded — send it a little XNO first')
+    for rv in rendezvous_accts():                       # check in at each rendezvous
+        try:
+            _self_send(opkey, nano_to_pub(rv))
+        except Exception:
+            pass
+    _self_send(opkey, link)                             # commit the URL last (frontier link = URL)
+    return addr, url
+
+
 def relay_self_announce(url):  # a relay announces ITSELF: commit its URL on its own chain + check in at each RV
     import tempfile
     url = url.rstrip('/'); key = relay_key(url)
@@ -255,7 +293,10 @@ def _relay_url(account):  # a relay account -> the URL it announced on its own c
             link = rpc({'action': 'block_info', 'json_block': 'true', 'hash': h})['contents']['link']
             if not link or link == '0' * 64 or link.upper() in rv_links:
                 continue
-            out = subprocess.check_output(['ipfs', 'cat', digest_to_cid(link)],
+            u = link_to_url(link)                        # mainnet: URL packed as ASCII in the link
+            if u:
+                return u
+            out = subprocess.check_output(['ipfs', 'cat', digest_to_cid(link)],   # legacy: URL via IPFS CID
                                           env={**os.environ, 'IPFS_PATH': IPFS_PATH}, timeout=5)
             u = json.loads(out).get('url')
             if u:

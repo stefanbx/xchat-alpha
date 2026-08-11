@@ -17,3 +17,4 @@ relay/*.json
 
 # staged for the container image by deploy/deploy.sh
 deploy/app/
+deploy/relay/app/
