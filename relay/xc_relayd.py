@@ -7,11 +7,17 @@ import json, sys, os, time, threading, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import importlib.util
-try:                                            # xc_common only needed to DERIVE this relay's account
-    _spec = importlib.util.spec_from_file_location("xc_common", os.path.join(os.path.dirname(os.path.abspath(__file__)), "xc_common.py"))
-    xc = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(xc)
-except Exception:
-    xc = None
+xc = None                                       # xc_common: relay account + pay-to-pin ledger reads
+_here = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.join(_here, "xc_common.py"),          # staged next to the relay (deploy)
+           os.path.join(_here, "..", "backend", "xc_common.py")):  # repo layout
+    if os.path.exists(_p):
+        try:
+            _spec = importlib.util.spec_from_file_location("xc_common", _p)
+            xc = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(xc)
+            break
+        except Exception:
+            xc = None
 
 PORT = int(sys.argv[1]); STORE = sys.argv[2]
 BIND = os.environ.get('BIND_HOST', '127.0.0.1')      # '0.0.0.0' when hosted (Fly.io)
@@ -40,10 +46,76 @@ dms = []                             # list of encrypted direct messages (cipher
 pollvotes = {}                       # poll_id -> {account: signed vote record} (one vote per account)
 known = {SELF}                       # relays this relay knows about
 
+# --- content cache: a relay is a CACHE, not an archive ---
+# Blobs are held under a byte cap and evicted least-recently-used, so the store can't grow without
+# bound and OOM the box. Pay-to-pin (below) is the exception: a CID someone has PAID to keep is
+# protected from eviction until the paid span elapses. Heads already expire on their own TTL.
+BLOB_CAP = int(float(os.environ.get('XC_BLOB_CAP_MB', '128')) * 1024 * 1024)   # cache size ceiling
+PIN_DAYS_PER_XNO = float(os.environ.get('XC_PIN_DAYS_PER_XNO', '30000'))       # 0.001 XNO ≈ 30 days pinned
+_PIN_S_PER_RAW = PIN_DAYS_PER_XNO * 86400.0 / 1e30
+pinned = {}                          # cid -> pin-expiry epoch (paid); survives eviction until then
+pins_paid = {}                       # payment block hash -> cid (consumed once; audit + no double-claim)
+blob_meta = {}                       # cid -> {'size': bytes, 'last': epoch}  (LRU bookkeeping; rebuilt on load)
+_blob_lock = threading.Lock()
+
+def _blob_total():
+    return sum(m['size'] for m in blob_meta.values())
+
+def blob_put(cid, b64):
+    with _blob_lock:
+        blobs[cid] = b64
+        blob_meta[cid] = {'size': len(b64 or ''), 'last': time.time()}
+        _evict_locked()
+
+def blob_touch(cid):                 # a read counts as use, so popular content isn't the first evicted
+    m = blob_meta.get(cid)
+    if m:
+        m['last'] = time.time()
+
+def _evict_locked():                 # drop least-recently-used UNPINNED blobs until under the cap
+    total = _blob_total()
+    if total <= BLOB_CAP:
+        return
+    now = time.time()
+    victims = sorted((m['last'], c) for c, m in blob_meta.items() if pinned.get(c, 0) <= now)
+    for _, c in victims:
+        if total <= BLOB_CAP:
+            break
+        total -= blob_meta[c]['size']
+        blobs.pop(c, None)
+        blob_meta.pop(c, None)
+
+def blob_rebuild_meta():             # after a restart, rebuild sizes from the loaded blobs
+    now = time.time()
+    for c, b in list(blobs.items()):
+        blob_meta.setdefault(c, {'size': len(b or ''), 'last': now})
+
+def grant_pin(cid, payhash):
+    # PAY-TO-PIN: verify payhash is a confirmed Nano send TO this relay's account, then protect cid
+    # from eviction for a span proportional to the amount. A public ledger read — no key needed, the
+    # relay never moves funds; the PINNER paid. Each payment is consumed once (no double-claim).
+    if xc is None or not RELAY_ACCT or not cid or not payhash or payhash in pins_paid:
+        return 0
+    try:
+        bi = xc.rpc({'action': 'block_info', 'json_block': 'true', 'hash': payhash})
+        c = bi.get('contents', {})
+        to_us = (c.get('link_as_account') == RELAY_ACCT
+                 or c.get('link', '').upper() == xc.nano_to_pub(RELAY_ACCT).upper())
+        amt = int(bi.get('amount', '0'))
+    except Exception:
+        return 0
+    if not to_us or amt <= 0:
+        return 0
+    pins_paid[payhash] = cid
+    exp = max(pinned.get(cid, 0.0), time.time()) + amt * _PIN_S_PER_RAW
+    pinned[cid] = exp
+    save()
+    return exp
+
 # --- persistence: the WHOLE relay state survives a restart, not just heads ---
 # (in-memory before this meant comments, uploaded media, likes, poll votes vanished on restart)
 _STATE_KEYS = ('engage', 'notifs', 'supporters', 'blobs', 'follows', 'comments',
-               'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes')
+               'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'pinned', 'pins_paid')
 
 def load_state():
     global heads
@@ -78,6 +150,7 @@ def save():
         pass
 
 load_state()
+blob_rebuild_meta()
 
 def _autosave():                                     # flush every few seconds so a restart loses ≤5s
     while True:
@@ -135,10 +208,16 @@ class H(BaseHTTPRequestHandler):
                                         'accounts': list(supporters.keys())}))
         elif self.path.startswith('/blob'):
             cid = qs(self.path).get('cid', '')
+            blob_touch(cid)                                             # a read is use → LRU keeps it longer
             self._send(200, json.dumps({'cid': cid, 'b64': blobs.get(cid)}))   # serve cached content
+        elif self.path.startswith('/cache'):                           # cache health: size vs cap, pins
+            now = time.time()
+            self._send(200, json.dumps({'relay': PORT, 'blobs': len(blobs), 'bytes': _blob_total(),
+                                        'cap': BLOB_CAP, 'pinned': sum(1 for e in pinned.values() if e > now)}))
         elif self.path.startswith('/haveblob'):
             cid = qs(self.path).get('cid', '')
-            self._send(200, json.dumps({'cid': cid, 'have': cid in blobs}))
+            self._send(200, json.dumps({'cid': cid, 'have': cid in blobs,
+                                        'pinned_until': int(pinned.get(cid, 0))}))
         elif self.path.startswith('/followers'):
             # count how many stored follow-records include this account (for a profile's follower tally)
             acc = qs(self.path).get('account', '')
@@ -213,11 +292,27 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/blob'):
-            # a supporter pins content here (content-addressed — cid names the bytes)
+            # a supporter caches content here (content-addressed — cid names the bytes); byte-capped + LRU
             try:
                 m = json.loads(raw); cid = m['cid']; new = cid not in blobs
-                blobs[cid] = m['b64']
-                self._send(200, json.dumps({'ok': True, 'stored': new}))
+                blob_put(cid, m['b64'])
+                self._send(200, json.dumps({'ok': True, 'stored': new, 'cache_bytes': _blob_total()}))
+            except Exception as e:
+                self._send(400, json.dumps({'ok': False, 'error': str(e)}))
+        elif self.path.startswith('/pin'):
+            # PAY-TO-PIN: {cid, payhash} — protect cid from eviction, paid for by a Nano send to this relay
+            try:
+                m = json.loads(raw or '{}')
+                cid = m.get('cid') or qs(self.path).get('cid', '')
+                payhash = m.get('payhash') or qs(self.path).get('payhash', '')
+                exp = grant_pin(cid, payhash)
+                if exp:
+                    self._send(200, json.dumps({'ok': True, 'cid': cid, 'pinned_until': int(exp),
+                                                'days': round((exp - time.time()) / 86400, 2)}))
+                else:
+                    self._send(402, json.dumps({'ok': False, 'pay_to': RELAY_ACCT,
+                                                'rate_days_per_xno': PIN_DAYS_PER_XNO,
+                                                'error': 'no unconsumed confirmed payment to this relay for that cid'}))
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/follows'):
