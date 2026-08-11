@@ -1359,6 +1359,7 @@ class _FeedScreenState extends State<FeedScreen> {
   List<Post> _posts = [];
   final List<Post> _newPosts = [];        // fetched but held BACK — surfaced via a "new posts" pill,
                                           // not injected live, so the reader's scroll never jumps
+  int _pollTick = 0;                      // every 5th quiet poll does a full reconcile (drops expired)
   final ScrollController _scroll = ScrollController();
   List<Labeler> _labelers = [];
   final Set<String> _shown = {}; // posts the viewer chose to reveal
@@ -1444,11 +1445,15 @@ class _FeedScreenState extends State<FeedScreen> {
   // rebuilt from scratch here — already-fetched posts (and their CID-cached media) stay put.
   Future<void> _refreshFeedQuiet() async {
     if (_loading) return;                         // a full _load() is already in flight
+    // most polls are incremental (only new posts, for the pill); every 5th (~60s) pulls the full set
+    // so we can also DROP posts whose head expired / was removed — the incremental slice can't show that.
+    final reconcile = (++_pollTick % 5 == 0);
     try {
       // since-1 re-includes the boundary second (ts filter is strict '>'), so a post arriving in the
       // same second as our newest isn't missed; the id-dedupe below drops the tiny overlap.
       final t = _newestTs();
-      final results = await Future.wait([Api.feed(since: t > 0 ? t - 1 : 0), Api.engagement()]);
+      final results = await Future.wait(
+          [Api.feed(since: reconcile ? 0 : (t > 0 ? t - 1 : 0)), Api.engagement()]);
       final fd = results[0] as FeedData;
       if (!mounted) return;
       final seen = {..._posts.map((p) => p.id), ..._newPosts.map((p) => p.id)};
@@ -1457,6 +1462,11 @@ class _FeedScreenState extends State<FeedScreen> {
         _engage = results[1] as Map<String, dynamic>;      // counts tick in place — non-disruptive
         _relaysUp = fd.relaysUp;
         _relaysTotal = fd.relaysTotal;
+        if (reconcile) {
+          final live = fd.posts.map((p) => p.id).toSet();  // authoritative full set this round
+          _posts = _posts.where((p) => live.contains(p.id)).toList();   // drop expired/removed
+          _newPosts.removeWhere((p) => !live.contains(p.id));
+        }
         if (fresh.isNotEmpty) {
           _newPosts.addAll(fresh);
           _newPosts.sort((a, b) => b.ts.compareTo(a.ts));  // newest first, ready to prepend
@@ -3938,7 +3948,10 @@ class _FeedScreenState extends State<FeedScreen> {
           ],
         ),
       ]),
-      body: _loading
+      // only blank to a spinner on the FIRST load (nothing to show yet). A refresh with posts already
+      // on screen keeps the timeline visible and updates in place — the RefreshIndicator shows its own
+      // spinner — so the display is never lost.
+      body: (_loading && _posts.isEmpty)
           ? const Center(child: CircularProgressIndicator(color: kAccent))
           : _error != null
               ? _ErrorView(msg: _error!, onRetry: _load, onEndpoint: _showEndpoint)
