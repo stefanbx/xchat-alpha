@@ -77,7 +77,7 @@ FEED_TTL = float(os.environ.get('XC_FEED_TTL', '5'))
 _feed_ts = [0.0]
 _feed_lock = threading.Lock()
 
-def api_feed():
+def api_feed(query=None):
     now = time.time()
     if (now - _feed_ts[0] > FEED_TTL or not os.path.exists('/tmp/xc_feed_agg.json')) \
             and _feed_lock.acquire(blocking=False):
@@ -88,6 +88,21 @@ def api_feed():
             _feed_lock.release()
     content = read('/tmp/xc_feed_agg.json', '{}')
     blocks = read('/tmp/xc_onchain_count.txt', '0') or '0'
+    # Incremental: ?since=<ts> returns ONLY posts newer than what the client already has, so a poll
+    # usually returns an empty list instead of the whole feed. Aggregation is still cached whole (the
+    # expensive part); this just slices it on the way out. No `since` = the full feed (unchanged).
+    try:
+        since = int((query or {}).get('since', ['0'])[0])   # router parses the query and passes it in
+    except Exception:
+        since = 0
+    if since > 0:
+        try:
+            c = json.loads(content)
+            c['posts'] = [p for p in c.get('posts', []) if int(p.get('ts', 0)) > since]
+            c['incremental'] = True
+            content = json.dumps(c)
+        except Exception:
+            pass
     return ('{"onchain_blocks":' + blocks +
             ',"transport":"plural relays + signed mutable heads","content":' + content + '}')
 
@@ -177,7 +192,7 @@ def route(path, query, body):
     q = lambda k: (query.get(k, [''])[0])
     b = lambda k: (body.get(k, '') if isinstance(body, dict) else '')
 
-    if path.startswith('/api/feed'):        return api_feed()
+    if path.startswith('/api/feed'):        return api_feed(query)
     if path.startswith('/api/relaydir'):     spawn('xc_reldir.py', 'engine');                     return read('/tmp/xc_relaydir.json', '{}')
     if path.startswith('/api/pin_targets'):  return api_pin_targets()
     # prefix collisions: /api/media_relay must precede /api/media, which must precede /api/me.

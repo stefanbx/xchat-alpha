@@ -505,8 +505,11 @@ class Api {
     }
   }
 
-  static Future<FeedData> feed() async {
-    final r = await http.get(Uri.parse('$kBase/api/feed'));
+  // since > 0 asks the node for ONLY posts newer than that ts (incremental poll), so a quiet
+  // refresh usually returns an empty list instead of re-downloading the whole feed.
+  static Future<FeedData> feed({int since = 0}) async {
+    final url = since > 0 ? '$kBase/api/feed?since=$since' : '$kBase/api/feed';
+    final r = await http.get(Uri.parse(url));
     final d = jsonDecode(r.body);
     final c = d['content'] ?? {};
     final posts = (c['posts'] as List?) ?? [];
@@ -1354,6 +1357,9 @@ class FeedScreen extends StatefulWidget {
 class _FeedScreenState extends State<FeedScreen> {
   NanoWallet? _wallet; // on-device signer, built from the local seed — never sent to the node
   List<Post> _posts = [];
+  final List<Post> _newPosts = [];        // fetched but held BACK — surfaced via a "new posts" pill,
+                                          // not injected live, so the reader's scroll never jumps
+  final ScrollController _scroll = ScrollController();
   List<Labeler> _labelers = [];
   final Set<String> _shown = {}; // posts the viewer chose to reveal
   int _modIdx = 0;
@@ -1421,26 +1427,56 @@ class _FeedScreenState extends State<FeedScreen> {
     _republishTimer?.cancel();
     _gossipTimer?.cancel();
     _feedTimer?.cancel();
+    _scroll.dispose();
     super.dispose();
   }
 
-  // A lightweight, silent feed poll — refreshes the timeline in place so posts from other devices
-  // show up on their own, WITHOUT the full-screen loading state or the wallet side-effects (sweep,
-  // profile, supporter sync) that _load() carries. On a transient error it keeps the last good feed.
+  int _newestTs() {                               // newest ts we already hold (shown OR buffered)
+    var t = 0;
+    for (final p in _posts) { if (p.ts > t) t = p.ts; }
+    for (final p in _newPosts) { if (p.ts > t) t = p.ts; }
+    return t;
+  }
+
+  // A lightweight, silent poll. It fetches ONLY posts newer than we already have (incremental), holds
+  // them in a buffer surfaced by a "new posts" pill instead of injecting them live (so the reader's
+  // scroll never jumps), and updates engagement counts in place. The timeline itself is never
+  // rebuilt from scratch here — already-fetched posts (and their CID-cached media) stay put.
   Future<void> _refreshFeedQuiet() async {
     if (_loading) return;                         // a full _load() is already in flight
     try {
-      final results = await Future.wait([Api.feed(), Api.engagement()]);
+      // since-1 re-includes the boundary second (ts filter is strict '>'), so a post arriving in the
+      // same second as our newest isn't missed; the id-dedupe below drops the tiny overlap.
+      final t = _newestTs();
+      final results = await Future.wait([Api.feed(since: t > 0 ? t - 1 : 0), Api.engagement()]);
       final fd = results[0] as FeedData;
       if (!mounted) return;
+      final seen = {..._posts.map((p) => p.id), ..._newPosts.map((p) => p.id)};
+      final fresh = fd.posts.where((p) => !seen.contains(p.id)).toList();
       setState(() {
-        _posts = fd.posts;
-        _onchainBlocks = fd.onchainBlocks;
+        _engage = results[1] as Map<String, dynamic>;      // counts tick in place — non-disruptive
         _relaysUp = fd.relaysUp;
         _relaysTotal = fd.relaysTotal;
-        _engage = results[1] as Map<String, dynamic>;
+        if (fresh.isNotEmpty) {
+          _newPosts.addAll(fresh);
+          _newPosts.sort((a, b) => b.ts.compareTo(a.ts));  // newest first, ready to prepend
+        }
       });
     } catch (_) {/* transient — keep showing the last good timeline */}
+  }
+
+  // The reader tapped the "new posts" pill: merge the buffer into the timeline and jump to the top.
+  void _showNewPosts() {
+    if (_newPosts.isEmpty) return;
+    setState(() {
+      final have = _posts.map((p) => p.id).toSet();
+      _posts = [..._newPosts.where((p) => !have.contains(p.id)), ..._posts]
+        ..sort((a, b) => b.ts.compareTo(a.ts));
+      _newPosts.clear();
+    });
+    if (_scroll.hasClients) {
+      _scroll.animateTo(0, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
+    }
   }
 
   // start/stop the actual serving work as the charging+wifi gate flips
@@ -3597,6 +3633,7 @@ class _FeedScreenState extends State<FeedScreen> {
       final engage = results[4] as Map<String, dynamic>;
       setState(() {
         _posts = fd.posts;
+        _newPosts.clear();                    // a full refresh already includes everything
         _onchainBlocks = fd.onchainBlocks;
         _relaysUp = fd.relaysUp;
         _relaysTotal = fd.relaysTotal;
@@ -3734,9 +3771,10 @@ class _FeedScreenState extends State<FeedScreen> {
                               : 'signed & posted off-chain · 0 Nano blocks')));
     }
     await _load();
-    // the node caches the feed for ~5s, so a just-posted item can miss the immediate reload —
-    // a quiet follow-up once the cache expires makes your own post appear without a manual pull.
-    Future.delayed(const Duration(seconds: 6), () { if (mounted) _refreshFeedQuiet(); });
+    // the node caches the feed for ~5s, so a just-posted item can miss the immediate reload — a
+    // delayed full reload (not the quiet poll) makes YOUR OWN post appear in the timeline directly,
+    // rather than hidden behind the "new posts" pill meant for other people's posts.
+    Future.delayed(const Duration(seconds: 6), () { if (mounted) _load(); });
   }
 
   // quote a post (opens compose with the post embedded)
@@ -3945,28 +3983,61 @@ class _FeedScreenState extends State<FeedScreen> {
         ]),
       ),
       Expanded(
-        child: RefreshIndicator(
-          color: kAccent,
-          backgroundColor: kCard,
-          onRefresh: _load,
-          child: ListView.separated(
-            physics: const AlwaysScrollableScrollPhysics(),
-            itemCount: posts.length + 1,
-            separatorBuilder: (_, __) => Container(color: kLine, height: 1),
-            itemBuilder: (_, i) {
-              if (i == posts.length) {
-                return (_homeFeed == 1 && _follows.isEmpty)
-                    ? const _DiscoverHint()
-                    : const _LedgerFooter();
-              }
-              // stable identity per post so a feed refresh matches elements by post, not by slot —
-              // without this the list recycles cards across posts and their media gets mismatched
-              return KeyedSubtree(key: ValueKey(posts[i].id), child: _profileCard(posts[i]));
-            },
+        // the timeline, with a floating "N new posts" pill overlaid at the top (X-style). New posts
+        // are held in _newPosts and only merged in when the reader taps the pill — so the scroll
+        // position never jumps under them.
+        child: Stack(children: [
+          RefreshIndicator(
+            color: kAccent,
+            backgroundColor: kCard,
+            onRefresh: _load,
+            child: ListView.separated(
+              controller: _scroll,
+              physics: const AlwaysScrollableScrollPhysics(),
+              itemCount: posts.length + 1,
+              separatorBuilder: (_, __) => Container(color: kLine, height: 1),
+              itemBuilder: (_, i) {
+                if (i == posts.length) {
+                  return (_homeFeed == 1 && _follows.isEmpty)
+                      ? const _DiscoverHint()
+                      : const _LedgerFooter();
+                }
+                // stable identity per post so a feed refresh matches elements by post, not by slot —
+                // without this the list recycles cards across posts and their media gets mismatched
+                return KeyedSubtree(key: ValueKey(posts[i].id), child: _profileCard(posts[i]));
+              },
+            ),
           ),
-        ),
+          if (_newPosts.isNotEmpty && _homeFeed == 0)
+            Positioned(top: 10, left: 0, right: 0, child: Center(child: _newPostsPill())),
+        ]),
       ),
     ]);
+  }
+
+  Widget _newPostsPill() {
+    final n = _newPosts.length;
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(24),
+        onTap: _showNewPosts,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+          decoration: BoxDecoration(
+            color: kAccent,
+            borderRadius: BorderRadius.circular(24),
+            boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.4), blurRadius: 8, offset: const Offset(0, 2))],
+          ),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.arrow_upward, size: 15, color: Colors.black),
+            const SizedBox(width: 6),
+            Text('$n new post${n == 1 ? '' : 's'}',
+                style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 13)),
+          ]),
+        ),
+      ),
+    );
   }
 
   Widget _feedTabBtn(String label, int i) {

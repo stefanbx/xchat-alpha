@@ -355,8 +355,14 @@ class H(BaseHTTPRequestHandler):
             try:
                 h = json.loads(raw)
                 now = time.time()
-                # clamp expiry so no head can be made eternal (a Sybil head then expires + gets pruned)
-                h['expires'] = min(float(h.get('expires', now + HEAD_TTL)), now + HEAD_TTL + HEAD_SKEW)
+                # Clamp ONLY a head claiming a too-far-future expiry (anti-eternal-head). Crucially,
+                # leave an in-bounds head's `expires` BYTE-IDENTICAL: the author signed over
+                # "account|seq|cid|expires", so rewriting it (even int->float) would break that
+                # signature and make clients reject the head. A clamped (bogus) head's signature won't
+                # verify either — which is the point: it's stored bounded, gets pruned, and never renders.
+                maxexp = now + HEAD_TTL + HEAD_SKEW
+                if float(h.get('expires', 0)) > maxexp:
+                    h['expires'] = int(maxexp)
                 with _heads_lock:
                     cur = heads.get(h['author'])
                     at_cap = h['author'] not in heads and len(heads) >= MAX_HEADS
