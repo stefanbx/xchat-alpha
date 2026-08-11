@@ -66,11 +66,21 @@ for h in best.values():                                  # the thread = the sum 
             pass
     cids[h['cid']] = max(cids.get(h['cid'], 0.0), thread_tips)      # the thread JSON
 
-blobs = 0; backfilled = 0
-for cid, tips in cids.items():
+# SYNC THE BEST: replicate content to every relay in VALUE order, most-tipped first, within a byte
+# budget per round. The best content reaches all relays (durable, multi-copy); when the budget runs
+# out the weak (low-value) content is left single-copy on its origin — synced ≠ everything. A supporter
+# does this outbound-only, so replication stays client-driven and decentralised.
+SYNC_BUDGET = int(float(os.environ.get('XC_SYNC_BUDGET_MB', '32')) * 1024 * 1024)
+ranked = sorted(cids.items(), key=lambda kv: -kv[1])     # highest tips first
+spent = 0; blobs = 0; backfilled = 0; skipped = 0
+for cid, tips in ranked:
     data = fetch(cid)
     if not data or len(data) > CAP:
         continue
+    if spent + len(data) > SYNC_BUDGET:                  # budget went to the best — the weak isn't synced
+        skipped += 1
+        continue
+    spent += len(data)
     b64 = base64.b64encode(data).decode(); blobs += 1
     for r in RELAYS:
         try:
@@ -78,8 +88,9 @@ for cid, tips in cids.items():
                 r + '/blob', json.dumps({'cid': cid, 'b64': b64, 'tips': tips}).encode(),
                 {'Content-Type': 'application/json'}), timeout=5).read())
             if resp.get('stored'):
-                backfilled += 1                          # this relay was missing it — now pinned
+                backfilled += 1                          # this relay was missing it — now replicated
         except Exception:
             pass
-json.dump({"ok": True, "blobs": blobs, "relays": len(RELAYS), "backfilled": backfilled},
+json.dump({"ok": True, "blobs": blobs, "relays": len(RELAYS), "backfilled": backfilled,
+           "skipped_lowvalue": skipped, "synced_bytes": spent},
           open('/tmp/xc_pin_result.json', 'w'))
