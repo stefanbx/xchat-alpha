@@ -124,18 +124,21 @@ finer, reversible filter on top.
 
 **Reputation-weighted, not one-account-one-vote.** Each report counts for its author's **on-chain
 reputation** — an *unopened* throwaway account weighs **0**, and an opened account earns weight from
-its balance and chain activity (both costly to fake at scale). Two more factors, both trustless:
-**decay** — reputation halves on a ~30-day half-life of on-chain *inactivity* (read from the account's
-last-block timestamp), so stale standing fades; and **accuracy** — a reporter's weight is scaled by how
-often their flags are *corroborated by other reputable accounts*, so a lone-wolf or frivolous reporter
-is discounted to a floor while a reporter the community backs keeps full weight (a Sybil sock-puppet
-can't self-corroborate — corroboration needs two accounts that each hold real reputation). The takedown
-threshold and the shield fraction are over this weighted, decayed, accuracy-scaled sum, and one score —
-`tips − weighted_reports` — still drives eviction, sync, and takedown alike. Every input is read or
+its balance and chain activity (both costly to fake at scale), and **decays** on a ~30-day half-life of
+on-chain *inactivity* (read from the account's last-block timestamp) so stale standing fades. That
+on-chain reputation is the **pre-trust seed** for a round of **iterative trust propagation**
+(pre-trust-anchored EigenTrust): trust flows between reporters who *agree* — who flag the same posts —
+and the vector `t = (1−α)·Cᵀ·t + α·p` is iterated to a fixed point. So a modest account whose calls are
+corroborated by high-trust accounts is **boosted** above its own pre-trust, while a lone-wolf or
+frivolous reporter is discounted. The decisive property is **conservation**: because the agreement
+matrix is row-stochastic and the teleport re-anchors to pre-trust, **total trust converges to the total
+on-chain reputation** — a Sybil swarm (pre-trust 0) can only *redistribute* real trust by mimicking
+trusted reporters, **never manufacture it**, so no number of empty accounts can force a takedown. The
+takedown threshold and the shield fraction are over the sum of reporters' propagated trust, and one
+score — `tips − weighted_reports` — drives eviction, sync, and takedown alike. Every input is read or
 verified from the ledger + the signed report graph — **no trusted party.** ✅ *Residual:* a genuinely
-wealthy, active adversary is still not priced out (reputation buys weight), and accuracy is a single-pass
-corroboration heuristic, not full iterative trust propagation — the knobs (`XC_REP_*`,
-`XC_TAKEDOWN_WEIGHT`) tune it. 🔨
+wealthy, *active* adversary is still not priced out (real reputation buys weight); the knobs
+(`XC_REP_*`, `XC_TAKEDOWN_WEIGHT`) tune the rest. 🔨
 
 ## 6. Funding — tips reward creators, pay-to-pin keeps content alive
 

@@ -152,6 +152,8 @@ REP_BAL_FULL = float(os.environ.get('XC_REP_BAL_FULL', '1'))    # XNO balance fo
 REP_BLK_FULL = float(os.environ.get('XC_REP_BLK_FULL', '10'))   # chain blocks for full activity credit
 REP_HALFLIFE = float(os.environ.get('XC_REP_HALFLIFE', str(30 * 86400)))   # rep halves per 30 idle days
 REP_TTL      = float(os.environ.get('XC_REP_TTL', '300'))       # cache an account's reputation this long
+REP_TELEPORT = float(os.environ.get('XC_REP_TELEPORT', '0.5'))  # EigenTrust anchor back to on-chain pre-trust
+REP_ITERS    = int(os.environ.get('XC_REP_ITERS', '25'))        # trust-propagation iterations to convergence
 _rep_cache = {}
 
 def account_rep(account):
@@ -180,12 +182,10 @@ def account_rep(account):
 
 def aggregate_reports(relays):
     # Read /reports from every relay, VERIFY each signature + key<->author binding, dedupe by account,
-    # weight each reporter by account_rep (Sybil-resistant, decayed), AND scale by the reporter's
-    # ACCURACY — how often their flags are corroborated by OTHER reputable accounts. A lone-wolf or
-    # frivolous reporter (nobody reputable agrees) is discounted to a floor; a reporter whose calls the
-    # community backs keeps full weight. Returns post_id -> {'weight', 'count', 'cid'}.
-    per = {}                                                # pid -> {'accts': {acc: rep}, 'cid': cid}
-    by_reporter = {}                                        # acc -> set(pid) they reported
+    # then weight reporters by ITERATIVE TRUST PROPAGATION seeded by their on-chain reputation (below).
+    # Returns post_id -> {'weight' (sum of its reporters' propagated trust), 'count', 'cid'}.
+    per = {}                                                # pid -> {'accts': set(acc), 'cid': cid}
+    reporters = {}                                          # acc -> set(pid) they reported
     for r in relays:
         try:
             d = json.loads(urllib.request.urlopen(r + '/reports', timeout=4).read()).get('reports', {})
@@ -196,26 +196,51 @@ def aggregate_reports(relays):
                 pub, sig, ts = rec.get('pub', ''), rec.get('sig', ''), rec.get('ts', 0)
                 if pub_to_addr(pub) != acc or not verify_msg(pub, 'report|%s|%s|%s' % (acc, pid, ts), sig):
                     continue
-                e = per.setdefault(pid, {'accts': {}, 'cid': ''})
-                e['accts'][acc] = account_rep(acc)          # dedupe by account across relays
+                e = per.setdefault(pid, {'accts': set(), 'cid': ''})
+                e['accts'].add(acc)                         # dedupe by account across relays
                 if rec.get('cid'):
                     e['cid'] = rec.get('cid')
-                by_reporter.setdefault(acc, set()).add(pid)
-    # A post is CORROBORATED when >= 2 of its reporters hold real (non-zero) reputation — a lone report,
-    # or a report + a rep-0 Sybil sock-puppet, does not corroborate.
-    corroborated = {pid for pid, e in per.items()
-                    if sum(1 for rp in e['accts'].values() if rp > 0) >= 2}
-    # Accuracy per reporter: fraction of their reports that landed on corroborated posts, floored at
-    # 0.25 so a newcomer/lone reporter isn't zeroed, capped at 1.0 (matches the old labeler model).
-    accuracy = {}
-    for acc, pids in by_reporter.items():
-        hit = sum(1 for pid in pids if pid in corroborated)
-        accuracy[acc] = 0.25 + 0.75 * (hit / len(pids)) if pids else 0.25
-    out = {}
-    for pid, e in per.items():
-        w = sum(rp * accuracy.get(acc, 0.25) for acc, rp in e['accts'].items())
-        out[pid] = {'weight': round(w, 4), 'count': len(e['accts']), 'cid': e['cid']}
-    return out
+                reporters.setdefault(acc, set()).add(pid)
+    # ITERATIVE TRUST PROPAGATION (pre-trust-anchored EigenTrust). pre-trust p = on-chain reputation
+    # (the Sybil-resistant seed); agreement C[i][j] = how much of i's reporting overlaps j (they flag
+    # the same posts). Iterate  t = (1-a)*C^T*t + a*p  to a fixed point: trust flows to reporters the
+    # trusted agree with, so a modest account corroborated by high-trust accounts is BOOSTED above its
+    # own pre-trust. Because C is row-stochastic and the teleport re-anchors to p, total trust converges
+    # to the total pre-trust -- a Sybil swarm (pre-trust 0) can only REDISTRIBUTE real trust by mimicking
+    # trusted reporters, never manufacture it.
+    accts = list(reporters)
+    p = {a: account_rep(a) for a in accts}                  # pre-trust = on-chain reputation
+    if sum(p.values()) <= 0:                                # no real reputation anywhere -> no takedowns
+        return {pid: {'weight': 0.0, 'count': len(e['accts']), 'cid': e['cid']} for pid, e in per.items()}
+
+    raw = {a: {} for a in accts}                            # co-report counts: raw[i][j] = posts i and j both flagged
+    for e in per.values():
+        rs = list(e['accts'])
+        for i in rs:
+            ri = raw[i]
+            for j in rs:
+                if i != j:
+                    ri[j] = ri.get(j, 0) + 1
+    C = {}                                                  # row-normalised agreement (stochastic where non-empty)
+    for i in accts:
+        s = sum(raw[i].values())
+        C[i] = {j: c / s for j, c in raw[i].items()} if s > 0 else {}
+
+    a = REP_TELEPORT
+    t = dict(p)                                             # iterate to the fixed point
+    for _ in range(REP_ITERS):
+        tn = {acc: a * p[acc] for acc in accts}             # a*p teleport (re-anchor to pre-trust)
+        for i in accts:
+            ti = t[i]
+            if ti:
+                w = (1.0 - a) * ti
+                for j, cij in C[i].items():
+                    tn[j] += w * cij                        # trust flows from i to those it agrees with
+        t = tn
+
+    return {pid: {'weight': round(sum(t.get(acc, 0.0) for acc in e['accts']), 4),
+                  'count': len(e['accts']), 'cid': e['cid']}
+            for pid, e in per.items()}
 
 def gsend(dst_pub, amt):  # genesis -> dst_pub, returns the send hash
     gi = rpc({'action': 'account_info', 'account': derive(GEN)[0]}); nb = str(int(gi['balance']) - amt)
