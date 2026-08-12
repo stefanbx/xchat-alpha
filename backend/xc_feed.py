@@ -72,5 +72,7 @@ for h in best.values():
         except Exception:
             pass
 posts.sort(key=lambda p: p.get('ts', 0), reverse=True)
+# ATOMIC write: a reader (api_feed) must never see this file half-written, or the feed blinks empty.
 json.dump({"feed": "XChat", "posts": posts, "relays_up": up, "relays_total": len(RELAYS),
-           "authors": len(best)}, open('/tmp/xc_feed_agg.json', 'w'))
+           "authors": len(best)}, open('/tmp/xc_feed_agg.json.tmp', 'w'))
+os.replace('/tmp/xc_feed_agg.json.tmp', '/tmp/xc_feed_agg.json')

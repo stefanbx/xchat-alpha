@@ -22,4 +22,5 @@ for pid, e in agg.items():
 
 out = {'labelers': [{'account': 'community', 'reputation': 1,
                      'list': {'labeler': 'community', 'labels': labels}}]} if labels else {'labelers': []}
-json.dump(out, open('/tmp/xc_labels.json', 'w'))
+json.dump(out, open('/tmp/xc_labels.json.tmp', 'w'))       # atomic: never let a reader see a half-write
+os.replace('/tmp/xc_labels.json.tmp', '/tmp/xc_labels.json')
