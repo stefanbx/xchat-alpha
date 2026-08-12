@@ -250,7 +250,13 @@ def aggregate_reports(relays):
     # to the total pre-trust -- a Sybil swarm (pre-trust 0) can only REDISTRIBUTE real trust by mimicking
     # trusted reporters, never manufacture it.
     accts = list(reporters)
-    p = {a: account_rep(a) for a in accts}                  # pre-trust = on-chain reputation
+    # pre-trust = on-chain reputation. account_rep is a mainnet RPC (~0.66s) on a cache miss, so a fresh
+    # spawn paid one PER reporter SERIALLY — the dominant feed-aggregation cost. Fetch them in parallel.
+    if accts:
+        with ThreadPoolExecutor(max_workers=min(16, len(accts))) as ex:
+            p = dict(zip(accts, ex.map(account_rep, accts)))
+    else:
+        p = {}
     if sum(p.values()) <= 0:                                # no real reputation anywhere -> no takedowns
         return {pid: {'weight': 0.0, 'count': len(e['accts']), 'cid': e['cid']} for pid, e in per.items()}
 
