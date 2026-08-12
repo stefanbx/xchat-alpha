@@ -120,6 +120,14 @@ elif mode == 'publish':
            'size': size, 'changelog': changelog, 'ts': int(time.time())}
     d = dict(l.split(' ', 1) for l in xc._sign_lines(key, canon(rec)))
     rec['sig'] = d['sig']; rec['pub'] = d['pub']
+    # A hash-verified DOWNLOAD MIRROR: a plain-binary CDN URL the app fetches FIRST (a 20 MB binary GET is
+    # far more reliable than 27 MB of base64 JSON re-served by a small relay — that's what made the in-app
+    # download spin-and-fail). It is NOT in the signed canon and NOT the root of trust: the app accepts the
+    # bytes only if they match `sha256` above, and falls back to the relays if the mirror is wrong/down.
+    mirror = os.environ.get('XC_RELEASE_URL', '') or \
+        'https://raw.githubusercontent.com/stefanbx/xchat-alpha/master/apk/xchat-alpha.apk'
+    if mirror:
+        rec['url'] = mirror
     pushed = post('/release', rec)
     json.dump({'ok': True, 'version': version, 'cid': cid, 'size': size,
                'pinned_relays': pinned, 'record_relays': pushed}, open('/tmp/xc_release_result.json', 'w'))

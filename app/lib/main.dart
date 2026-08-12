@@ -32,7 +32,7 @@ String kBase = kDefaultBase;
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.3'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.2.4'; // this build; the update checker compares against the signed release.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
 // 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
 // below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)
@@ -791,11 +791,22 @@ class Api {
     }
   }
 
-  // Fetch a RELEASE APK (tens of MB) and verify its hash. Goes DIRECT to the public relays that hold the
-  // blob — NOT through the node's /api/media, which would have to re-fetch and re-serve the whole APK and
-  // chokes on it (a 512 MB node re-serializing a 20 MB APK as base64 JSON drops the response). A relay
-  // serves its own cached blob fine. Tries each relay until one returns bytes whose sha256 matches.
-  static Future<Uint8List?> fetchReleaseApk(String cid, String wantSha) async {
+  // Fetch a RELEASE APK (tens of MB) and verify its hash. Order of preference:
+  //  1) `mirrorUrl` from the record — a plain BINARY download from a CDN (e.g. the repo's raw host). This
+  //     is ~half the bytes of the base64 relay path and streams reliably; a relay serving 27 MB of base64
+  //     JSON from a 512 MB box to a phone is what made the in-app download spin-and-fail.
+  //  2) DIRECT from the public relays (base64) — the censorship-resistant fallback if the mirror is down.
+  //  3) the node's /api/media — last resort.
+  // Trust is the SHA-256, not the host: whatever a source returns is accepted only if it matches the hash
+  // in the SIGNED release record, so a mirror is exactly that — a mirror, never a root of trust.
+  static Future<Uint8List?> fetchReleaseApk(String cid, String wantSha, {String? mirrorUrl}) async {
+    if (mirrorUrl != null && mirrorUrl.isNotEmpty) {
+      try {
+        final r = await http.get(Uri.parse(mirrorUrl)).timeout(const Duration(seconds: 120));
+        if (r.statusCode == 200 && r.bodyBytes.isNotEmpty &&
+            sha256.convert(r.bodyBytes).toString() == wantSha) return r.bodyBytes;
+      } catch (_) {}
+    }
     for (final url in await relayUrls()) {                // every discovered PUBLIC relay (not deduped by account)
       try {
         final r = await http.get(Uri.parse('$url/blob?cid=$cid')).timeout(const Duration(seconds: 120));
@@ -3758,8 +3769,8 @@ class _FeedScreenState extends State<FeedScreen> {
           setSheet(() => phase = 'downloading');
           try {
             final want = '${rel['sha256']}';
-            // fetch DIRECT from the relays that hold the APK + verify the hash on-device (don't trust transport)
-            final bytes = await Api.fetchReleaseApk('${rel['cid']}', want);
+            // hash-verified CDN mirror first (fast binary), relays as the decentralized fallback
+            final bytes = await Api.fetchReleaseApk('${rel['cid']}', want, mirrorUrl: rel['url'] as String?);
             if (bytes == null) {
               setSheet(() => phase = 'available');
               if (mounted) {
