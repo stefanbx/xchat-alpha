@@ -32,7 +32,10 @@ String kBase = kDefaultBase;
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '0.1.1'; // this build; the update checker compares against the signed release
+const String kAppVersion = '2.2.0'; // this build; the update checker compares against the signed release
+// NB the version JUMPED 0.1.x → 2.2.0 on purpose: the older (keeltube-lineage) app reached ~v2.1.0, so a
+// 0.1.x release looked like a DOWNGRADE to those installs and was never offered. 2.2.0 supersedes every
+// prior lineage. (Cross-lineage installs that pin a different publisher key still need one manual sideload.)
 // Alpha safety cap: the in-app wallet is meant to hold only a small tip float, not savings — so the
 // worst a bad app build could ever steal is small. Keep real funds in your own wallet.
 const double kWalletCapXno = 2.0;
@@ -213,6 +216,16 @@ class BookmarkStore {
       ((await SharedPreferences.getInstance()).getStringList(_k) ?? <String>[]).toSet();
   static Future<void> save(Set<String> s) async =>
       (await SharedPreferences.getInstance()).setStringList(_k, s.toList());
+}
+
+// remembers the update version the user dismissed, so the auto-check banner nags once per version, not
+// every launch. ("" = nothing dismissed.)
+class UpdateDismiss {
+  static const _k = 'xchat_update_dismissed';
+  static Future<String> get() async =>
+      (await SharedPreferences.getInstance()).getString(_k) ?? '';
+  static Future<void> set(String version) async =>
+      (await SharedPreferences.getInstance()).setString(_k, version);
 }
 
 // OUTBOX: posts composed while OFFLINE are queued here (persisted across restarts) and auto-flushed
@@ -1458,6 +1471,7 @@ class _FeedScreenState extends State<FeedScreen> {
   int _homeFeed = 0; // 0 = For You (ranked), 1 = Following (chronological)
   List<Map<String, dynamic>> _outbox = []; // posts composed OFFLINE, queued + auto-flushed on reconnect
   bool _flushing = false;                  // guards _flushOutbox against re-entrancy
+  Map<String, dynamic>? _update;           // a newer signed release found by the launch auto-check
   Set<String> _follows = {};
   Settings _settings = Settings();
   Map<String, dynamic> _engage = {}; // post_id -> {likes, reposts, tips_raw}
@@ -2581,6 +2595,20 @@ class _FeedScreenState extends State<FeedScreen> {
     _outbox = await Outbox.load();          // restore anything queued offline in a previous session
     if (mounted) setState(() {});
     _flushOutbox();                          // and try to send it now (best-effort; no-op if offline)
+    _autoCheckUpdate();                      // background: is there a newer signed release? (non-blocking)
+  }
+
+  // AUTO-UPDATE CHECK: on launch, ask the relays for a newer signed release and, if there is one the user
+  // hasn't already dismissed, surface a banner. The manual wallet→"App updates" flow still exists; this
+  // just means an update reaches people without them going looking for it.
+  Future<void> _autoCheckUpdate() async {
+    try {
+      final r = await Api.releaseCheck();
+      if (r == null || r['update'] != true) return;
+      final v = '${r['version']}';
+      if (await UpdateDismiss.get() == v) return;   // already dismissed this exact version
+      if (mounted) setState(() => _update = r);
+    } catch (_) {}
   }
 
   // ---- OFFLINE OUTBOX: queue posts composed offline, auto-flush on reconnect ----
@@ -4258,9 +4286,38 @@ class _FeedScreenState extends State<FeedScreen> {
     );
   }
 
+  Widget _updateBanner() {
+    final r = _update!;
+    return Material(
+      color: kAccent.withOpacity(0.14),
+      child: InkWell(
+        onTap: _showUpdates,   // the full download+verify+install flow
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 8, 10),
+          child: Row(children: [
+            const Icon(Icons.system_update, size: 18, color: kAccent),
+            const SizedBox(width: 10),
+            Expanded(child: Text('Update available · v${r['version']} — tap to install',
+                style: const TextStyle(color: kAccent, fontWeight: FontWeight.w600, fontSize: 13.5))),
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.close, size: 18, color: kDim),
+              tooltip: 'Dismiss',
+              onPressed: () async {
+                await UpdateDismiss.set('${r['version']}');   // don't nag again for this version
+                if (mounted) setState(() => _update = null);
+              },
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
   Widget _homeBody() {
     final posts = _homeFeed == 0 ? _forYouPosts() : _homePosts();
     return Column(children: [
+      if (_update != null) _updateBanner(),
       // For You / Following segmented header (X-style), with a transparency ⓘ
       Container(
         decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: kLine))),
