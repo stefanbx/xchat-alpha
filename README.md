@@ -1,12 +1,34 @@
 # ӾChat
 
-**A censorship-free X (Twitter), discovered on the XNO ledger.** Your identity is a Nano
-keypair, your posts are signed events on interchangeable relays, and the app finds those relays
-by **scanning the Nano ledger** — no hardcoded server, no directory anyone can seize, no app-store
-gate. The "Ӿ" is the XNO symbol.
+**A censorship-free X (Twitter), discovered on the XNO ledger.**
 
-> **Alpha.** This is research software. It moves no money on your behalf — you hold your keys.
-> Read [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md) for the full design.
+You *are* a Nano keypair — no email, no password, no server account. Posts are **signed events
+replicated across interchangeable relays**, and the app finds those relays by **scanning the Nano
+(XNO) ledger** — so there's no hardcoded server and no directory anyone can seize. Tips are **real
+XNO**, feeless, signed on your phone. The app even **updates itself over its own relays** — no app
+store in the path. *(The "Ӿ" is the XNO symbol.)*
+
+<p align="center">
+  <img src="docs/img/feed.png" width="300"
+       alt="ӾChat feed — signed posts on plural relays, discovered on the XNO ledger">
+</p>
+
+**Try it (Android)** → [download the signed APK](apk/xchat-alpha.apk) (verify its checksum
+[below](#install-the-app)), open it, allow "install unknown apps", create a wallet — **back up your
+seed** — and post.  ·  **Read the design** → [`docs/WHITEPAPER.md`](docs/WHITEPAPER.md).
+
+**Why it's different** — every load-bearing part can be routed around:
+
+- 🔑 **Identity is a keypair, not an account.** Restore your seed on any phone and your posts, follows and tips return. The seed never leaves the device; no server API even accepts one.
+- 📡 **Content is signed events on *plural* relays.** A relay verifies nothing and can only *fail to serve* — never forge or silently delete. Kill one mid-scroll and the feed is intact.
+- 🛰️ **Discovery is on-ledger.** Relays self-announce on XNO; the app finds them by scanning keyless, plural rendezvous accounts. No relay URL is hardcoded — [verify it yourself](#verify-discovery-yourself).
+- ⚡ **Money is Nano.** Only tips touch the chain — batched, feeless, non-custodial, signed on-device. A billion posts cost zero ledger growth.
+- 📦 **Self-delivering.** Updates are signed, content-addressed, pinned across the relays, and hash-verified on-device before an explicit-tap install.
+
+> **Alpha, on mainnet.** Research software — it moves no money on your behalf; you hold your keys.
+> Only tip amounts you can afford to lose, and **back up your wallet seed** (it is the *only*
+> recovery). Android-only today; one small hosted node + a couple of relays, so expect rough edges.
+> See [§11 of the whitepaper](docs/WHITEPAPER.md) for an honest done-vs-building breakdown.
 
 ---
 
@@ -21,24 +43,18 @@ gate. The "Ӿ" is the XNO symbol.
 | `docs/` | Whitepaper |
 | `test/` | The interop and end-to-end tests behind the "your seed never leaves" claim |
 
-## The four layers, in one breath
-
-- **Identity** = a Nano keypair (no email, no account). Restore your seed anywhere, your account returns. **The seed never leaves the phone** — the app signs everything locally and no node API will even accept one.
-- **Content** = signed events on *plural* relays. Relays verify nothing; clients verify every signature. One relay down doesn't matter.
-- **Discovery** = relays self-announce on the XNO ledger; the app finds them by scanning keyless, plural *rendezvous* accounts. No relay URL is hardcoded. (See [Verify discovery](#verify-discovery-yourself).)
-- **Settlement** = only tips touch Nano, batched and non-custodial. The whole social graph is off-chain.
-
 ## Install the app
 
-Download `apk/xchat-alpha.apk` onto an Android phone and open it (allow "install from this
-source" once). **Verify it first:**
+Download `apk/xchat-alpha.apk` (**v2.2.1**) onto an Android phone and open it (allow "install from
+this source" once). **Verify it first:**
 
 ```
 sha256sum xchat-alpha.apk
-# expected: 3ae5ebdabe940a7241dc7c0aca072b4a4207b6ed2f3bdc16ed700dd1f41263ad
+# expected: 83f83f14af47fd14abe1c46e3f2381b7d16ca5c7657caca4e5e6c84990c72653
 ```
 
-Signing certificate SHA-256: `3cc918358c69a37a84be1f048dccfc3a7c1edf74f2a0790cb28b5ccacd15f393`
+Signing certificate SHA-256: `d3c83e1a08edc6339a95489bce6cd017e10c921272af15429aa07a9919b7788e`
+(every published update is signed by this same key, so once installed the app updates **in place**).
 (`apksigner verify --print-certs xchat-alpha.apk`). Android only installs an update over an app
 signed by the same certificate, so this fingerprint is what ties every future release to this one.
 
@@ -128,7 +144,10 @@ needs `dart` on PATH and an `ipfs` daemon.)
 - **The node cannot act as you.** It holds no seed; every write is signed on the device and the
   node only verifies, adds proof-of-work, and relays. There is no API that accepts a seed.
 - **The seed is stored in the app's private storage, which is not hardware-backed.** A rooted or
-  physically compromised phone can read it. Back up the seed; treat the phone as the weak point.
+  physically compromised phone can read it. **Recovery is *only* your seed** — a wallet is a random
+  seed, so if you don't save it and the app is reinstalled, its funds are unrecoverable. Back it up
+  the moment you create a wallet; treat the phone as the weak point. (Mandatory-backup UX + keystore
+  storage are a priority — see whitepaper §11.)
 - **In-app updates need a pinned publisher.** The update-signing key lives outside this repo
   (`xc_release.py keygen` → `~/.xchat/publisher.key`, 0600). With no publisher account pinned, the
   app refuses in-app updates rather than trusting an unknown signer.
