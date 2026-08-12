@@ -13,6 +13,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8790
 NS = str(PORT)
+# The node runs its own relay on loopback; kt_server owns /api/* and forwards every OTHER path to it,
+# so the node's PUBLIC url doubles as a fully-working relay (/heads, /push, /blob, /relays,
+# /relay_announce, …). That's what lets a peer relay bootstrap TO the node and discover it.
+RELAY_ORIGIN = 'http://127.0.0.1:%d' % int(os.environ.get('XC_RELAY_PORT', '7401'))
 # The helpers import xc_common (nanopy), so the right interpreter is by definition THIS one — it
 # already imported it below. Defaulting to a bare 'python3' picked whichever came first on PATH,
 # which on a machine with more than one Python is a different install with no nanopy: every helper
@@ -315,8 +319,20 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _handle(self, body):
+    def _proxy_relay(self, raw):
+        # Forward a relay-owned request to the loopback relay, verbatim (method + path + query + body).
+        req = urllib.request.Request(RELAY_ORIGIN + self.path,
+                                     data=(raw if self.command == 'POST' else None),
+                                     headers={'Content-Type': 'application/json'}, method=self.command)
+        try:
+            self._send(urllib.request.urlopen(req, timeout=10).read())
+        except Exception as e:
+            self._send(json.dumps({'error': 'relay: ' + str(e)}))
+
+    def _handle(self, body, raw=b''):
         u = urllib.parse.urlparse(self.path)
+        if not u.path.startswith('/api/') and u.path != '/':   # /api/* is kt_server's; the rest is the relay's
+            return self._proxy_relay(raw)
         self._send(route(u.path, urllib.parse.parse_qs(u.query), body))
 
     def do_GET(self):
@@ -333,7 +349,7 @@ class H(BaseHTTPRequestHandler):
                 body = json.loads(raw or b'{}')
             except Exception:
                 body = {}
-            self._handle(body)
+            self._handle(body, raw)
         except Exception as e:
             self._send(json.dumps({'error': str(e)}))
 

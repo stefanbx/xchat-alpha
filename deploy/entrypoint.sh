@@ -15,8 +15,19 @@ ipfs init >/dev/null 2>&1 || true
 ipfs config --json Addresses.Gateway '"/ip4/127.0.0.1/tcp/8081"' >/dev/null 2>&1 || true
 ipfs daemon --offline >/tmp/ipfs.log 2>&1 &
 sleep 5
-echo "http://127.0.0.1:7401" > /tmp/xchat_bootstrap.txt   # node uses its co-located relay
-python3 /app/xc_relayd.py 7401 "$STORE_DIR/relay.json" >/tmp/relay.log 2>&1 &
+
+# --- relay mesh wiring (no single point of discovery) ---
+# The node's public url IS its relay (kt_server proxies every non-/api path to :7401), so the embedded
+# relay advertises that url and PEERS with the independent public relay both ways:
+#   - the embedded relay bootstraps to PEER_RELAY (announces itself + pulls its /relays)
+#   - the node's own aggregation (xc_feed/xc_post) gets PEER_RELAY straight from XCHAT_BOOTSTRAP, so a
+#     momentary on-chain relay-scan miss can't strand the feed on the loopback relay alone.
+NODE_PUBLIC_URL="${NODE_PUBLIC_URL:-https://xchat-alpha-node.fly.dev}"
+PEER_RELAY="${PEER_RELAY:-https://xchat-relay-1.fly.dev}"
+export RELAY_PUBLIC_URL="$NODE_PUBLIC_URL"     # the embedded relay's reachable identity (proxied to :7401)
+export XCHAT_BOOTSTRAP="$PEER_RELAY"           # xc_common._bootstrap() always includes the peer relay
+echo "http://127.0.0.1:7401" > /tmp/xchat_bootstrap.txt   # node still talks to its co-located relay on loopback
+python3 /app/xc_relayd.py 7401 "$STORE_DIR/relay.json" "$PEER_RELAY" >/tmp/relay.log 2>&1 &
 sleep 1
-echo "starting ӾChat node on :8790 (relay :7401 store=$STORE_DIR/relay.json ipfs=$IPFS_PATH, RPC=$XC_NANO_RPC)"
+echo "starting ӾChat node on :8790 (relay :7401 public=$NODE_PUBLIC_URL peer=$PEER_RELAY store=$STORE_DIR/relay.json ipfs=$IPFS_PATH, RPC=$XC_NANO_RPC)"
 exec python3 /app/kt_server.py 8790
