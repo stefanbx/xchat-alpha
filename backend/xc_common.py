@@ -42,6 +42,28 @@ def _transport_err(r):
         return False
     return not any(k in e for k in _NANO_ERRS)
 
+_session = [None]
+def _post_json(url, obj, timeout=20):
+    # Keep-alive HTTP: a fresh TCP+TLS handshake per RPC cost ~0.35s to a public node (measured: fresh
+    # 0.5s/call vs pooled 0.15s/call). A shared requests.Session pools connections per host — in the
+    # long-lived kt_server process it reuses them ACROSS requests (money-path account_state/receivables
+    # can't be cached, so this is their main win); within a spawned helper it reuses across the parallel
+    # RPC batch. Falls back to urllib if requests is somehow absent.
+    hdr = {'Content-Type': 'application/json', 'User-Agent': 'xchat-node/0.1'}
+    data = json.dumps(obj).encode()
+    try:
+        if _session[0] is None:
+            import requests
+            from requests.adapters import HTTPAdapter
+            s = requests.Session()
+            ad = HTTPAdapter(pool_connections=8, pool_maxsize=32, max_retries=0)
+            s.mount('http://', ad); s.mount('https://', ad)
+            _session[0] = s
+        return _session[0].post(url, data=data, headers=hdr, timeout=timeout).json()
+    except ImportError:
+        return json.loads(urllib.request.urlopen(
+            urllib.request.Request(url, data, hdr), timeout=timeout).read())
+
 def rpc(o):
     # public mainnet RPCs (e.g. rpc.nano.to) reject the default python User-Agent with 403 — send one.
     eps = _rpc_endpoints()
@@ -50,9 +72,7 @@ def rpc(o):
     last = None
     for i in order:
         try:
-            r = json.loads(urllib.request.urlopen(
-                urllib.request.Request(eps[i], json.dumps(o).encode(),
-                    {'Content-Type': 'application/json', 'User-Agent': 'xchat-node/0.1'}), timeout=20).read())
+            r = _post_json(eps[i], o, timeout=20)     # pooled/keep-alive connection
         except Exception as e:
             last = e
             continue

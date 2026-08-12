@@ -1,3 +1,4 @@
 # ӾChat node — pure-Python dependencies (no native build, runs on any OS)
 nanopy>=28        # Nano ed25519-blake2b keys, signing, block hashing
 pynacl>=1.5       # X25519 sealed boxes for encrypted DMs
+requests>=2.31    # pooled/keep-alive HTTP for the Nano RPC (a fresh TLS handshake per call cost ~0.35s)
