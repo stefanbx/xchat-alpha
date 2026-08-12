@@ -143,11 +143,12 @@ needs `dart` on PATH and an `ipfs` daemon.)
   go directly wallet-to-wallet.
 - **The node cannot act as you.** It holds no seed; every write is signed on the device and the
   node only verifies, adds proof-of-work, and relays. There is no API that accepts a seed.
-- **The seed is stored in the app's private storage, which is not hardware-backed.** A rooted or
-  physically compromised phone can read it. **Recovery is *only* your seed** — a wallet is a random
-  seed, so if you don't save it and the app is reinstalled, its funds are unrecoverable. Back it up
-  the moment you create a wallet; treat the phone as the weak point. (Mandatory-backup UX + keystore
-  storage are a priority — see whitepaper §11.)
+- **The seed is held in the platform secure store** — Android EncryptedSharedPreferences (master key in
+  the Android Keystore), iOS Keychain; a legacy plaintext copy is migrated in and deleted on first read.
+  It isn't in readable preferences, but a rooted/compromised device running the app can still have it
+  decrypted, so treat the phone as the weak point. **Recovery is *only* your seed** — a wallet is a
+  random seed, so if you don't save it and the app is reinstalled, its funds are unrecoverable; backup
+  is now **mandatory and verified**, and receiving XNO is gated on it (see whitepaper §11).
 - **In-app updates need a pinned publisher.** The update-signing key lives outside this repo
   (`xc_release.py keygen` → `~/.xchat/publisher.key`, 0600). With no publisher account pinned, the
   app refuses in-app updates rather than trusting an unknown signer.

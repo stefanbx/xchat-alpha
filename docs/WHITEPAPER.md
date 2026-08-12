@@ -258,8 +258,11 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
 - **A relay's account key is guessable from its public URL** (so it could be impersonated or, if
   funded, drained). → A relay announces from the **operator's own secret key**, never a URL-derived
   one. 🔨
-- **Seed at rest on a lost/rooted phone.** → Move seed storage to the OS secure enclave/keystore.
-  (Alpha uses app-private storage.) 🗺️
+- **Seed at rest on a lost/rooted phone.** → The seed is held in the **OS secure store** already —
+  Android EncryptedSharedPreferences (master key in the Android Keystore), iOS Keychain — so it isn't in
+  readable preferences (legacy plaintext copies are migrated in and deleted). A rooted device running the
+  app can still have it decrypted, so the device itself remains the weak point; your written backup is the
+  real recovery. ✅
 
 ### Content & relays
 - **A relay forges posts.** → Every event is **signature-verified**, and each author's head key is
@@ -431,16 +434,21 @@ look like a network fault rather than a crypto one. `test/e2e_test.py` then runs
 real node and drives all of it through the app's own signer, checking each path twice: that a valid
 record is accepted and lands on the relay, and that a **tampered** one is refused.
 
-**Honest limits.** The seed is stored in the app's private `SharedPreferences`, which is not
-hardware-backed — a rooted or physically compromised phone can read it (moving to the platform
-keystore is the next step). **Wallet recovery is *only* your seed backup** — a wallet is a random seed,
+**Honest limits.** The seed is held in the **platform secure store** — on Android in
+EncryptedSharedPreferences with the master key in the **Android Keystore**, on iOS in the **Keychain**
+(and any legacy plaintext copy is migrated in and deleted on first read), so it is not sitting in
+readable preferences. The honest caveat: the Keystore master key is *hardware*-backed only where the
+device provides it (TEE/StrongBox), and a rooted or physically compromised phone running the app can
+still have the value decrypted — so treat the device itself as the ultimate weak point, and your written
+seed backup as the real recovery. **Wallet recovery is *only* your seed backup** — a wallet is a random seed,
 so if it isn't saved and the app is reinstalled, its funds are unrecoverable (on-chain but unspendable).
 Backup is now **mandatory and verified**: creating a wallet requires re-entering the seed characters at
 random positions *from your written copy* (the seed is hidden during that check) before you can enter the
 app, and an existing wallet is nagged by a persistent banner until it confirms — closing the
 accidental-loss footgun. **Receiving XNO is gated on that confirmed backup** too (the receive QR is
 withheld and the Receive button locked until the seed is secured), so funds can't land in a wallet you
-can't recover. Still pending: moving the seed into the platform keystore. **Update delivery works but isn't production-grade:** the download comes
+can't recover. (The seed is already in the OS secure store — see the seed paragraph above — so the
+wallet-safety pieces are in place; the residual risk is a compromised *device*.) **Update delivery works but isn't production-grade:** the download comes
 direct from a relay and is hash-verified, but the hosted node and relays are small single instances
 that can get busy, so an in-app update can need a retry or two. Moderation labeling is minimal. Network metadata is **not** private (no
 onion routing yet — treat your IP as visible). The node is single-identity-per-instance for the
