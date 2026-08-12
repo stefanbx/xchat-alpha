@@ -235,6 +235,29 @@ def api_head(acct):
         return json.dumps({'ok': True, 'head': None})
     return json.dumps({'ok': True, 'head': {'seq': best['seq'], 'cid': best['cid'], 'handle': best.get('handle', '')}})
 
+_relcheck_cache = {}   # current -> (result_str, ts)
+def api_release_check(current):
+    # Cache the check like the feed. It spawns a helper (relay fan-out) and holds the HTTP connection
+    # open ~1s+; under the app's launch burst on a single machine that piles up open connections until
+    # Fly's proxy can't route ("no good candidate") and a phone's check fails though the node is healthy.
+    # A short-TTL cache makes repeat/concurrent checks return in microseconds, freeing the connection.
+    now = time.time()
+    c = _relcheck_cache.get(current)
+    if c and now - c[1] < 20:
+        return c[0]
+    put('/tmp/xc_rel_current.txt', current)
+    spawn('xc_release.py', 'check')
+    r = read('/tmp/xc_release_result.json', '{}')
+    try:
+        ok = json.loads(r).get('ok') is True
+    except Exception:
+        ok = False
+    if ok:                                            # don't cache a transient failure (would stick 20s)
+        _relcheck_cache[current] = (r, now)
+        if len(_relcheck_cache) > 64:
+            _relcheck_cache.pop(next(iter(_relcheck_cache)), None)
+    return r
+
 def api_status():
     try:
         bc = xc.rpc_cached({'action': 'block_count'}, ttl=10)  # chain height for display; 10s stale is invisible
@@ -317,7 +340,7 @@ def route(path, query, body):
 
     if path.startswith('/api/blob_put'):     put('/tmp/xc_blob_in.txt', b('b64')); spawn('xc_blobput.py');    return read('/tmp/xc_blobput_result.json', '{}')
 
-    if path.startswith('/api/release_check'): put('/tmp/xc_rel_current.txt', q('current')); spawn('xc_release.py','check'); return read('/tmp/xc_release_result.json','{}')
+    if path.startswith('/api/release_check'): return api_release_check(q('current'))
     if path.startswith('/api/release_fetch'): put('/tmp/xc_rel_cid.txt', b('cid')); put('/tmp/xc_rel_sha.txt', b('sha256')); spawn('xc_release.py','fetch'); return read('/tmp/xc_release_result.json','{}')
 
     if path.startswith('/api/head'):         return api_head(q('account'))   # app re-signs it to republish (seedless)
