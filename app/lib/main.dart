@@ -4174,7 +4174,10 @@ class _FeedScreenState extends State<FeedScreen> {
       // spinner — so the display is never lost.
       body: (_loading && _posts.isEmpty)
           ? const Center(child: CircularProgressIndicator(color: kAccent))
-          : _error != null
+          // A cold start while OFFLINE fails the feed load, but if there are QUEUED posts we must still
+          // show them (the feed with its pending cards) instead of a bare error — else a restart hides
+          // your unsent posts. Send-now + pull-to-refresh retry; Settings holds the server-address editor.
+          : (_error != null && _outbox.isEmpty)
               ? _ErrorView(msg: _error!, onRetry: _load, onEndpoint: _showEndpoint)
               : _tab == 1
                   ? DiscoverScreen(
