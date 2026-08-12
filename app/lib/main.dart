@@ -32,7 +32,7 @@ String kBase = kDefaultBase;
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.4'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.2.5'; // this build; the update checker compares against the signed release.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
 // 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
 // below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)
@@ -2119,7 +2119,9 @@ class _FeedScreenState extends State<FeedScreen> {
     final seen = <String>{};
     final out = <Map<String, String>>[];
     for (final p in _posts) {
-      if (p.account.isNotEmpty && p.handle != 'you.xno' && !_hidden(p.account) && seen.add(p.account)) {
+      // exclude only YOUR OWN account (and muted/blocked) — not the default "you.xno" handle, or Discover
+      // is empty whenever everyone still shares that default handle (they're told apart by their acctTag).
+      if (p.account.isNotEmpty && p.account != _account && !_hidden(p.account) && seen.add(p.account)) {
         out.add({'account': p.account, 'handle': p.handle});
       }
     }

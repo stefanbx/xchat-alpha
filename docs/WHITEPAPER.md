@@ -191,9 +191,9 @@ on any one secret:
   gate itself (Android allows sideload/self-update; iOS does not) — and the app says so.
 
 **Bootstrapping honesty — what's shipped vs. the target.** The alpha **implements today**: signed,
-content-addressed releases; the APK pinned + **auto-replicated** across plural relays; the client
-fetching from *any* relay and **re-verifying the SHA-256 on-device** before an explicit-tap install;
-and an auto-update check. It uses a **single publisher key** (held outside the repo; the app pins only
+content-addressed releases; the APK pinned + **auto-replicated** across plural relays **and mirrored on
+a hash-verified CDN URL** (fetched first for speed, relays as the fallback); the client **re-verifying
+the SHA-256 on-device** before an explicit-tap install; and an auto-update check (on launch + periodic). It uses a **single publisher key** (held outside the repo; the app pins only
 the public account). The **reproducible builds** and the **K-of-N attestor quorum** described above are
 the *design target*, **not yet shipped** — they are the hardening toward 1.0 (reproducible builds make
 the binary trustless relative to the source; a real quorum needs several independent maintainers).
@@ -208,12 +208,17 @@ Two things travel separately, which is why there is no central distribution poin
   list so a forged record can't evict the real one — the client keeps the highest *validly signed*
   version). Committing the record (and attestations) **on the XNO ledger** for public, website-free
   tamper-evidence is the roadmap item, not yet shipped.
-- **The bytes** (the APK): **content-addressed** by hash and cached on the **relays**, plural and
-  interchangeable — and now **auto-replicated + pinned** across the relay set on publish.
+- **The bytes** (the APK): **content-addressed** by hash. They live on the **relays** (plural,
+  interchangeable, **auto-replicated + pinned** across the set on publish) **and** at an optional
+  plain-HTTPS **mirror** URL carried in the record — a CDN (the repo's raw host by default, or anything:
+  a Cloudflare bucket, IPFS, a friend's server). The client fetches the mirror **first** (a 20 MB binary
+  GET is far faster and more reliable than 27 MB of base64 re-served by a small relay) and falls back to
+  the relays if the mirror is missing, wrong, or taken down.
 
-The client reads the pointer from the ledger, fetches the bytes from *any* relay that has them, and
-checks the hash. It never matters *where* the bytes came from — only that they match the
-on-chain-attested hash.
+The client fetches the bytes from the mirror or *any* relay that has them and **re-verifies the SHA-256
+on-device** against the signed record. It never matters *where* the bytes came from — a mirror is
+exactly that, a mirror; wrong bytes from anywhere fail the hash and the client moves to the next source.
+This is why hosting the APK on a fast CDN costs nothing in trust: the hash is the root, not the host.
 
 Nobody pushes the release to every relay. The publisher pins it to a handful they can reach; from
 there it spreads with the same gossip the content layer uses — **relay-to-relay backfill**,
