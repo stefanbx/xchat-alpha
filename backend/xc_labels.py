@@ -13,8 +13,21 @@ RELAYS = xc.discover_relays()
 QUORUM_W = float(os.environ.get('XC_TAKEDOWN_WEIGHT', '2'))     # weighted reporters for a full 1.0 (= takedown)
 
 agg = xc.aggregate_reports(RELAYS)                             # post_id -> {'weight','count','cid'}
+
+# Drop reports for posts that no longer exist in the live feed — a DELETED post (thread republished
+# without it) must not carry a ghost report badge, and orphaned reports shouldn't accumulate forever.
+# The feed cache is the authoritative live-post set; if it isn't available yet, don't prune (fail open).
+live_ids = None
+try:
+    feed = json.load(open('/tmp/xc_feed_agg.json'))           # read-only, never consume the cache
+    live_ids = {p.get('id') for p in feed.get('posts', [])}
+except Exception:
+    live_ids = None
+
 labels = []
 for pid, e in agg.items():
+    if live_ids is not None and pid not in live_ids:
+        continue                                              # orphaned report (post deleted / gone)
     frac = min(1.0, e['weight'] / QUORUM_W) if QUORUM_W > 0 else 1.0
     labels.append({'post': pid, 'verdict': 'reported',
                    'reason': "%d report(s) · weight %.2f" % (e['count'], e['weight']),

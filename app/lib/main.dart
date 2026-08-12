@@ -855,6 +855,38 @@ class Api {
     }
   }
 
+  // Delete your OWN post: sign a delete event, the node rebuilds your thread WITHOUT it (new CID),
+  // you sign the new head over that CID and submit it — same on-device two-step as posting, so the
+  // node never touches your seed. The post drops from every relay's feed.
+  static Future<bool> deletePost(String postId, String handle) async {
+    final w = gWallet;
+    if (w == null) return false;
+    try {
+      final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final ds = w.signMsg(w.deleteMsg(postId, ts));                 // 1) prove authorship of the delete
+      final pr = await http
+          .post(Uri.parse('$kBase/api/post_delete'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({'account': w.account, 'post_id': postId, 'ts': ts,
+                                'sig': ds['sig'], 'pub': ds['pub'], 'handle': handle}))
+          .timeout(const Duration(seconds: 30));
+      final d = jsonDecode(pr.body) as Map<String, dynamic>;
+      final cid = d['cid'] as String?;
+      if (cid == null) return false;
+      final seq = d['seq'] as int, expires = d['expires'] as int;
+      final hs = w.signMsg(w.headMsg(seq, cid, expires));            // 2) sign the new head over the new thread
+      final sub = await http
+          .post(Uri.parse('$kBase/api/post_submit'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({'author': w.account, 'handle': handle, 'seq': seq, 'cid': cid,
+                                'expires': expires, 'sig': hs['sig'], 'pub': hs['pub']}))
+          .timeout(const Duration(seconds: 30));
+      return (jsonDecode(sub.body)['ok'] == true);
+    } catch (_) {
+      return false;
+    }
+  }
+
   // returns the new post's id (empty string on failure) so a thread can chain reply_to.
   // ON-DEVICE SIGNED, two-step: (1) sign the post event locally + POST it to /api/post_prepare — the
   // node assembles the thread, pins it, and returns the content CID + head seq; (2) sign the head
@@ -2015,7 +2047,8 @@ class _FeedScreenState extends State<FeedScreen> {
         onBookmark: () => _toggleBookmark(post),
         onPin: (post.media != null && post.media!.isNotEmpty) ? () => _pinPost(post) : null,
         onMute: post.account == _account ? null : () => _toggleMute(post.account, post.handle),
-        onBlock: post.account == _account ? null : () => _toggleBlock(post.account, post.handle));
+        onBlock: post.account == _account ? null : () => _toggleBlock(post.account, post.handle),
+        onDelete: post.account == _account ? () => _deletePost(post) : null);   // your own posts only
   }
 
   // ---- threads: posts chained by reply_to ----
@@ -2449,6 +2482,37 @@ class _FeedScreenState extends State<FeedScreen> {
         backgroundColor: kCard,
         content: Text('reported to the community + hidden from your feed — enough reports take it '
             'down for everyone (reversible)')));
+  }
+
+  // Delete your own post: confirm, optimistically remove it, then republish your thread without it.
+  void _deletePost(Post p) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kCard,
+        title: const Text('Delete post?', style: TextStyle(color: kText, fontWeight: FontWeight.w700)),
+        content: const Text('Your thread is republished without it, so it drops from the relays. '
+            'This can’t be undone.', style: TextStyle(color: kDim)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel', style: TextStyle(color: kDim))),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              setState(() => _posts = _posts.where((x) => x.id != p.id).toList());   // optimistic
+              final ok = await Api.deletePost(p.id, p.handle);
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  backgroundColor: kCard,
+                  content: Text(ok ? 'deleted — your thread was republished without it'
+                                   : 'delete failed — restoring')));
+              Future.delayed(Duration(seconds: ok ? 3 : 0), () { if (mounted) _load(); });  // reconcile / restore
+            },
+            child: const Text('Delete', style: TextStyle(color: Color(0xFFEF6C9B), fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _refreshLabels() async {                  // pull the updated community-report labels
@@ -4952,7 +5016,7 @@ class PostCard extends StatefulWidget {
   final bool liked, reposted;
   final int commentCount;
   final VoidCallback onTip, onLike, onRepost, onReport, onComment;
-  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin;
+  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete;
   final bool muted, blocked, bookmarked;
   final Post? quoted; // resolved quoted post (for a quote-post), rendered inline
   final bool inThread; // part of an author thread → show a thread affordance
@@ -4978,6 +5042,7 @@ class PostCard extends StatefulWidget {
       this.onBlock,
       this.onBookmark,
       this.onPin,
+      this.onDelete,
       this.muted = false,
       this.blocked = false,
       this.bookmarked = false,
@@ -5172,16 +5237,25 @@ class _PostCardState extends State<PostCard> {
                   style: TextStyle(color: kDim, fontSize: 11)),
               onTap: () { Navigator.pop(context); widget.onPin!(); },
             ),
-          ListTile(
-            leading: const Icon(Icons.flag_outlined, color: Color(0xFFEF6C9B)),
-            title: const Text('Report', style: TextStyle(color: kText, fontWeight: FontWeight.w600)),
-            subtitle: const Text('a trust-scoped flag for moderation — not a downvote, and reversible',
-                style: TextStyle(color: kDim, fontSize: 11)),
-            onTap: () {
-              Navigator.pop(context);
-              widget.onReport();
-            },
-          ),
+          if (widget.onDelete != null)
+            ListTile(
+              leading: const Icon(Icons.delete_outline, color: Color(0xFFEF6C9B)),
+              title: const Text('Delete post', style: TextStyle(color: kText, fontWeight: FontWeight.w600)),
+              subtitle: const Text('republish your thread without it — it drops from the relays',
+                  style: TextStyle(color: kDim, fontSize: 11)),
+              onTap: () { Navigator.pop(context); widget.onDelete!(); },
+            ),
+          if (widget.onDelete == null)                       // don't report your own post
+            ListTile(
+              leading: const Icon(Icons.flag_outlined, color: Color(0xFFEF6C9B)),
+              title: const Text('Report', style: TextStyle(color: kText, fontWeight: FontWeight.w600)),
+              subtitle: const Text('a trust-scoped flag for moderation — not a downvote, and reversible',
+                  style: TextStyle(color: kDim, fontSize: 11)),
+              onTap: () {
+                Navigator.pop(context);
+                widget.onReport();
+              },
+            ),
         ]),
       ),
     );

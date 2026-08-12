@@ -237,6 +237,9 @@ def route(path, query, body):
     if path.startswith('/api/post_prepare'):
         put('/tmp/xc_post_rec.json', json.dumps(body)); spawn('xc_post.py', 'prepare')   # app-signed post event
         return read('/tmp/xc_post_result.json', '{}')
+    if path.startswith('/api/post_delete'):
+        put('/tmp/xc_delete_rec.json', json.dumps(body)); spawn('xc_post.py', 'delete')  # app-signed delete event
+        return read('/tmp/xc_post_result.json', '{}')
     if path.startswith('/api/post_submit'):
         put('/tmp/xc_head_rec.json', json.dumps(body)); spawn('xc_post.py', 'submit')     # app-signed head
         return read('/tmp/xc_post_result.json', '{}')
