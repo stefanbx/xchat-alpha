@@ -2595,13 +2595,17 @@ class _FeedScreenState extends State<FeedScreen> {
     }
     final segs = (job['segments'] as List).cast<String>();
     final pollCsv = ((job['poll'] as List?)?.cast<String>() ?? const <String>[]).join('|');
+    final baseTs = job['ts'] as int?;
     String prev = '';
     for (int i = 0; i < segs.length; i++) {
+      // A post's id is 'u<ts>' (seconds), so every segment MUST get a distinct ts — else a queued thread
+      // (all segments share the job's single ts) collapses to one id and the reply chain breaks. +i keeps
+      // order and makes each unique. (Also fixes a fast online thread posting >1 segment in the same second.)
       final id = await Api.post(segs[i], handle: job['handle'] as String,
           media: i == 0 ? mediaCid : '', mediaKind: i == 0 ? (job['mediaKind'] as String? ?? '') : '',
           quote: i == 0 ? (job['quote'] as String? ?? '') : '', replyTo: i == 0 ? '' : prev,
           title: i == 0 ? (job['title'] as String? ?? '') : '', poll: i == 0 ? pollCsv : '',
-          ts: (job['ts'] as int?));                            // keep the original compose time + order
+          ts: baseTs == null ? null : baseTs + i);
       if (id.isEmpty) return false;
       prev = id;
     }
