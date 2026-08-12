@@ -910,12 +910,19 @@ class Api {
   }
 
   static Future<void> like(String pid, int delta) => _engagePost('like', pid, delta);
-  // repost carries the resharer's account so tips can reward whoever spread the post
+  // A reshare earns a slice of every tip to the post, so it is SIGNED on-device (canon
+  // reshare|account|post_id|ts). The relay verifies it before crediting the resharer — an unsigned
+  // reshare can no longer name someone else's/your own account to skim tips.
   static Future<void> repost(String pid, int delta, String account) async {
+    final w = gWallet;
+    if (w == null) return; // seedless: no signer, no reshare
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final s = w.signMsg(w.reshareMsg(pid, ts));
     try {
       await http.post(Uri.parse('$kBase/api/repost'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'post_id': pid, 'delta': '$delta', 'account': account}));
+          body: jsonEncode({'post_id': pid, 'delta': '$delta', 'account': w.account,
+                            'ts': ts, 'sig': s['sig'], 'pub': s['pub']}));
     } catch (_) {}
   }
   static Future<void> _engagePost(String kind, String pid, int delta) async {

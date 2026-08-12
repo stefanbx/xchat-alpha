@@ -71,6 +71,9 @@ class NanoWallet {
   String dmKeyMsg(int ts, String dmPub) => '$account|$ts|$dmPub';
   String reportMsg(String postId, int ts) => 'report|$account|$postId|$ts';
   String deleteMsg(String postId, int ts) => 'delete|$account|$postId|$ts';
+  // A reshare earns a slice of every tip to the post, so it is SIGNED like a report: the relay verifies
+  // it before crediting the resharer, blocking a forged "first resharer" from skimming others' tips.
+  String reshareMsg(String postId, int ts) => 'reshare|$account|$postId|$ts';
 
   // ---- encrypted DMs (on-device): a SEPARATE X25519 keypair derived from the seed, sealing with
   // NaCl crypto_box (pinenacl) — byte-compatible with the node's PyNaCl. The relays only ever see

@@ -34,13 +34,17 @@ elif mode == 'like':
     post('/like', {'post_id': sys.argv[2], 'delta': int(sys.argv[3])})
     json.dump({"ok": True}, open('/tmp/xc_engage_result.json', 'w'))
 elif mode == 'repost':
-    acct = ''
+    # Forward the full app-SIGNED reshare record {post_id, delta, account, ts, sig, pub}. A reshare
+    # earns a slice of every tip to the post, so the relay verifies the signature before crediting the
+    # resharer — the node just relays the signed record (it holds no key). canon: reshare|account|post_id|ts.
     try:
-        acct = open('/tmp/xc_reshare_acct.txt').read().strip()
+        rec = json.load(open('/tmp/xc_reshare_rec.json'))
     except Exception:
-        pass
-    post('/repost', {'post_id': sys.argv[2], 'delta': int(sys.argv[3]), 'account': acct})
-    json.dump({"ok": True}, open('/tmp/xc_engage_result.json', 'w'))
+        rec = {}
+    ok = bool(rec.get('sig') and rec.get('pub') and rec.get('account'))
+    if ok:
+        post('/repost', rec)
+    json.dump({"ok": ok}, open('/tmp/xc_engage_result.json', 'w'))
 elif mode == 'tip':
     post('/tipstat', {'post_id': sys.argv[2], 'raw': int(sys.argv[3])})
     json.dump({"ok": True}, open('/tmp/xc_engage_result.json', 'w'))

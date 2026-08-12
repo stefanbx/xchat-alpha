@@ -7,7 +7,7 @@
 # Wallet state is namespaced per instance (XC_NS = port): one node = one identity ("run your own node").
 #
 #   python3 kt_server.py 8790            # serve on :8790 (binds 0.0.0.0 so a phone/relay can reach it)
-import os, sys, json, subprocess, urllib.parse, urllib.request, time, threading
+import os, sys, json, subprocess, urllib.parse, urllib.request, time, threading, base64, hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -173,13 +173,32 @@ def api_receivables(acct):
         out.append({'hash': h, 'amount': amt})
     return json.dumps({'ok': True, 'receivables': out})
 
+def _blob_matches_cid(cid, b64):
+    # A relay earns the media split only if it actually SERVES the exact content — not just claims to.
+    # Media is content-addressed as 'sha256-<hex>', so verify the served bytes hash to the cid. A relay
+    # that lies about hosting (self-attested /haveblob) or serves garbage fails here and isn't paid.
+    # Non-sha256 cids (the IPFS demo) aren't cheaply verifiable, so the split is skipped (creator keeps
+    # 100%) rather than paid on an unverifiable claim — safe by default.
+    if not b64 or not cid.startswith('sha256-'):
+        return False
+    try:
+        return hashlib.sha256(base64.b64decode(b64)).hexdigest() == cid.split('sha256-', 1)[1]
+    except Exception:
+        return False
+
 def api_media_relay(cid):
-    # which relay serves this post's media (so a tip can reward it) — a public read across relays
+    # which relay serves this post's media (so a tip can reward it) — a public read across relays.
+    # The claim is VERIFIED (bytes must hash to the cid) so a lying relay can't skim the media split.
+    cq = urllib.parse.quote(cid, safe='')
     for r in xc.discover_relays():
         try:
-            if json.loads(urllib.request.urlopen(r + '/haveblob?cid=' + cid, timeout=3).read()).get('have'):
-                acct = json.loads(urllib.request.urlopen(r + '/relayacct', timeout=3).read()).get('account')
-                return json.dumps({'account': acct or ''})
+            if not json.loads(urllib.request.urlopen(r + '/haveblob?cid=' + cq, timeout=3).read()).get('have'):
+                continue
+            b64 = json.loads(urllib.request.urlopen(r + '/blob?cid=' + cq, timeout=6).read()).get('b64')
+            if not _blob_matches_cid(cid, b64):
+                continue
+            acct = json.loads(urllib.request.urlopen(r + '/relayacct', timeout=3).read()).get('account')
+            return json.dumps({'account': acct or ''})
         except Exception:
             pass
     return json.dumps({'account': ''})
@@ -253,7 +272,7 @@ def route(path, query, body):
     # /api/block_process). The node never receives, stores, or signs with a seed.
 
     if path.startswith('/api/like'):         spawn('xc_engage.py', 'like', b('post_id'), b('delta'));        return read('/tmp/xc_engage_result.json', '{}')
-    if path.startswith('/api/repost'):       put('/tmp/xc_reshare_acct.txt', b('account')); spawn('xc_engage.py','repost',b('post_id'),b('delta')); return read('/tmp/xc_engage_result.json','{}')
+    if path.startswith('/api/repost'):       put('/tmp/xc_reshare_rec.json', json.dumps(body)); spawn('xc_engage.py','repost'); return read('/tmp/xc_engage_result.json','{}')
     if path.startswith('/api/tipstat'):      spawn('xc_engage.py', 'tip', b('post_id'), b('raw'));           return read('/tmp/xc_engage_result.json', '{}')
     if path.startswith('/api/view'):         spawn('xc_engage.py', 'view', b('post_id'), b('delta'));        return read('/tmp/xc_engage_result.json', '{}')
     if path.startswith('/api/engagement'):   spawn('xc_engage.py', 'get');                                    return read('/tmp/xc_engage_result.json', '{}')
@@ -309,6 +328,10 @@ def route(path, query, body):
     return '{"error":"not found"}'
 
 
+MAX_JSON_BODY = int(os.environ.get('XC_MAX_JSON_BODY', str(512 * 1024)))        # non-blob request cap
+MAX_BLOB_BODY = int(os.environ.get('XC_MAX_BLOB_BODY', str(32 * 1024 * 1024)))  # blob/APK-sized cap
+
+
 class H(BaseHTTPRequestHandler):
     def _send(self, body):
         data = body.encode() if isinstance(body, str) else body
@@ -321,9 +344,16 @@ class H(BaseHTTPRequestHandler):
 
     def _proxy_relay(self, raw):
         # Forward a relay-owned request to the loopback relay, verbatim (method + path + query + body).
+        # Pass the REAL client IP so the relay throttles per-attacker: without this every proxied write
+        # arrives from 127.0.0.1 and all users share one bucket (one abuser 429s everyone). The relay
+        # trusts X-Forwarded-For only from a loopback peer (us), so this can't be spoofed end-to-end.
+        client_ip = (self.headers.get('Fly-Client-IP')
+                     or self.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+                     or self.client_address[0])
         req = urllib.request.Request(RELAY_ORIGIN + self.path,
                                      data=(raw if self.command == 'POST' else None),
-                                     headers={'Content-Type': 'application/json'}, method=self.command)
+                                     headers={'Content-Type': 'application/json',
+                                              'X-Forwarded-For': client_ip}, method=self.command)
         try:
             self._send(urllib.request.urlopen(req, timeout=10).read())
         except Exception as e:
@@ -343,7 +373,16 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            n = int(self.headers.get('Content-Length', 0) or 0)
+            # Bound the request body: records are tiny; only blob uploads are large. Without a cap a
+            # single multi-GB body is read whole into RAM (one thread per connection) → OOM.
+            p = urllib.parse.urlparse(self.path).path
+            limit = MAX_BLOB_BODY if 'blob' in p else MAX_JSON_BODY
+            try:
+                n = int(self.headers.get('Content-Length', 0) or 0)
+            except ValueError:
+                self._send(json.dumps({'error': 'bad content-length'})); return
+            if n < 0 or n > limit:
+                self._send(json.dumps({'error': 'body too large'})); return
             raw = self.rfile.read(n) if n else b''
             try:
                 body = json.loads(raw or b'{}')

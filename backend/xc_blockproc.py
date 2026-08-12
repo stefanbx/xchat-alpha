@@ -22,6 +22,8 @@ res = {'ok': False, 'error': 'invalid'}
 try:
     inp = json.load(open('/tmp/xc_block_in.json'))
     block = inp['block']; subtype = inp.get('subtype', 'send')
+    if not xc.verify_block(block):        # reject a forged/malformed block BEFORE spending PoW on it
+        raise ValueError('block signature invalid')
     prev = block.get('previous', '0' * 64)
     # work is over the previous hash, or (for an OPEN block, previous == 0) the account's public key
     root = prev if set(prev) != {'0'} else xc.nano_to_pub(block['account'])

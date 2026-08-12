@@ -34,10 +34,12 @@ is the real identity, and nobody can rename, suspend, or de-federate a keypair.
 
 ## 3. Content — signed off-chain events on plural relays
 
-Posts, likes, reposts, comments, follows, profiles, and polls are **signed events**, not ledger
-transactions. Each author publishes a signed, sequence-numbered **head** (`{author, seq, cid,
-ts, sig}`) that points to their current content, addressed by hash (CID). Heads are gossiped to
-**several independent relays**.
+Posts, reposts, comments, follows, profiles, and polls are **signed events**, not ledger
+transactions (a repost is signed because it earns a share of the post's tips, so its attribution must
+be unforgeable). Likes and view counts are **unsigned, best-effort tallies** — they only ratchet a
+public counter and never move money, so they aren't individually signed. Each author publishes a
+signed, sequence-numbered **head** (`{author, seq, cid, ts, sig}`) that points to their current
+content, addressed by hash (CID). Heads are gossiped to **several independent relays**.
 
 - A relay **verifies nothing and stores signed bytes + ciphertext.** Clients verify every
   signature and bind each head's key to its author (`pub_to_addr(pub) == author`). A malicious
@@ -46,8 +48,9 @@ ts, sig}`) that points to their current content, addressed by hash (CID). Heads 
 - Clients read from **all** relays in parallel and keep the highest valid sequence per author,
   so one relay being slow, censoring, or offline changes nothing. (Kill a relay mid-session and
   the feed is intact.)
-- Encrypted 1:1 DMs use a separate X25519 keypair derived from the same seed; relays hold only
-  ciphertext.
+- Encrypted 1:1 DMs use a separate X25519 keypair derived from the same seed; relays hold only the
+  **ciphertext of each message body** — never the plaintext. (They do see the *metadata*: which
+  accounts are messaging and when. Hiding that is a roadmap item; see §9.)
 
 **Retention — a relay is a cache, not an archive, and MEMORY is the limit, not a clock.** Both the
 post pointers (heads) and the media (blobs) are kept until the relay is *full*, then evicted by one
@@ -283,7 +286,10 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   bound to its account (`pub_to_addr(pub) == author`). Forgeries fail. ✅
 - **A relay tampers with content.** → Content is **hash-addressed** (CID); any change breaks the
   hash. ✅
-- **A relay reads your DMs.** → Relays hold only **X25519 ciphertext**. ✅
+- **A relay reads your DM contents.** → Relays hold only the **X25519 ciphertext of the message
+  body**; the plaintext never leaves the endpoints. ✅ The **metadata** (which accounts DM each other,
+  and when) *is* visible to a relay and persisted in its state — content is protected, the social
+  graph is not. 🔨 (metadata privacy — sealed sender / onion routing — is roadmap.)
 - **A relay censors/withholds content.** → **Plural relays**; clients read from all and keep the
   highest signed sequence. Killing a relay leaves the feed intact. ✅
 - **Replay/rollback of old signed content.** → **Monotonic sequence numbers** + head TTL; a lower-seq
@@ -293,6 +299,10 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
 - **Eclipse (surround a client with only malicious relays).** → Honest relays are announced
   **on-chain and immutably**; an attacker can add fakes but cannot remove or hide honest
   announcements, so a scanning client still finds real relays. ✅
+- **SSRF via discovery** (announce/gossip a relay URL pointing at an internal address — cloud metadata,
+  loopback, LAN — to make a node probe it). → Discovered URLs (on-chain and peer-gossiped) are filtered
+  to **public http(s) hosts only**; loopback/private/link-local/reserved IP literals and internal names
+  are rejected before the node ever fetches them. ✅
 
 ### App updates — the "push malware to steal Nano" vector
 - **A relay serves a malicious APK / a forged release.** → The bytes are **content-addressed** and
@@ -333,8 +343,18 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   a pay-to-pin or a wallet send — no path can spend XNO another has already claimed. An over-commit is
   refused up front with the reason, not discovered at settle time. ✅ (verified live: with 0.48 XNO
   and 0.01 tallied, a 0.475 send is refused — "0.01 reserved for pending tips")
-- **Reshare-payment gaming** (reshare after a tip to claim the split). → Attribution is **locked at
-  tip time**. ✅
+- **Reshare-payment gaming.** A reshare earns a slice of every tip to a post, so it's an attack target.
+  → Two defenses: a reshare is a **signed event** (`reshare|account|post_id|ts`) the relay verifies
+  before crediting a resharer, so nobody can forge a "first resharer" claim under someone else's or an
+  attacker's account; and among genuine resharers, attribution is **locked at tip time** (a reshare
+  registered after a given tip can't retroactively claim it). ✅
+- **Media-host split theft.** The media-hosting slice of a tip pays whoever serves the post's media.
+  → The claim is **verified**: the relay must actually serve bytes that hash to the content-addressed
+  CID, so a relay can't self-attest hosting to skim the split (unverifiable non-hash CIDs simply forgo
+  the split — the creator keeps 100%). ✅
+- **PoW amplification via block broadcast.** → The node **verifies a block's signature locally before
+  spending any delegated PoW** on it, so an unauthenticated flood of forged blocks can't burn its work
+  budget. ✅
 - **Double-spend / balance forgery.** → Handled by Nano mainnet consensus, outside our trust surface. ✅
 
 ### Moderation
@@ -362,11 +382,15 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   pay-to-pinned last), so no volume of unpaid media grows a relay without bound, and keeping content
   alive costs XNO (§6), which prices the attack. ✅
 - **Metadata / Sybil flood — mint unlimited keypairs and push a head (or a mention, or a DM) each.**
-  → **Bounded.** Every mutable table now has a hard ceiling: head **expiries are clamped** (no eternal
-  head) and expired heads are **actively pruned** each tick with a hard author cap as a backstop;
-  notifications are capped **per-recipient and per distinct-account**; the DM mailbox is a **bounded
-  ring** with O(1) dedup; releases stay capped at 24/author; and media blobs are byte-capped on disk.
-  So no volume of writes grows a relay's memory without bound — and because clients **verify every
+  → **Bounded.** Every mutable table has a hard distinct-key ceiling and every record a size limit:
+  head **expiries are clamped** (no eternal head) and expired heads are **actively pruned** each tick
+  with a hard author cap; notifications are capped **per-recipient and per distinct-account**; the DM
+  mailbox is a **bounded ring** with O(1) dedup; **follows, profiles, DM-keys, poll votes, comments,
+  engagement, supporters, and the gossiped relay set are each key-capped** (with per-record limits on
+  follow-list length, profile fields, comment text, etc.); releases are **signature-verified at ingest**
+  and capped; and media blobs are **per-blob size-capped and byte-capped** on disk. The **request body
+  itself is bounded** (records are tiny; only blob uploads are large), so a single huge POST can't be
+  read into RAM. So no volume of writes grows a relay's memory or disk without bound — and because clients **verify every
   signature on read**, forged spam is inert junk that can never reach a feed regardless. A per-IP
   write rate-limit adds a coarse CPU throttle, and the redundant per-write state flush was dropped for
   a dirty-flagged 5 s autosave. ✅ (verified: clamp, author cap→429, prune frees slots, notif+DM caps,
@@ -477,11 +501,15 @@ that can get busy, so an in-app update can need a retry or two. Moderation label
 onion routing yet — treat your IP as visible). The node is single-identity-per-instance for the
 state it caches, though it no longer holds an identity that can sign. A relay's one-time on-chain
 *announcement* is a real (tiny) mainnet transaction the operator makes with a funded wallet. **Relay
-anti-spam is now bounded but not maximal**: every table has a hard ceiling (clamped + pruned heads,
-capped notifs/DMs, byte-capped blobs) and a per-IP write throttle, so a Sybil flood can no longer grow
-a relay's memory without limit (§9) — but there's no write-time proof-of-work yet, reads aren't
-throttled, and a shared node counts as one IP for the write limit. See the README for how to run a
-node, run a relay, announce it on-chain, and verify discovery yourself.
+anti-spam is now bounded but not maximal**: every table has a hard distinct-key ceiling with per-record
+size limits, the request body is capped, media blobs are per-blob size-capped, and release records are
+signature-verified at ingest (so a forged flood can't evict the real update), so a Sybil flood can no
+longer grow a relay's memory or disk without limit (§9). The per-IP write throttle now sees the **real
+client IP** even behind a shared node (the node forwards it; the relay trusts a forwarded IP only from
+its own loopback proxy or the edge), so one abuser no longer throttles everyone. Honest residuals:
+there's no write-time proof-of-work yet (money blocks are the exception — the node verifies a block's
+signature locally before spending any PoW on it), and reads aren't throttled. See the README for how to
+run a node, run a relay, announce it on-chain, and verify discovery yourself.
 
 ---
 

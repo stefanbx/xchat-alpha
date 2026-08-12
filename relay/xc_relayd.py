@@ -76,6 +76,39 @@ DM_MAX      = int(os.environ.get('XC_DM_MAX', '20000'))       # global ciphertex
 # flood, NOT the memory guarantee. Memory is bounded regardless of rate by the caps + prune above.
 RATE_MAX    = int(os.environ.get('XC_RATE_MAX', '600'))       # writes per window per client IP (~60/s)
 RATE_WINDOW = int(os.environ.get('XC_RATE_WINDOW', '10'))     # rate-limit window (s)
+RATE_ACCTS  = int(os.environ.get('XC_RATE_ACCTS', '100000'))  # cap on tracked IP buckets (backstop)
+# Body + per-record ceilings. Records are tiny (a signed pointer/JSON); only content blobs are large,
+# so the POST body is capped small for everything EXCEPT /blob. Without this a single multi-GB body is
+# read whole into RAM (one thread per connection) → OOM. Every keyed table also gets a distinct-key cap
+# so an unauthenticated flood of random keys can't grow RAM/disk without bound (the value-eviction on
+# heads/blobs already did this; these extend it to the rest of the state).
+MAX_BODY    = int(os.environ.get('XC_MAX_BODY', str(512 * 1024)))          # non-blob POST body cap
+MAX_BLOB    = int(os.environ.get('XC_MAX_BLOB', str(32 * 1024 * 1024)))    # per-blob b64 cap (APK-sized)
+FOLLOWS_MAX     = int(os.environ.get('XC_FOLLOWS_MAX', '50000'))     # distinct accounts with a follow record
+FOLLOW_LIST_MAX = int(os.environ.get('XC_FOLLOW_LIST_MAX', '5000'))  # follows inside one record
+PROFILES_MAX    = int(os.environ.get('XC_PROFILES_MAX', '50000'))
+DMKEYS_MAX      = int(os.environ.get('XC_DMKEYS_MAX', '50000'))
+SUPPORTERS_MAX  = int(os.environ.get('XC_SUPPORTERS_MAX', '50000'))
+POLLS_MAX       = int(os.environ.get('XC_POLLS_MAX', '50000'))       # distinct polls with votes
+POLL_VOTERS_MAX = int(os.environ.get('XC_POLL_VOTERS_MAX', '50000')) # voters stored per poll
+COMMENT_POSTS_MAX = int(os.environ.get('XC_COMMENT_POSTS_MAX', '50000'))  # distinct posts with comments
+COMMENTS_PER_POST = int(os.environ.get('XC_COMMENTS_PER_POST', '1000'))
+ENGAGE_MAX      = int(os.environ.get('XC_ENGAGE_MAX', '200000'))     # distinct post_ids with engagement
+RESHARERS_MAX   = int(os.environ.get('XC_RESHARERS_MAX', '1000'))    # resharers stored per post
+KNOWN_MAX       = int(os.environ.get('XC_KNOWN_MAX', '10000'))       # distinct relay URLs gossiped
+FIELD_MAX       = int(os.environ.get('XC_FIELD_MAX', '8192'))        # bytes per free-text record field
+RELEASE_PUBS_MAX = int(os.environ.get('XC_RELEASE_PUBS_MAX', '8'))   # distinct release publishers stored
+
+def _cap_dict(d, maxn):
+    # Distinct-key backstop: evict oldest-inserted keys until within maxn. Python dicts are
+    # insertion-ordered, so next(iter(d)) is the oldest key; updating an existing key keeps its slot.
+    while len(d) > maxn:
+        d.pop(next(iter(d)), None)
+
+def engage_for(pid):
+    e = engage.setdefault(pid, {'likes': 0, 'tips_raw': 0, 'reposts': 0})
+    _cap_dict(engage, ENGAGE_MAX)                # bound distinct post_ids (was unbounded → OOM)
+    return e
 
 _heads_lock = threading.Lock()                                # guards heads across prune + /push
 _dm_seen = set()                                              # (from, ts) O(1) dedup for the mailbox
@@ -92,6 +125,8 @@ def rate_ok(ip):                                              # fixed-window per
     with _rate_lock:
         w = _rate.get(ip)
         if not w or now - w[0] >= RATE_WINDOW:
+            if ip not in _rate and len(_rate) >= RATE_ACCTS:
+                _rate.pop(next(iter(_rate)), None)   # backstop: bound the number of tracked buckets
             _rate[ip] = [now, 1]; return True
         if w[1] >= RATE_MAX:
             return False
@@ -143,6 +178,12 @@ def blob_has(cid):
     return cid in blob_meta
 
 def blob_put(cid, b64, tips=0.0):
+    # Reject an oversized blob BEFORE it is written. Two bugs this closes: (1) no per-blob ceiling let a
+    # single huge upload fill the disk; (2) a blob larger than BLOB_CAP, stored first and evicted after,
+    # sorted itself last (fresh + untipped) and so evicted EVERY other blob to get under cap while
+    # surviving — one POST wiped the whole cache. With a per-blob cap << BLOB_CAP that can't happen.
+    if not cid or not b64 or len(b64) > MAX_BLOB:
+        return False
     with _blob_lock:
         now = time.time()
         t = max(float(tips or 0), float((blob_meta.get(cid) or {}).get('tips', 0)))   # value ratchets up
@@ -152,6 +193,7 @@ def blob_put(cid, b64, tips=0.0):
                           'reports': sum(_blob_reporters.get(cid, {}).values())}   # carry existing report weight
         _evict_locked()
         _db.commit()
+        return True
 
 def blob_report(cid, account, rep):
     # a signed, reputation-WEIGHTED community report referencing this media: a NEGATIVE term in
@@ -223,6 +265,40 @@ def sync_release_blobs():
         for rec in recs:
             ensure_release_blob(rec.get('cid'))
 
+def _release_canon(m):
+    return '%s|%s|%s|%s|%s|%s' % (m.get('publisher', ''), m.get('version', ''), m.get('cid', ''),
+                                  m.get('sha256', ''), m.get('size', ''), m.get('changelog', ''))
+
+def accept_release(m):
+    # Ingest a signed release record — VERIFYING it, unlike other relay writes. Releases are app
+    # updates, so a forged flood here isn't inert junk: the old code stored any record and capped the
+    # list at 24, which let an attacker push ≥24 forged records under the pinned publisher's key and
+    # EVICT the genuine one, freezing updates network-wide (a suppression attack). Now the relay checks
+    # the publisher-pinned signature at the door and drops anything that doesn't validate, so forged
+    # records never enter, the list stays genuine, and the per-cid pin + background pull can't be
+    # amplified by junk. Returns True if newly stored.
+    if xc is None:
+        return False
+    pub_acc = m.get('publisher', '')
+    pub, sig = m.get('pub', ''), m.get('sig', '')
+    if pub_acc != PUBLISHER_ACCT:                      # only the pinned publisher's channel is stored
+        return False
+    try:
+        if xc.pub_to_addr(pub) != PUBLISHER_ACCT or not xc.verify_msg(pub, _release_canon(m), sig):
+            return False
+    except Exception:
+        return False
+    lst = releases.setdefault(pub_acc, [])
+    if any(x.get('sig') == sig for x in lst):
+        return False
+    lst.append(m)
+    releases[pub_acc] = lst[-24:]
+    _cap_dict(releases, RELEASE_PUBS_MAX)
+    if m.get('cid'):
+        threading.Thread(target=ensure_release_blob, args=(m['cid'],), daemon=True).start()
+    mark_dirty()
+    return True
+
 def backfill():
     # SYNC ON JOIN. bootstrap() learns the peer list but pulls no content, so a freshly launched
     # relay used to come up blank and only accumulate what was pushed to it AFTER joining — it never
@@ -258,15 +334,7 @@ def backfill():
         except Exception:
             continue
         for m in d.get('records', []):
-            pub = m.get('publisher')
-            if not pub:
-                continue
-            lst = releases.setdefault(pub, [])
-            if not any(x.get('sig') == m.get('sig') for x in lst):
-                lst.append(m)
-            releases[pub] = lst[-24:]
-            if m.get('cid'):
-                threading.Thread(target=ensure_release_blob, args=(m['cid'],), daemon=True).start()
+            accept_release(m)                         # verify (publisher-pinned sig) + store + pull bytes
     mark_dirty()                                      # persist the caught-up state
 
 def grant_pin(cid, payhash):
@@ -475,13 +543,29 @@ class H(BaseHTTPRequestHandler):
         else:
             self._send(404, '{"error":"not found"}')
     def do_POST(self):
-        # Fly/CDN put the real client IP in a header; fall back to the socket peer for local runs.
-        ip = (self.headers.get('Fly-Client-IP')
-              or self.headers.get('X-Forwarded-For', '').split(',')[0].strip()
-              or self.client_address[0])
+        # Real client IP for the throttle. A forwarded IP is trustworthy ONLY from Fly's edge or our own
+        # loopback node proxy (kt_server on the same host); otherwise a remote client spoofs
+        # X-Forwarded-For to dodge the throttle AND to bloat the _rate table with fake IPs. So trust the
+        # header only in those cases; else fall back to the socket peer.
+        peer = self.client_address[0]
+        fly = self.headers.get('Fly-Client-IP')
+        xff = self.headers.get('X-Forwarded-For', '').split(',')[0].strip()
+        if fly:
+            ip = fly
+        elif xff and peer in ('127.0.0.1', '::1'):   # forwarded by our own loopback node proxy
+            ip = xff
+        else:
+            ip = peer
         if not rate_ok(ip):                          # per-IP write throttle — first line against a flood
             self._send(429, '{"ok":false,"error":"rate limited"}'); return
-        n = int(self.headers.get('Content-Length', 0))
+        # Bound the request body. Records are tiny; only /blob carries large (content-addressed) bytes.
+        limit = MAX_BLOB if self.path.startswith('/blob') else MAX_BODY
+        try:
+            n = int(self.headers.get('Content-Length', 0) or 0)
+        except ValueError:
+            self._send(400, '{"ok":false,"error":"bad content-length"}'); return
+        if n < 0 or n > limit:
+            self._send(413, '{"ok":false,"error":"body too large"}'); return
         raw = self.rfile.read(n) if n else b'{}'
         mark_dirty()                                 # any accepted write flushes within ≤5s (see _autosave)
         if self.path.startswith('/push'):
@@ -515,7 +599,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/relay_announce'):
             try:
                 u = json.loads(raw).get('url', '')
-                if u and u != SELF:
+                if u and u != SELF and len(u) <= FIELD_MAX and len(known) < KNOWN_MAX:
                     known.add(u)
                 self._send(200, json.dumps({'ok': True, 'relays': sorted(known)}))
             except Exception as e:
@@ -536,6 +620,7 @@ class H(BaseHTTPRequestHandler):
                 m = json.loads(raw); acc = m['account']
                 if m.get('on'):
                     supporters[acc] = m.get('ts', 0)
+                    _cap_dict(supporters, SUPPORTERS_MAX)
                 else:
                     supporters.pop(acc, None)
                 self._send(200, json.dumps({'ok': True, 'count': len(supporters)}))
@@ -545,7 +630,8 @@ class H(BaseHTTPRequestHandler):
             # a supporter caches content here (content-addressed — cid names the bytes); byte-capped + LRU
             try:
                 m = json.loads(raw); cid = m['cid']; new = not blob_has(cid)
-                blob_put(cid, m['b64'], tips=m.get('tips', 0))   # tips = the post's value, ranks eviction
+                if not blob_put(cid, m['b64'], tips=m.get('tips', 0)):   # oversized/empty rejected pre-store
+                    self._send(413, json.dumps({'ok': False, 'error': 'blob too large', 'max': MAX_BLOB})); return
                 self._send(200, json.dumps({'ok': True, 'stored': new, 'cache_bytes': _blob_total()}))
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
@@ -569,8 +655,11 @@ class H(BaseHTTPRequestHandler):
             # signed follow-list record, keyed by account, highest ts wins
             try:
                 m = json.loads(raw); acc = m['account']; cur = follows.get(acc)
+                if isinstance(m.get('follows'), list) and len(m['follows']) > FOLLOW_LIST_MAX:
+                    self._send(413, '{"ok":false,"error":"follow list too large"}'); return
                 if cur is None or m.get('ts', 0) > cur.get('ts', 0):
                     follows[acc] = m
+                    _cap_dict(follows, FOLLOWS_MAX)
                 self._send(200, '{"ok":true}')
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
@@ -578,8 +667,11 @@ class H(BaseHTTPRequestHandler):
             # signed profile record (display name, bio, avatar/banner CIDs), keyed by account, highest ts wins
             try:
                 m = json.loads(raw); acc = m['account']; cur = profiles.get(acc)
+                if any(len(str(m.get(k, ''))) > FIELD_MAX for k in ('display', 'bio', 'avatar', 'banner')):
+                    self._send(413, '{"ok":false,"error":"profile field too large"}'); return
                 if cur is None or m.get('ts', 0) > cur.get('ts', 0):
                     profiles[acc] = m
+                    _cap_dict(profiles, PROFILES_MAX)
                 self._send(200, '{"ok":true}')
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
@@ -589,6 +681,7 @@ class H(BaseHTTPRequestHandler):
                 m = json.loads(raw); acc = m['account']; cur = dmkeys.get(acc)
                 if cur is None or m.get('ts', 0) > cur.get('ts', 0):
                     dmkeys[acc] = m
+                    _cap_dict(dmkeys, DMKEYS_MAX)
                 self._send(200, '{"ok":true}')
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
@@ -597,8 +690,10 @@ class H(BaseHTTPRequestHandler):
             try:
                 m = json.loads(raw); pid = m['poll_id']; acc = m['account']
                 votes = pollvotes.setdefault(pid, {})
-                if acc not in votes or m.get('ts', 0) >= votes[acc].get('ts', 0):
-                    votes[acc] = m
+                _cap_dict(pollvotes, POLLS_MAX)
+                if acc in votes or len(votes) < POLL_VOTERS_MAX:
+                    if acc not in votes or m.get('ts', 0) >= votes[acc].get('ts', 0):
+                        votes[acc] = m
                 self._send(200, json.dumps({'ok': True, 'total': len(votes)}))
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
@@ -617,19 +712,16 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/release'):
-            # append-only list of signed release records per publisher. The relay does NOT verify
-            # (clients do) — so a FORGED record can be stored, but keeping a LIST means it can't
-            # EVICT the real one: on check the client keeps the highest VALID (signed) version.
+            # Signed release records (app updates). Unlike other writes, the relay VERIFIES here: the
+            # record must carry the PINNED publisher's signature (see accept_release). This drops forged
+            # records at the door, so an attacker can no longer flood ≥24 fakes to evict the genuine
+            # update (a network-wide freeze) or amplify the background blob-pull with junk.
             try:
-                m = json.loads(raw); pub = m['publisher']
-                lst = releases.setdefault(pub, [])
-                fresh = not any(x.get('sig') == m.get('sig') for x in lst)
-                if fresh:
-                    lst.append(m)
-                releases[pub] = lst[-24:]                 # cap; real record survives forged noise
-                if fresh and m.get('cid'):               # a NEW release → pull + pin its bytes so we can serve updates
-                    threading.Thread(target=ensure_release_blob, args=(m['cid'],), daemon=True).start()
-                self._send(200, json.dumps({'ok': True, 'stored': len(releases[pub])}))
+                m = json.loads(raw)
+                stored = accept_release(m)
+                pub = m.get('publisher', '')
+                self._send(200, json.dumps({'ok': True, 'accepted': stored,
+                                            'stored': len(releases.get(pub, []))}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         elif self.path.startswith('/report'):
@@ -658,38 +750,47 @@ class H(BaseHTTPRequestHandler):
             # Verification (sig + pub↔account) happens client-side on fetch, like /follows.
             try:
                 m = json.loads(raw); pid = m['post_id']
+                if len(str(m.get('text', ''))) > FIELD_MAX:
+                    self._send(413, '{"ok":false,"error":"comment too large"}'); return
                 lst = comments.setdefault(pid, [])
+                _cap_dict(comments, COMMENT_POSTS_MAX)
                 key = (m.get('account'), m.get('ts'))
-                if not any((c.get('account'), c.get('ts')) == key for c in lst):
+                if len(lst) < COMMENTS_PER_POST and not any((c.get('account'), c.get('ts')) == key for c in lst):
                     lst.append(m)
                 self._send(200, json.dumps({'ok': True, 'count': len(lst)}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         elif self.path.startswith('/like'):
             try:
-                m = json.loads(raw); e = engage.setdefault(m['post_id'], {'likes': 0, 'tips_raw': 0, 'reposts': 0})
+                m = json.loads(raw); e = engage_for(m['post_id'])
                 e['likes'] = max(0, e.get('likes', 0) + int(m.get('delta', 1)))
                 self._send(200, json.dumps({'ok': True, 'likes': e['likes']}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         elif self.path.startswith('/repost'):
+            # A reshare is MONEY-BEARING: the earliest resharer of a post earns a slice (the reposter
+            # split) of every tip to it. So the relay VERIFIES a SIGNED reshare event here — otherwise an
+            # attacker POSTs an unsigned reshare naming their own account, pre-registers as "first
+            # resharer" of a popular post, and skims real XNO from every tipper. canon: reshare|account|post_id|ts.
             try:
-                m = json.loads(raw); e = engage.setdefault(m['post_id'], {'likes': 0, 'tips_raw': 0, 'reposts': 0})
-                delta = int(m.get('delta', 1)); acc = m.get('account')
+                m = json.loads(raw); pid = m['post_id']; acc = m.get('account')
+                ts, pub, sig = m.get('ts', 0), m.get('pub', ''), m.get('sig', '')
+                if not (acc and xc is not None and xc.pub_to_addr(pub) == acc
+                        and xc.verify_msg(pub, 'reshare|%s|%s|%s' % (acc, pid, ts), sig)):
+                    self._send(400, json.dumps({'ok': False, 'error': 'bad reshare signature'})); return
+                e = engage_for(pid); delta = int(m.get('delta', 1))
                 e['reposts'] = max(0, e.get('reposts', 0) + delta)
-                # record WHO reshared, earliest-first (so tips can reward the spreader). Dedup.
-                rs = e.setdefault('resharers', [])
-                if acc:
-                    if delta > 0 and acc not in rs:
-                        rs.append(acc)
-                    elif delta < 0 and acc in rs:
-                        rs.remove(acc)
+                rs = e.setdefault('resharers', [])            # earliest-first, so tips can reward the spreader
+                if delta > 0 and acc not in rs and len(rs) < RESHARERS_MAX:
+                    rs.append(acc)
+                elif delta < 0 and acc in rs:
+                    rs.remove(acc)
                 self._send(200, json.dumps({'ok': True, 'reposts': e['reposts'], 'resharers': rs}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         elif self.path.startswith('/tipstat'):
             try:
-                m = json.loads(raw); e = engage.setdefault(m['post_id'], {'likes': 0, 'tips_raw': 0, 'reposts': 0})
+                m = json.loads(raw); e = engage_for(m['post_id'])
                 e['tips_raw'] += int(m.get('raw', 0))
                 self._send(200, json.dumps({'ok': True, 'tips_raw': e['tips_raw']}))
             except Exception as ex:
@@ -697,7 +798,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/view'):
             # impression counter for a post or comment cid (client dedups one view per session)
             try:
-                m = json.loads(raw); e = engage.setdefault(m['post_id'], {'likes': 0, 'tips_raw': 0, 'reposts': 0})
+                m = json.loads(raw); e = engage_for(m['post_id'])
                 e['views'] = e.get('views', 0) + int(m.get('delta', 1))
                 self._send(200, json.dumps({'ok': True, 'views': e['views']}))
             except Exception as ex:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Shared helpers for the ӾChat per-user-thread backend (dev Nano network + IPFS).
-import json, subprocess, urllib.request, base64, hashlib, os, time
+import json, subprocess, urllib.request, urllib.parse, base64, hashlib, os, time, ipaddress
 # Nano RPC endpoint(s). XC_NANO_RPC may be ONE url or a comma-separated list; defaults to the local
 # dev node. When a PUBLIC mainnet RPC is configured, known-good public fallbacks are appended —
 # because any single datacenter-hosted RPC (rpc.nano.to did, from Fly) can throttle or block a
@@ -144,6 +144,19 @@ def pub_to_addr(pubhex):  # 32-byte pubkey hex -> nano_ address (binds a head's 
     cs = hashlib.blake2b(pub, digest_size=5).digest()[::-1]              # 5-byte checksum, reversed
     csbits = ''.join(bin(b)[2:].zfill(8) for b in cs)
     return 'nano_' + _b32enc(pkbits) + _b32enc(csbits)
+
+def verify_block(block):
+    # Verify an app-signed Nano STATE block's signature LOCALLY, so the node can reject a forged block
+    # BEFORE spending delegated PoW on it. Without this, an unauthenticated flood of shape-valid blocks
+    # makes the node burn work_generate cycles on each before the ledger drops them (PoW amplification).
+    # The account's own pubkey signs the block hash; a forger has no key, so this can't be faked.
+    try:
+        acc_pub = nano_to_pub(block['account'])
+        rep_pub = nano_to_pub(block['representative'])
+        bh = _block_hash(acc_pub, block['previous'], rep_pub, str(block['balance']), block['link'])
+        return _ext.verify_signature(bytes.fromhex(block['signature']), bytes.fromhex(acc_pub), bh) == 1
+    except Exception:
+        return False
 
 # --- Sybil-resistant moderation weight -----------------------------------------------------------
 # A community report counts for its author's ON-CHAIN reputation, not one-account-one-vote, so a
@@ -329,12 +342,35 @@ def url_to_link(url):  # a relay URL packed into a 32-byte block link as ASCII (
         raise ValueError(f'relay URL is {len(b)} bytes; the on-chain link holds at most 32 (use a short host)')
     return (b + bytes(32 - len(b))).hex()
 
+def is_safe_relay_url(u):
+    # SSRF guard for relay URLs learned from UNTRUSTED sources (on-chain announcements + peer gossip).
+    # Those become GET/POST targets for the node's helpers, so a hostile announcer could point discovery
+    # at an internal address (cloud metadata 169.254.169.254, 127.0.0.1:<admin>, a LAN box). Require
+    # http(s) and reject loopback/private/link-local/reserved IP literals and obvious internal names.
+    # (The node's OWN co-located relay is loopback, but it enters via the explicit bootstrap, not here.)
+    try:
+        p = urllib.parse.urlparse(u)
+        host = p.hostname or ''
+        if p.scheme not in ('http', 'https') or not host:
+            return False
+        if host == 'localhost' or host.endswith('.local') or host.endswith('.internal'):
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+            return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                        or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+        except ValueError:
+            return True                      # a DNS name (not an IP literal) — allowed
+    except Exception:
+        return False
+
 def link_to_url(link_hex):  # inverse: a link that is printable ASCII + looks like a host -> https URL, else None
     try:
         b = bytes.fromhex(link_hex).rstrip(b'\x00')
         s = b.decode('ascii')
         if s and '.' in s and all(32 < c < 127 for c in b):
-            return 'https://' + s
+            url = 'https://' + s
+            return url if is_safe_relay_url(url) else None   # reject on-chain-announced internal targets
     except Exception:
         pass
     return None
@@ -515,7 +551,7 @@ def discover_relays(bootstrap=None):     # gossip BFS: follow /relays from a boo
             d = json.loads(urllib.request.urlopen(u + '/relays', timeout=3).read())
             found.add(u)
             for r in d.get('relays', []):
-                if r not in seen:
+                if r not in seen and is_safe_relay_url(r):   # SSRF: don't chase gossiped internal targets
                     seen.add(r); queue.append(r)
         except Exception:
             pass
