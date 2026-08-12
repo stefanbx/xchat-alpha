@@ -49,15 +49,19 @@ ts, sig}`) that points to their current content, addressed by hash (CID). Heads 
 - Encrypted 1:1 DMs use a separate X25519 keypair derived from the same seed; relays hold only
   ciphertext.
 
-**Retention — a relay is a cache, not an archive.** A head expires on a TTL (its author republishes
-it while active); content blobs (media) live **on disk in an embedded SQLite store** (so the cache
-survives a relay restart instead of vanishing with the process, and is bounded by disk rather than
-RAM) and are evicted **value-weighted**: under storage pressure a relay drops the *least-valuable*
-content first — old and untipped before tipped, well-tipped content last — so a relay can never grow
-without bound, yet it keeps what the network values. A blob's value is the tip total of the post that carries it, propagated with the
-content. Availability is therefore **economic, not eternal**: content survives because it is worth
-keeping, and **pay-to-pin** (§6) lets anyone pay a relay to protect a specific item from eviction for
-a span proportional to the amount. Content nobody values and nobody pins is eventually dropped — the
+**Retention — a relay is a cache, not an archive, and MEMORY is the limit, not a clock.** Both the
+post pointers (heads) and the media (blobs) are kept until the relay is *full*, then evicted by one
+**value score — `tips − reports`** — least-valuable first. Media blobs live **on disk in an embedded
+SQLite store** (bounded by disk, and they survive a relay restart instead of vanishing with the
+process); heads live in RAM under a large author cap. A head still carries a long TTL (a ~30-day
+backstop that its author refreshes while active), but that is *not* the practical limit — the relay
+holds a post as long as memory allows and, under pressure, drops the lowest-value heads: **untipped
+spam goes before any tipped post, regardless of how recently it arrived**, so a Sybil head-flood can
+never push real content out. (Value-weighting is what lets the limit be memory rather than a short
+clock; a purely recency-based cleanup would keep the freshest spam and evict older real posts.)
+Availability is therefore **economic, not eternal**: content survives because it is worth keeping, and
+**pay-to-pin** (§6) lets anyone pay a relay to protect a specific item from eviction for a span
+proportional to the amount. Content nobody values and nobody pins is eventually dropped — the
 honest alternative to unbounded storage or a central archive. (Popular content is also *replicated*
 to more relays; the weak stays single-copy; nothing is force-kept.)
 

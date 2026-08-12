@@ -44,14 +44,24 @@ dmkeys = {}                          # account -> signed X25519 DM public key re
 dms = []                             # list of encrypted direct messages (ciphertext only; relay can't read)
 pollvotes = {}                       # poll_id -> {account: signed vote record} (one vote per account)
 reports = {}                         # post_id -> {account: signed report} (community moderation signal)
+head_value = {}                      # author -> content value (tips - reports), pushed by supporters;
+                                     # ranks HEAD eviction so memory (not a short clock) is the real limit
 known = {SELF}                       # relays this relay knows about
+
+def head_score(author, h):
+    # A head's eviction rank: its author's content VALUE (tips minus reports, pushed by supporters),
+    # then recency as a tiebreak. Untipped spam (value 0) is evicted before any tipped post, so making
+    # memory the limit (long TTL below) can't let a Sybil head-flood push real posts out.
+    return (float(head_value.get(author, 0.0)), h.get('ts', 0))
 
 # --- anti-spam / DoS hardening ------------------------------------------------
 # A relay verifies nothing and stores signed bytes; clients verify on read, so forged spam is inert
 # junk — it can never appear in a feed or impersonate. These bounds stop an UNAUTHENTICATED flood
 # from growing one relay's RAM/CPU without limit. (The plural network already routes around a bad
 # relay; this keeps each individual relay standing.)
-HEAD_TTL    = int(os.environ.get('XC_HEAD_TTL', '604800'))    # 7 days: a post survives a week offline
+HEAD_TTL    = int(os.environ.get('XC_HEAD_TTL', '2592000'))   # 30-day backstop; MEMORY (MAX_HEADS) is the
+                                                              # real limit, and value-eviction is the cleanup
+HEAD_VALUE_CAP = float(os.environ.get('XC_HEAD_VALUE_CAP', '100'))   # clamp a pushed head value (anti-abuse)
 HEAD_SKEW   = 900                                             # clock-skew slack on the max expiry
 MAX_HEADS   = int(os.environ.get('XC_MAX_HEADS', '50000'))    # hard cap on live authors (backstop)
 NOTIF_MAX   = int(os.environ.get('XC_NOTIF_MAX', '200'))      # per-recipient notification cap
@@ -205,7 +215,8 @@ def grant_pin(cid, payhash):
 # --- persistence: the WHOLE relay state survives a restart, not just heads ---
 # (in-memory before this meant comments, uploaded media, likes, poll votes vanished on restart)
 _STATE_KEYS = ('engage', 'notifs', 'supporters', 'follows', 'comments',   # blobs now live in SQLite
-               'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'reports', 'pinned', 'pins_paid')
+               'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'reports', 'head_value',
+               'pinned', 'pins_paid')
 
 def load_state():
     global heads
@@ -265,11 +276,13 @@ def prune():
         dead = [a for a, h in heads.items() if h.get('expires', 9e18) < now]
         for a in dead:
             heads.pop(a, None)
-        if len(heads) > MAX_HEADS:                   # backstop: keep the freshest-expiring authors
-            keep = dict(sorted(heads.items(), key=lambda kv: kv[1].get('expires', 0),
+        if len(heads) > MAX_HEADS:                   # over the memory cap: keep the MOST VALUABLE heads
+            keep = dict(sorted(heads.items(), key=lambda kv: head_score(kv[0], kv[1]),
                                reverse=True)[:MAX_HEADS])
             heads.clear(); heads.update(keep)
             changed = True
+        for a in [a for a in head_value if a not in heads]:   # forget values for gone authors
+            head_value.pop(a, None)
     changed = changed or bool(dead)
     with _rate_lock:
         for ip in [ip for ip, w in _rate.items() if now - w[0] >= RATE_WINDOW]:
@@ -409,15 +422,18 @@ class H(BaseHTTPRequestHandler):
                     h['expires'] = int(maxexp)
                 with _heads_lock:
                     cur = heads.get(h['author'])
-                    at_cap = h['author'] not in heads and len(heads) >= MAX_HEADS
-                    if at_cap:
-                        resp = '{"ok":false,"error":"relay at head capacity"}'   # hard backstop
-                    elif cur is None or h.get('seq', 0) > cur.get('seq', 0) or h['expires'] > cur.get('expires', 0):
+                    if cur is None and len(heads) >= MAX_HEADS:
+                        # at the memory cap: make room by dropping the LEAST-VALUABLE head. Its value
+                        # (tips - reports) is <= a new post's floor, so a tipped post is never displaced
+                        # by a newcomer; only untipped/spam churns — memory, not a clock, is the limit.
+                        victim = min(heads, key=lambda a: head_score(a, heads[a]))
+                        heads.pop(victim, None)
+                    if cur is None or h.get('seq', 0) > cur.get('seq', 0) or h['expires'] > cur.get('expires', 0):
                         heads[h['author']] = h                                   # newer seq OR fresher TTL
                         resp = '{"ok":true,"accepted":true}'
                     else:
                         resp = '{"ok":true,"accepted":false,"reason":"stale"}'
-                self._send(429 if at_cap else 200, resp)
+                self._send(200, resp)
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/relay_announce'):
@@ -556,6 +572,18 @@ class H(BaseHTTPRequestHandler):
                     recs[acc] = {'ts': ts, 'sig': sig, 'pub': pub, 'cid': m.get('cid', ''), 'rep': rep}
                     blob_report(m.get('cid', ''), acc, rep)     # penalise + maybe take down the media
                 self._send(200, json.dumps({'ok': True, 'reports': len(recs)}))
+            except Exception as ex:
+                self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
+        elif self.path.startswith('/headvalue'):
+            # a supporter reports an author's content value (tips − reports) so heads evict by VALUE, not
+            # a clock — untipped spam is dropped before real posts under memory pressure. Clamped anti-abuse;
+            # a semi-trusted hint (like sync), and it only matters at the memory cap. Derived from on-chain
+            # tips + signed reports, recomputed each round (so it tracks new reports down as well as up).
+            try:
+                m = json.loads(raw); a = m['author']
+                if a:
+                    head_value[a] = max(0.0, min(float(m.get('value', 0)), HEAD_VALUE_CAP))
+                self._send(200, '{"ok":true}')
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         elif self.path.startswith('/comment'):
