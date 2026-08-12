@@ -79,14 +79,27 @@ _feed_lock = threading.Lock()
 
 def api_feed(query=None):
     now = time.time()
-    if (now - _feed_ts[0] > FEED_TTL or not os.path.exists('/tmp/xc_feed_agg.json')) \
-            and _feed_lock.acquire(blocking=False):
+    if not os.path.exists('/tmp/xc_feed_agg.json'):
+        # COLD START (fresh node, or a redeploy cleared /tmp): BLOCK on the first aggregation so the very
+        # first feed is never empty. Only one caller aggregates per TTL window; others wait on the lock,
+        # then read the fresh file. If it fails, they fall through to empty fast (no thundering herd).
+        with _feed_lock:
+            if not os.path.exists('/tmp/xc_feed_agg.json') and time.time() - _feed_ts[0] > FEED_TTL:
+                _feed_ts[0] = time.time()
+                spawn('xc_feed.py')
+    elif now - _feed_ts[0] > FEED_TTL and _feed_lock.acquire(blocking=False):
         try:
-            _feed_ts[0] = now                                # claim the window before the slow spawn
+            _feed_ts[0] = now                                # warm refresh: serve the stale cache meanwhile
             spawn('xc_feed.py')
         finally:
             _feed_lock.release()
-    content = read('/tmp/xc_feed_agg.json', '{}')
+    # The aggregation file is a CACHE that must persist for FEED_TTL, so read it WITHOUT consuming it —
+    # unlike a one-shot helper result. (read() deletes what it reads; using it here defeated the cache
+    # and re-aggregated on every request, which is what made the feed blink slow-or-empty.)
+    try:
+        content = open('/tmp/xc_feed_agg.json').read() or '{}'
+    except Exception:
+        content = '{}'
     blocks = read('/tmp/xc_onchain_count.txt', '0') or '0'
     # Incremental: ?since=<ts> returns ONLY posts newer than what the client already has, so a poll
     # usually returns an empty list instead of the whole feed. Aggregation is still cached whole (the
@@ -115,14 +128,17 @@ def api_labels():
     # labeler: verify each report's signature, count distinct reporters per post, and expose a per-post
     # fraction (reporters / quorum) the app filters against. Cached like the feed.
     now = time.time()
-    if (now - _labels_ts[0] > LABELS_TTL or not os.path.exists('/tmp/xc_labels.json')) \
-            and _labels_lock.acquire(blocking=False):
+    if now - _labels_ts[0] > LABELS_TTL and _labels_lock.acquire(blocking=False):
         try:
             _labels_ts[0] = now
-            spawn('xc_labels.py')
+            spawn('xc_labels.py')                            # async refresh; serve the cache meanwhile
         finally:
             _labels_lock.release()
-    return read('/tmp/xc_labels.json', '{"labelers":[]}')
+    # cache — read WITHOUT consuming, or every /api/labels re-runs the (RPC-heavy) trust aggregation.
+    try:
+        return open('/tmp/xc_labels.json').read() or '{"labelers":[]}'
+    except Exception:
+        return '{"labelers":[]}'
 
 # ---- on-device money: PUBLIC ledger reads (no seed) that let the app build + sign its own blocks ----
 def api_account_state(acct):
