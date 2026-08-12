@@ -27,12 +27,59 @@ import 'wallet.dart';
 const String kDefaultBase = 'https://xchat-alpha-node.fly.dev'; // hosted alpha node (run your own + repoint in Settings)
 String kBase = kDefaultBase;
 
+// Node endpoints tried in order, with FAILOVER. The app REMEMBERS the last-good one (persisted) and
+// uses it directly — no rescan every launch. It only re-probes the list when the current endpoint fails,
+// then switches to a healthy one. Seed extra endpoints here or via Settings; a 2nd node makes this real.
+List<String> kEndpoints = [kDefaultBase];
+
+Future<void> _loadEndpoints() async {
+  final sp = await SharedPreferences.getInstance();
+  final seen = <String>{};
+  final list = <String>[];
+  for (final e in [
+    sp.getString('xchat_endpoint') ?? '',            // legacy single-endpoint pref (last-good)
+    ...?sp.getStringList('xchat_endpoints'),
+    kDefaultBase,
+  ]) {
+    if (e.isNotEmpty && seen.add(e)) list.add(e);
+  }
+  kEndpoints = list;
+  kBase = kEndpoints.first;                            // trust the cached last-good endpoint; no probe here
+}
+
+Future<bool> _endpointHealthy(String base) async {
+  try {
+    final r = await http.get(Uri.parse('$base/api/status')).timeout(const Duration(seconds: 6));
+    final d = jsonDecode(r.body);
+    return d is Map && d['online'] == true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Probe the list, switch kBase to the first healthy endpoint, move it to the front, persist. Called only
+// when the current endpoint FAILED — so a healthy node is never re-probed on the happy path.
+Future<bool> resolveEndpoint() async {
+  for (final e in kEndpoints) {
+    if (await _endpointHealthy(e)) {
+      kBase = e;
+      kEndpoints.remove(e);
+      kEndpoints.insert(0, e);
+      final sp = await SharedPreferences.getInstance();
+      await sp.setStringList('xchat_endpoints', kEndpoints);
+      await sp.setString('xchat_endpoint', e);
+      return true;
+    }
+  }
+  return false;
+}
+
 // On-device signer, built from the local seed. Every write the app publishes (follows, comments,
 // polls, profile, …) is signed HERE and only the signed record is sent — the node never sees the
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.5'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.2.6'; // this build; the update checker compares against the signed release.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
 // 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
 // below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)
@@ -49,8 +96,7 @@ const Color kDim = Color(0xFF71767B);
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final saved = (await SharedPreferences.getInstance()).getString('xchat_endpoint');
-  if (saved != null && saved.isNotEmpty) kBase = saved;
+  await _loadEndpoints();                              // persisted last-good endpoint + failover list
   runApp(const XChatApp());
 }
 
@@ -623,11 +669,33 @@ class Api {
     final d = jsonDecode(r.body);
     final c = d['content'] ?? {};
     final posts = (c['posts'] as List?) ?? [];
+    // Cache the last FULL feed that actually has content, so a cold-node blip (a machine just restarted
+    // and its feed cache is still warming) or an offline launch shows the last feed instead of blanking.
+    if (since == 0 && posts.isNotEmpty) {
+      try {
+        (await SharedPreferences.getInstance()).setString('xchat_feed_cache', r.body);
+      } catch (_) {}
+    }
     return FeedData(
         posts.map((p) => Post.fromJson(p)).toList(),
         (d['onchain_blocks'] ?? 0) as int,
         (c['relays_up'] ?? 0) as int,
         (c['relays_total'] ?? 0) as int);
+  }
+
+  static Future<FeedData?> cachedFeed() async {
+    try {
+      final s = (await SharedPreferences.getInstance()).getString('xchat_feed_cache');
+      if (s == null || s.isEmpty) return null;
+      final d = jsonDecode(s);
+      final c = d['content'] ?? {};
+      final posts = (c['posts'] as List?) ?? [];
+      if (posts.isEmpty) return null;
+      return FeedData(posts.map((p) => Post.fromJson(p)).toList(), (d['onchain_blocks'] ?? 0) as int,
+          (c['relays_up'] ?? 0) as int, (c['relays_total'] ?? 0) as int);
+    } catch (_) {
+      return null;
+    }
   }
 
   // settle the batched off-chain tip tally. The tip is SPLIT immutably on-chain: the creator gets
@@ -4045,11 +4113,22 @@ class _FeedScreenState extends State<FeedScreen> {
         ]),
       );
 
-  Future<void> _load() async {
+  Future<void> _load({bool failedOver = false}) async {
     setState(() {
       _loading = true;
       _error = null;
     });
+    // Cold start: paint the last cached feed immediately so the first frame isn't blank while we fetch.
+    if (_posts.isEmpty) {
+      final cached = await Api.cachedFeed();
+      if (cached != null && mounted && _posts.isEmpty) {
+        setState(() {
+          _posts = cached.posts;
+          _relaysUp = cached.relaysUp;
+          _relaysTotal = cached.relaysTotal;
+        });
+      }
+    }
     try {
       final results = await Future.wait(
           [Api.feed(), Api.me(), Api.labels(), Api.notify(), Api.engagement()]);
@@ -4059,11 +4138,15 @@ class _FeedScreenState extends State<FeedScreen> {
       final notifs = results[3] as List<Map<String, dynamic>>;
       final engage = results[4] as Map<String, dynamic>;
       setState(() {
-        _posts = fd.posts;
+        // Never blank a good feed with a momentarily-empty one (e.g. a just-restarted node whose feed
+        // cache is still warming). Only replace when the fetch has posts, or we truly had none.
+        if (fd.posts.isNotEmpty || _posts.isEmpty) _posts = fd.posts;
         _newPosts.clear();                    // a full refresh already includes everything
         _onchainBlocks = fd.onchainBlocks;
-        _relaysUp = fd.relaysUp;
-        _relaysTotal = fd.relaysTotal;
+        if (fd.posts.isNotEmpty) {
+          _relaysUp = fd.relaysUp;
+          _relaysTotal = fd.relaysTotal;
+        }
         _handle = me['handle'] ?? 'you.xno';
         _account = me['account'] ?? '';
         _balance = me['balance']?.toString() ?? '0';
@@ -4076,9 +4159,14 @@ class _FeedScreenState extends State<FeedScreen> {
       _initProfile();   // pull our own profile (name/avatar) into the cache
       _maybeSweep();    // keep only the safety-cap float here; forward the rest to savings
     } catch (e) {
+      // The current endpoint failed — try to fail over to a healthy one from the list, then retry ONCE.
+      if (!failedOver && await resolveEndpoint()) {
+        return _load(failedOver: true);
+      }
       setState(() {
-        _error = 'could not reach the ledger engine\n($kBase)';
         _loading = false;
+        // Keep showing the cached feed if we have one; only hard-error on a genuinely empty screen.
+        if (_posts.isEmpty) _error = 'could not reach the ledger engine\n($kBase)';
       });
     }
   }
