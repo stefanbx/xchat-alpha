@@ -364,6 +364,49 @@ def grant_pin(cid, payhash):
 _STATE_KEYS = ('engage', 'notifs', 'supporters', 'follows', 'comments',   # blobs now live in SQLite
                'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'reports', 'pinned', 'pins_paid')
 
+def _prune_loaded():
+    # PRUNE-ON-LOAD. The per-table caps in the write handlers only bound NEW writes; state loaded from
+    # disk is not capped on the way in, so a store that grew large under older (uncapped) code would
+    # re-inflate RAM on every restart (this is what tipped the 512 MB node into an OOM on redeploy).
+    # Applying the same ceilings here means the in-memory footprint is bounded by the caps regardless
+    # of how big the file on disk got, and the next save() writes the smaller state back. (heads is left
+    # to prune()/head_score, which trims it by on-chain value rather than insertion order.)
+    _cap_dict(notifs, NOTIF_ACCTS)
+    for a, lst in list(notifs.items()):
+        if isinstance(lst, list) and len(lst) > NOTIF_MAX:
+            notifs[a] = lst[-NOTIF_MAX:]
+    _cap_dict(supporters, SUPPORTERS_MAX)
+    _cap_dict(follows, FOLLOWS_MAX)
+    for a, rec in list(follows.items()):
+        fl = (rec or {}).get('follows')
+        if isinstance(fl, list) and len(fl) > FOLLOW_LIST_MAX:
+            rec['follows'] = fl[:FOLLOW_LIST_MAX]
+    _cap_dict(profiles, PROFILES_MAX)
+    _cap_dict(dmkeys, DMKEYS_MAX)
+    _cap_dict(comments, COMMENT_POSTS_MAX)
+    for pid, lst in list(comments.items()):
+        if isinstance(lst, list) and len(lst) > COMMENTS_PER_POST:
+            comments[pid] = lst[-COMMENTS_PER_POST:]
+    _cap_dict(pollvotes, POLLS_MAX)
+    for pid, votes in list(pollvotes.items()):
+        if isinstance(votes, dict):
+            _cap_dict(votes, POLL_VOTERS_MAX)
+    _cap_dict(engage, ENGAGE_MAX)
+    for pid, e in list(engage.items()):
+        rs = (e or {}).get('resharers')
+        if isinstance(rs, list) and len(rs) > RESHARERS_MAX:
+            e['resharers'] = rs[:RESHARERS_MAX]
+    _cap_dict(reports, REPORT_POSTS)
+    for pid, recs in list(reports.items()):
+        if isinstance(recs, dict):
+            _cap_dict(recs, REPORT_PER_POST)
+    _cap_dict(releases, RELEASE_PUBS_MAX)
+    for pub, lst in list(releases.items()):
+        if isinstance(lst, list) and len(lst) > 24:
+            releases[pub] = lst[-24:]
+    if len(dms) > DM_MAX:
+        del dms[:-DM_MAX]
+
 def load_state():
     global heads
     if not os.path.exists(STORE):
@@ -384,6 +427,8 @@ def load_state():
         for cid, b64 in (d.get('blobs') or {}).items():   # one-time migration: legacy in-JSON blobs -> SQLite
             if b64:
                 blob_put(cid, b64)
+        _prune_loaded()                              # bound the loaded state to the same caps as live writes
+        mark_dirty()                                 # so the pruned (smaller) state is written back on next save
     except Exception:
         pass
 
