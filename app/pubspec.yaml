@@ -16,10 +16,12 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-# versionName+versionCode. Keep in lockstep with kAppVersion in main.dart. The build code is
-# major*10000 + minor*100 + patch, so it ALWAYS increments across releases → Android accepts every
-# in-place update. (Small ALPHA steps: 2.2.0 → 2.2.1 → 2.2.2 …; anchored at 2.2.x because the phone
-# already installed 2.2.0 and the version doubles as the update-check comparison — can't go below it.)
+# versionName+build. versionName MUST match kAppVersion in main.dart (it's the update-check key). Bump
+# the build number (+N) every release and keep it increasing — the Android versionCode the toolchain
+# emits follows it monotonically, so in-place updates are always accepted. (Small ALPHA steps: 2.2.0 →
+# 2.2.1 → 2.2.2 …; anchored at 2.2.x because the phone already installed 2.2.0 and the version doubles as
+# the update-check comparison — can't go below it. NB the emitted versionCode may differ from N; only
+# that it INCREASES matters — verify with `aapt2 dump badging` if unsure.)
 version: 2.2.1+20201
 
 environment:

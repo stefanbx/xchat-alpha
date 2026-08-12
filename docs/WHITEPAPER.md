@@ -1,6 +1,6 @@
 # ӾChat — a censorship-free X, discovered on the XNO ledger
 
-**Alpha whitepaper · v0.1**
+**Alpha whitepaper · v0.2 · app v2.2.1**
 
 ӾChat is a Twitter/X-style social app for phones with no company, no server account, and
 no removable point of control. Your identity is a cryptographic keypair, your posts are
@@ -190,20 +190,26 @@ on any one secret:
   commit, and how many attestors agree. The one layer that isn't censorship-free is the OS install
   gate itself (Android allows sideload/self-update; iOS does not) — and the app says so.
 
-**Bootstrapping honesty:** reproducible builds make the *binary* trustless relative to the source;
-a real K-of-N quorum needs several independent maintainers, so early on the attestor set is small
-(size-1 at genesis, with keys on separate devices) — but the *mechanism* is already plural, designed
-to grow into a quorum rather than to be replaced by one. The alpha ships a single content-addressed
-signer as a bootstrap; reproducible builds + the multi-attestor format are the hardening toward 1.0.
+**Bootstrapping honesty — what's shipped vs. the target.** The alpha **implements today**: signed,
+content-addressed releases; the APK pinned + **auto-replicated** across plural relays; the client
+fetching from *any* relay and **re-verifying the SHA-256 on-device** before an explicit-tap install;
+and an auto-update check. It uses a **single publisher key** (held outside the repo; the app pins only
+the public account). The **reproducible builds** and the **K-of-N attestor quorum** described above are
+the *design target*, **not yet shipped** — they are the hardening toward 1.0 (reproducible builds make
+the binary trustless relative to the source; a real quorum needs several independent maintainers).
+Until then the honest trust root for updates is that single pinned key — see §8 and §11.
 
 ### How a release propagates — no single domain, no single pusher
 
 Two things travel separately, which is why there is no central distribution point:
 
-- **The pointer** (a few hundred bytes): the release record `{version, commit, sha256, attestations}`
-  lives **on the XNO ledger** (immutable, public — no website) and on the relays.
+- **The pointer** (a few hundred bytes): a **signed, append-only release record** `{version, cid,
+  sha256, size, changelog, sig}`. **Today it lives on the relays** (published to every relay, kept as a
+  list so a forged record can't evict the real one — the client keeps the highest *validly signed*
+  version). Committing the record (and attestations) **on the XNO ledger** for public, website-free
+  tamper-evidence is the roadmap item, not yet shipped.
 - **The bytes** (the APK): **content-addressed** by hash and cached on the **relays**, plural and
-  interchangeable.
+  interchangeable — and now **auto-replicated + pinned** across the relay set on publish.
 
 The client reads the pointer from the ledger, fetches the bytes from *any* relay that has them, and
 checks the hash. It never matters *where* the bytes came from — only that they match the
@@ -224,11 +230,12 @@ right code still gets out — while wrong bytes, from anywhere, are rejected by 
 ## 8. Trust roots (there are exactly three, and all are minimal)
 
 1. **Your seed** — your identity. Yours alone; back it up.
-2. **The release attestor set** — authenticates app updates. *Not a single key:* an update is trusted
-   when it is a **reproducible build of the public source** confirmed by a **user-chosen quorum** of
-   independent attestations, logged on-chain. Early on the quorum is small (a bootstrap), but no
-   single secret is load-bearing — the binary is verifiable from source by anyone, so this is a
-   plural, growable anchor rather than a fixed point of failure.
+2. **The release publisher** — authenticates app updates. **Today this is a single pinned publisher
+   key** (held outside the repo; the app pins only its public account); the update is content-addressed
+   and its hash re-verified on-device. The *target* — **not yet shipped** — replaces that single key
+   with a **reproducible build of the public source** confirmed by a **user-chosen K-of-N quorum** of
+   independent attestations logged on-chain, so no single secret is load-bearing. It is deliberately a
+   growable anchor, but honesty requires stating that the alpha's update trust rests on that one key.
 3. **The rendezvous addresses** — the discovery bootstrap. *Keyless and plural* — meeting points,
    not controllers. This is the irreducible minimum every peer-to-peer system needs (Bitcoin has
    hardcoded DNS seeds); the design makes it as weak-as-possible rather than pretending it away.
@@ -408,6 +415,14 @@ now shipped:
   blobs live in an **on-disk SQLite cache** that survives a relay restart (they used to sit in RAM and
   vanish on redeploy) — verified live: the cache persisted a restart and a real photo posted from the
   app landed in it and served back.
+- **Resilient client + self-delivery, hardened.** Posts written **offline queue and auto-send** when
+  the signal returns (and survive an app restart); you can **delete your own posts** (the thread is
+  re-signed and republished without them); accounts that share the default handle are distinguished by
+  a short, **unforgeable account tag** derived from the pubkey. The relays form a **two-way mesh** so
+  discovery doesn't hinge on a single on-chain scan, and a published **release auto-replicates + is
+  pinned across every relay** so an update reaches the whole set on its own. The app **auto-checks for
+  updates on launch** (and periodically) and shows a one-tap banner; the APK is fetched **direct from a
+  relay** and its SHA-256 re-verified on-device before install — all verified end-to-end on a device.
 
 **How that claim is tested.** `test/interop_test.py` signs one canonical message per write path with
 the *shipped* app wallet (Dart/nanodart) and verifies each with the *shipped* node verifier
@@ -418,7 +433,12 @@ record is accepted and lands on the relay, and that a **tampered** one is refuse
 
 **Honest limits.** The seed is stored in the app's private `SharedPreferences`, which is not
 hardware-backed — a rooted or physically compromised phone can read it (moving to the platform
-keystore is the next step). Moderation labeling is minimal. Network metadata is **not** private (no
+keystore is the next step). **Wallet recovery is *only* your seed backup, and today's backup step is
+optional — a real footgun:** a wallet is a random seed, so if it isn't saved and the app is reinstalled,
+its funds are unrecoverable on-chain-but-unspendable. Mandatory-backup UX (and keystore storage) is a
+priority before wider use. **Update delivery works but isn't production-grade:** the download comes
+direct from a relay and is hash-verified, but the hosted node and relays are small single instances
+that can get busy, so an in-app update can need a retry or two. Moderation labeling is minimal. Network metadata is **not** private (no
 onion routing yet — treat your IP as visible). The node is single-identity-per-instance for the
 state it caches, though it no longer holds an identity that can sign. A relay's one-time on-chain
 *announcement* is a real (tiny) mainnet transaction the operator makes with a funded wallet. **Relay
