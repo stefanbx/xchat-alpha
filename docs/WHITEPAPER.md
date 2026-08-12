@@ -124,13 +124,18 @@ finer, reversible filter on top.
 
 **Reputation-weighted, not one-account-one-vote.** Each report counts for its author's **on-chain
 reputation** — an *unopened* throwaway account weighs **0**, and an opened account earns weight from
-its balance and chain activity (both costly to fake at scale). The takedown threshold and the shield
-fraction are over this **weighted** sum, so a pile of empty keypairs can't force anything: it takes
-reporters with real skin in the game. The weight is verified from the ledger (`account_rep`) and one
-score — `tips − weighted_reports` — still drives eviction, sync, and takedown alike. ✅ *Residual:* the
-weight is a fixed balance+activity formula, not yet decayed-by-inactivity or accuracy-scored, and a
-genuinely wealthy adversary is not priced out — the knobs (`XC_REP_*`, `XC_TAKEDOWN_WEIGHT`) are how
-you tune it. 🔨
+its balance and chain activity (both costly to fake at scale). Two more factors, both trustless:
+**decay** — reputation halves on a ~30-day half-life of on-chain *inactivity* (read from the account's
+last-block timestamp), so stale standing fades; and **accuracy** — a reporter's weight is scaled by how
+often their flags are *corroborated by other reputable accounts*, so a lone-wolf or frivolous reporter
+is discounted to a floor while a reporter the community backs keeps full weight (a Sybil sock-puppet
+can't self-corroborate — corroboration needs two accounts that each hold real reputation). The takedown
+threshold and the shield fraction are over this weighted, decayed, accuracy-scaled sum, and one score —
+`tips − weighted_reports` — still drives eviction, sync, and takedown alike. Every input is read or
+verified from the ledger + the signed report graph — **no trusted party.** ✅ *Residual:* a genuinely
+wealthy, active adversary is still not priced out (reputation buys weight), and accuracy is a single-pass
+corroboration heuristic, not full iterative trust propagation — the knobs (`XC_REP_*`,
+`XC_TAKEDOWN_WEIGHT`) tune it. 🔨
 
 ## 6. Funding — tips reward creators, pay-to-pin keeps content alive
 

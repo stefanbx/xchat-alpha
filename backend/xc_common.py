@@ -150,13 +150,15 @@ def pub_to_addr(pubhex):  # 32-byte pubkey hex -> nano_ address (binds a head's 
 # takedown needs reporters with real skin in the game, not a pile of empty throwaway keypairs.
 REP_BAL_FULL = float(os.environ.get('XC_REP_BAL_FULL', '1'))    # XNO balance for full balance credit
 REP_BLK_FULL = float(os.environ.get('XC_REP_BLK_FULL', '10'))   # chain blocks for full activity credit
+REP_HALFLIFE = float(os.environ.get('XC_REP_HALFLIFE', str(30 * 86400)))   # rep halves per 30 idle days
 REP_TTL      = float(os.environ.get('XC_REP_TTL', '300'))       # cache an account's reputation this long
 _rep_cache = {}
 
 def account_rep(account):
     # Reputation in [0,1]. An UNOPENED account (a fresh throwaway) weighs 0. An opened account gets a
-    # small floor plus credit for balance and chain height — both need real, costly on-chain activity
-    # to fake at scale. Cached (moderation is infrequent; this keeps the aggregation cheap).
+    # small floor plus credit for balance and chain height, then DECAYS by on-chain inactivity: an
+    # account dormant on the ledger (its last block is old) loses weight on a half-life, so stale
+    # standing fades. All read from the ledger — trustless. Cached (keeps the aggregation cheap).
     now = time.time()
     c = _rep_cache.get(account)
     if c and now - c[1] < REP_TTL:
@@ -167,7 +169,10 @@ def account_rep(account):
         if info and 'balance' in info and 'error' not in info:
             bal = int(info.get('balance', '0')) / 1e30
             blocks = int(info.get('block_count', '0'))
-            rep = min(1.0, 0.2 + 0.4 * min(1.0, bal / REP_BAL_FULL) + 0.4 * min(1.0, blocks / REP_BLK_FULL))
+            base = min(1.0, 0.2 + 0.4 * min(1.0, bal / REP_BAL_FULL) + 0.4 * min(1.0, blocks / REP_BLK_FULL))
+            mod = float(info.get('modified_timestamp', 0) or 0)                 # last on-chain activity
+            decay = 0.5 ** (max(0.0, now - mod) / REP_HALFLIFE) if mod > 0 else 1.0
+            rep = base * decay
     except Exception:
         rep = 0.0
     _rep_cache[account] = (rep, now)
@@ -175,9 +180,12 @@ def account_rep(account):
 
 def aggregate_reports(relays):
     # Read /reports from every relay, VERIFY each signature + key<->author binding, dedupe by account,
-    # and weight each reporter by account_rep. Returns post_id -> {'weight', 'count', 'cid'} where
-    # weight is the reputation-weighted sum that drives the labeler fraction, feed takedown, and sync.
-    per = {}
+    # weight each reporter by account_rep (Sybil-resistant, decayed), AND scale by the reporter's
+    # ACCURACY — how often their flags are corroborated by OTHER reputable accounts. A lone-wolf or
+    # frivolous reporter (nobody reputable agrees) is discounted to a floor; a reporter whose calls the
+    # community backs keeps full weight. Returns post_id -> {'weight', 'count', 'cid'}.
+    per = {}                                                # pid -> {'accts': {acc: rep}, 'cid': cid}
+    by_reporter = {}                                        # acc -> set(pid) they reported
     for r in relays:
         try:
             d = json.loads(urllib.request.urlopen(r + '/reports', timeout=4).read()).get('reports', {})
@@ -192,8 +200,22 @@ def aggregate_reports(relays):
                 e['accts'][acc] = account_rep(acc)          # dedupe by account across relays
                 if rec.get('cid'):
                     e['cid'] = rec.get('cid')
-    return {pid: {'weight': round(sum(e['accts'].values()), 4), 'count': len(e['accts']), 'cid': e['cid']}
-            for pid, e in per.items()}
+                by_reporter.setdefault(acc, set()).add(pid)
+    # A post is CORROBORATED when >= 2 of its reporters hold real (non-zero) reputation — a lone report,
+    # or a report + a rep-0 Sybil sock-puppet, does not corroborate.
+    corroborated = {pid for pid, e in per.items()
+                    if sum(1 for rp in e['accts'].values() if rp > 0) >= 2}
+    # Accuracy per reporter: fraction of their reports that landed on corroborated posts, floored at
+    # 0.25 so a newcomer/lone reporter isn't zeroed, capped at 1.0 (matches the old labeler model).
+    accuracy = {}
+    for acc, pids in by_reporter.items():
+        hit = sum(1 for pid in pids if pid in corroborated)
+        accuracy[acc] = 0.25 + 0.75 * (hit / len(pids)) if pids else 0.25
+    out = {}
+    for pid, e in per.items():
+        w = sum(rp * accuracy.get(acc, 0.25) for acc, rp in e['accts'].items())
+        out[pid] = {'weight': round(w, 4), 'count': len(e['accts']), 'cid': e['cid']}
+    return out
 
 def gsend(dst_pub, amt):  # genesis -> dst_pub, returns the send hash
     gi = rpc({'action': 'account_info', 'account': derive(GEN)[0]}); nb = str(int(gi['balance']) - amt)
