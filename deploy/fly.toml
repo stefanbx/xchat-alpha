@@ -10,7 +10,7 @@ primary_region = "iad"
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
-  memory = "512mb"
+  memory = "1024mb"   # 512mb OOM'd on restart (ipfs + node + loading the persisted store); 1GB gives headroom
 
 # Persistent disk for the relay store, so restarts/redeploys keep the history.
 # One volume ↔ one machine; a second machine would need its own volume and would hold separate
