@@ -17,8 +17,12 @@ primary_region = "iad"
     hard_limit = 250
 [[vm]]
   cpu_kind = "shared"
-  cpus = 1
+  cpus = 2
   memory = "1024mb"   # 512mb OOM'd on restart (ipfs + node + loading the persisted store); 1GB gives headroom
+  # The app's launch fires ~10+ concurrent requests, some spawning helpers; a single shared vCPU got
+  # pegged (e.g. by the on-chain relaydir scan) and stopped accepting connections, hanging the whole
+  # node. 2 vCPUs keep the accept loop scheduled while a background helper runs. (relaydir is also off
+  # the request path now — served from cache, refreshed in the background.)
 
 # Persistent disk for the relay store, so restarts/redeploys keep the history.
 # One volume ↔ one machine; a second machine would need its own volume and would hold separate

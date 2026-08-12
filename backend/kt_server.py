@@ -235,6 +235,35 @@ def api_head(acct):
         return json.dumps({'ok': True, 'head': None})
     return json.dumps({'ok': True, 'head': {'seq': best['seq'], 'cid': best['cid'], 'handle': best.get('handle', '')}})
 
+RELAYDIR_TTL = float(os.environ.get('XC_RELAYDIR_TTL', '180'))
+_relaydir_ts = [0.0]
+_relaydir_lock = threading.Lock()
+_RELAYDIR_CACHE = '/tmp/xc_relaydir_cache.json'
+_RELAYDIR_WARMING = '{"source":"warming","relays":[],"active":[],"count":0,"health":[],"rendezvous":[]}'
+def api_relaydir():
+    # The relay-directory panel does an on-chain scan + per-relay pings. A COLD scan can take ~80s and
+    # pegs the single shared CPU — running it on the request thread hung the WHOLE node under the app's
+    # launch burst (which calls this every start). It's a non-critical display, so NEVER block on it:
+    # serve the cached result immediately and refresh in ONE background thread (single-flight).
+    now = time.time()
+    if now - _relaydir_ts[0] > RELAYDIR_TTL and _relaydir_lock.acquire(blocking=False):
+        _relaydir_ts[0] = now                         # claim the window so a burst doesn't stack refreshes
+        def _bg():
+            try:
+                spawn('xc_reldir.py', 'engine')
+                if os.path.exists('/tmp/xc_relaydir.json'):
+                    os.replace('/tmp/xc_relaydir.json', _RELAYDIR_CACHE)
+            finally:
+                try:
+                    _relaydir_lock.release()
+                except Exception:
+                    pass
+        threading.Thread(target=_bg, daemon=True).start()
+    try:
+        return open(_RELAYDIR_CACHE).read() or _RELAYDIR_WARMING
+    except Exception:
+        return _RELAYDIR_WARMING
+
 _relcheck_cache = {}   # current -> (result_str, ts)
 def api_release_check(current):
     # Cache the check like the feed. It spawns a helper (relay fan-out) and holds the HTTP connection
@@ -271,7 +300,7 @@ def route(path, query, body):
     b = lambda k: (body.get(k, '') if isinstance(body, dict) else '')
 
     if path.startswith('/api/feed'):        return api_feed(query)
-    if path.startswith('/api/relaydir'):     spawn('xc_reldir.py', 'engine');                     return read('/tmp/xc_relaydir.json', '{}')
+    if path.startswith('/api/relaydir'):     return api_relaydir()   # cached + background-refreshed (never blocks)
     if path.startswith('/api/pin_targets'):  return api_pin_targets()
     # prefix collisions: /api/media_relay must precede /api/media, which must precede /api/me.
     if path.startswith('/api/media_relay'):   return api_media_relay(q('cid'))
