@@ -60,7 +60,6 @@ post_reports = {pid: e['weight'] for pid, e in xc.aggregate_reports(RELAYS).item
 
 cids = {}                                                # cid -> tips (XNO): media = its post's tips,
 cid_reports = {}                                         # cid -> reporter weight of the post using it
-author_value = {}                                        # author -> content value (tips - reports) for HEADS
 for h in best.values():                                  # the thread = the sum of its posts' tips
     data = fetch(h['cid'])
     thread_tips = 0.0; thread_rep = 0.0
@@ -79,19 +78,6 @@ for h in best.values():                                  # the thread = the sum 
             pass
     cids[h['cid']] = max(cids.get(h['cid'], 0.0), thread_tips)             # the thread JSON
     cid_reports[h['cid']] = max(cid_reports.get(h['cid'], 0), thread_rep)
-    author_value[h['author']] = max(0.0, thread_tips - thread_rep * REPORT_WEIGHT)
-
-# Tell the relays each author's content VALUE, so HEADS evict by value (tips - reports) under memory
-# pressure instead of on a fixed clock — a post survives as long as memory allows, and spam (value 0)
-# is what gets cleaned first. Outbound-only, like the rest of a supporter's work.
-for _a, _v in author_value.items():
-    for r in RELAYS:
-        try:
-            urllib.request.urlopen(urllib.request.Request(
-                r + '/headvalue', json.dumps({'author': _a, 'value': _v}).encode(),
-                {'Content-Type': 'application/json'}), timeout=5).read()
-        except Exception:
-            pass
 
 # SYNC THE BEST: replicate content to every relay in SCORE order (tips minus reports), best first,
 # within a byte budget per round. The best reaches all relays (durable, multi-copy); the weak stays

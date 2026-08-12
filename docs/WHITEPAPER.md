@@ -53,12 +53,15 @@ ts, sig}`) that points to their current content, addressed by hash (CID). Heads 
 post pointers (heads) and the media (blobs) are kept until the relay is *full*, then evicted by one
 **value score — `tips − reports`** — least-valuable first. Media blobs live **on disk in an embedded
 SQLite store** (bounded by disk, and they survive a relay restart instead of vanishing with the
-process); heads live in RAM under a large author cap. A head still carries a long TTL (a ~30-day
-backstop that its author refreshes while active), but that is *not* the practical limit — the relay
-holds a post as long as memory allows and, under pressure, drops the lowest-value heads: **untipped
-spam goes before any tipped post, regardless of how recently it arrived**, so a Sybil head-flood can
-never push real content out. (Value-weighting is what lets the limit be memory rather than a short
-clock; a purely recency-based cleanup would keep the freshest spam and evict older real posts.)
+process). A blob's value is the tip total of the post that carries it minus its community reports.
+Heads live in RAM under a large author cap; each still carries a long TTL (a ~30-day backstop its
+author refreshes while active), but that is *not* the practical limit — the relay holds a post as long
+as memory allows and, under pressure, drops the lowest-value heads first. A head's value is the
+author's **on-chain reputation, which the relay computes itself from the ledger** (`account_rep` —
+balance and chain activity) — **no trusted third party, no pushed hint.** It's Sybil-resistant (a
+throwaway account is 0) and it already reflects tips: a tip is on-chain XNO that *raises the creator's
+balance*, so a popular creator's reputation rises on its own. So a Sybil head-flood can never push real
+content out (a purely recency-based cleanup would keep the freshest spam and evict older real posts).
 Availability is therefore **economic, not eternal**: content survives because it is worth keeping, and
 **pay-to-pin** (§6) lets anyone pay a relay to protect a specific item from eviction for a span
 proportional to the amount. Content nobody values and nobody pins is eventually dropped — the
