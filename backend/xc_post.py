@@ -101,6 +101,29 @@ def push_head(head):
     return pushed
 
 
+def replicate_content(cid, data):
+    # Push a post's content to EVERY relay as a blob keyed by its CID. A head is only a pointer; the
+    # content itself lived only in the origin node's IPFS, so a second node (empty IPFS) served an empty
+    # feed. Storing the content as a relay blob means any node's get_content() falls back to /blob and
+    # serves it — the basis for node redundancy + app failover. Fire-and-forget; relays dedup by cid.
+    if not cid or not data:
+        return 0
+    try:
+        b64 = base64.b64encode(data).decode()
+    except Exception:
+        return 0
+    n = 0
+    for r in RELAYS:
+        try:
+            urllib.request.urlopen(urllib.request.Request(r + '/blob',
+                                   json.dumps({'cid': cid, 'b64': b64}).encode(),
+                                   {'Content-Type': 'application/json'}), timeout=6).read()
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
 if mode == 'prepare':
     # The post event is ALREADY SIGNED BY THE APP. Verify it, assemble the thread, pin it, and return
     # the CID + seq for the app to sign the head over. No seed touched.
@@ -136,8 +159,13 @@ elif mode == 'submit':
     if not (xc.pub_to_addr(pub) == acc and verify(pub, f"{acc}|{seq}|{cid}|{expires}", sig)):
         json.dump({"ok": False, "error": "bad head signature"}, open('/tmp/xc_post_result.json', 'w')); sys.exit()
     cand = f'/tmp/xc_thread_cand_{acc}.json'
+    committed = f'/tmp/xc_thread_{acc}.json'
     if os.path.exists(cand) and xc.ipfs_add(cand) == cid:   # the app signed exactly this content
-        os.replace(cand, f'/tmp/xc_thread_{acc}.json')
+        os.replace(cand, committed)
+        try:
+            replicate_content(cid, open(committed, 'rb').read())   # relay-side copy so any node can serve it
+        except Exception:
+            pass
     head_rec = {"author": acc, "handle": handle, "seq": seq, "cid": cid, "ts": int(time.time()),
                 "expires": expires, "sig": sig, "pub": pub}
     pushed = push_head(head_rec)
@@ -172,5 +200,27 @@ elif mode == 'delete':
     json.dump({"ok": True, "cid": cid, "seq": seq, "expires": expires, "post_id": pid,
                "head_msg": f"{acc}|{seq}|{cid}|{expires}"}, open('/tmp/xc_post_result.json', 'w'))
 
+elif mode == 'replicate':
+    # BACKFILL: ensure every live head's content is on the relays as a blob (keyed by CID), so content
+    # posted before replication existed (or held only in the origin's IPFS) is servable from any node.
+    # Idempotent — relays dedup by cid. Safe to run periodically. Reads content via IPFS, then relay.
+    seen = {}
+    for r in RELAYS:
+        try:
+            for h in json.loads(urllib.request.urlopen(r + '/heads', timeout=5).read()).get('heads', []):
+                c = h.get('cid')
+                if c and c not in seen:
+                    seen[c] = h
+        except Exception:
+            pass
+    done = 0
+    for c in seen:
+        data = get_content(c)                          # IPFS origin, else a relay that already has it
+        if data and replicate_content(c, data):
+            done += 1
+    json.dump({"ok": True, "cids": len(seen), "replicated": done},
+              open('/tmp/xc_post_result.json', 'w'))
+    print(json.dumps({"ok": True, "cids": len(seen), "replicated": done}))
+
 else:
-    json.dump({"ok": False, "error": "unknown mode (use prepare|submit|delete)"}, open('/tmp/xc_post_result.json', 'w'))
+    json.dump({"ok": False, "error": "unknown mode (use prepare|submit|delete|replicate)"}, open('/tmp/xc_post_result.json', 'w'))
