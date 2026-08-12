@@ -45,12 +45,12 @@ seed** — and post.  ·  **Read the design** → [`docs/WHITEPAPER.md`](docs/WH
 
 ## Install the app
 
-Download `apk/xchat-alpha.apk` (**v2.2.2**) onto an Android phone and open it (allow "install from
+Download `apk/xchat-alpha.apk` (**v2.2.3**) onto an Android phone and open it (allow "install from
 this source" once). **Verify it first:**
 
 ```
 sha256sum xchat-alpha.apk
-# expected: 9cf23d79f8693568e8bbe24584cac1fc9a7a20c1fbd03e7ec30687d68f16de15
+# expected: 0f715876742d7e1eae16dc22b07668a3db0bf9a7781a77871fd49143dad7c870
 ```
 
 Signing certificate SHA-256: `d3c83e1a08edc6339a95489bce6cd017e10c921272af15429aa07a9919b7788e`

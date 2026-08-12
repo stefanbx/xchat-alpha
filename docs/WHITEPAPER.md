@@ -438,7 +438,9 @@ so if it isn't saved and the app is reinstalled, its funds are unrecoverable (on
 Backup is now **mandatory and verified**: creating a wallet requires re-entering the seed characters at
 random positions *from your written copy* (the seed is hidden during that check) before you can enter the
 app, and an existing wallet is nagged by a persistent banner until it confirms — closing the
-accidental-loss footgun. Still pending: the platform keystore, and gating fund-receipt on a confirmed backup. **Update delivery works but isn't production-grade:** the download comes
+accidental-loss footgun. **Receiving XNO is gated on that confirmed backup** too (the receive QR is
+withheld and the Receive button locked until the seed is secured), so funds can't land in a wallet you
+can't recover. Still pending: moving the seed into the platform keystore. **Update delivery works but isn't production-grade:** the download comes
 direct from a relay and is hash-verified, but the hosted node and relays are small single instances
 that can get busy, so an in-app update can need a retry or two. Moderation labeling is minimal. Network metadata is **not** private (no
 onion routing yet — treat your IP as visible). The node is single-identity-per-instance for the
