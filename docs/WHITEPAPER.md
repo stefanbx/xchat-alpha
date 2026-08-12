@@ -172,10 +172,16 @@ The app updates **itself** through its own network, and — like everything else
 (leak it → everyone gets malware; lose it → updates die), so distribution is designed to not depend
 on any one secret:
 
-- **Reproducible builds.** The APK is a *deterministic* function of the public source: the same
-  commit builds to byte-identical bytes with the same SHA-256. Anyone can rebuild from the open
-  repository and confirm the released binary **is** the published code — so trust rests on the code
-  everyone can read, not on a signature. A malicious binary is caught by anyone who rebuilds.
+- **Reproducible builds.** The APK's *content* is a deterministic function of the public source:
+  the same commit, built on the pinned toolchain, yields the same **content-identity hash** — a hash
+  over every file inside the APK (the Dart AOT snapshot, native libs, assets, dex), deliberately
+  blind to ZIP timestamps, entry order, compression, and the signing key. (A signed `.apk` can't be
+  byte-reproduced by a third party — the signature needs the publisher's private key — so content
+  identity, not file SHA-256, is the right invariant.) Anyone runs `deploy/reproduce/reproduce-docker.sh`
+  and confirms the released binary **is** the published code, so trust rests on the code everyone can
+  read, not on a signature. A malicious binary is caught by anyone who rebuilds. **Shipped:** the
+  hasher, a pinned-toolchain container that builds at a fixed canonical path, and CI that publishes
+  the canonical hash on a native amd64 runner (`.github/workflows/reproduce.yml`).
 - **Plural attestors (K-of-N), user-chosen — the same model as moderation.** Independent maintainers
   each attest "commit X builds to hash H." The client accepts a release backed by at least *K*
   independent attestations, and the user chooses which attestor set to trust. No single key can push
@@ -194,10 +200,13 @@ on any one secret:
 content-addressed releases; the APK pinned + **auto-replicated** across plural relays **and mirrored on
 a hash-verified CDN URL** (fetched first for speed, relays as the fallback); the client **re-verifying
 the SHA-256 on-device** before an explicit-tap install; and an auto-update check (on launch + periodic). It uses a **single publisher key** (held outside the repo; the app pins only
-the public account). The **reproducible builds** and the **K-of-N attestor quorum** described above are
-the *design target*, **not yet shipped** — they are the hardening toward 1.0 (reproducible builds make
-the binary trustless relative to the source; a real quorum needs several independent maintainers).
-Until then the honest trust root for updates is that single pinned key — see §8 and §11.
+the public account). **Reproducible builds are now shipped as tooling** (`deploy/reproduce/`): a
+content-identity hasher, a pinned-toolchain container that builds at a fixed canonical path, and CI
+that publishes the canonical amd64 hash — so the released binary is verifiable against the public
+source today. What remains a *design target* is the **K-of-N attestor quorum** (it needs several
+independent maintainers) and committing release hashes **on-chain**; until those land the honest trust
+root for *who blessed* a release is still that single pinned key, now backed by a source-verifiable
+build — see §8 and §11.
 
 ### How a release propagates — no single domain, no single pusher
 
@@ -294,10 +303,12 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   attestations, and hashes are logged **on-chain** for public auditability. One compromised key can't
   push an update; one lost key doesn't stop them. Honest bootstrap: today the quorum is size-1, but
   the mechanism is plural by design. 🔨
-- **Confirming the APK matches the source.** → **Reproducible builds** + published SHA-256 +
-  on-chain attestations let anyone confirm the binary *is* the open code — trust in the code, not a
-  signer. 🔨 (alpha ships full source + APK SHA-256 + cert fingerprint; reproducibility is the
-  hardening step)
+- **Confirming the APK matches the source.** → **Reproducible builds are shipped**: a pinned-toolchain
+  container rebuilds the APK at a fixed canonical path and `apk_content_hash.py` computes a
+  signature/timestamp-blind **content-identity hash**; CI publishes the canonical amd64 hash and anyone
+  can match it (`deploy/reproduce/`). So the binary is confirmably *the open code*, not a signer's word.
+  ✅ (on-chain attestation logging + a multi-party quorum are the remaining hardening — see the two
+  items above 🔨)
 - **Silent/forced install.** → Installs require an **explicit user tap**; no background auto-install. ✅
 - **Downgrade attack.** → The client keeps the **highest attested** version; an attacker can't forge
   a quorum. ✅
@@ -431,6 +442,13 @@ now shipped:
   pinned across every relay** so an update reaches the whole set on its own. The app **auto-checks for
   updates on launch** (and periodically) and shows a one-tap banner; the APK is fetched **direct from a
   relay** and its SHA-256 re-verified on-device before install — all verified end-to-end on a device.
+- **Reproducible builds (source-verifiable APK).** `deploy/reproduce/` ships a content-identity
+  hasher, a pinned-toolchain container that builds at a fixed canonical path, and a CI workflow that
+  publishes the canonical amd64 content hash. Measured: two clean builds on a fixed toolchain + path
+  produce a byte-identical hash over all 297 in-APK files; the only cross-machine variance is two
+  path-derived entries (the AOT snapshot's embedded source URI and a 20-byte ELF build-id), which the
+  fixed canonical path in the container removes. So anyone can rebuild from the open source and confirm
+  the released binary **is** the published code — trust in an update rests on readable code, not a key.
 
 **How that claim is tested.** `test/interop_test.py` signs one canonical message per write path with
 the *shipped* app wallet (Dart/nanodart) and verifies each with the *shipped* node verifier

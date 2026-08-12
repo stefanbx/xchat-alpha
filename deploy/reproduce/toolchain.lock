@@ -1,0 +1,22 @@
+# Pinned toolchain for reproducing the ӾChat Android APK.
+# reproduce.sh reads this and refuses to build under a mismatched toolchain,
+# because a reproducible build is only meaningful against a fixed toolchain.
+# Fields are "key = value"; blank lines and #-comments ignored.
+
+flutter_version   = 3.44.9
+flutter_revision  = 6b182d2c75
+dart_version      = 3.12.2
+engine_revision   = 5a2a6a42cc
+gradle_version    = 9.1.0
+agp_version       = 9.0.1
+kotlin_version    = 2.3.20
+ndk_version       = 28.2.13676358
+java_major        = 17
+
+# Container reproduction (deploy/reproduce/Dockerfile) — the canonical amd64 build:
+build_platform    = linux/amd64
+base_image        = eclipse-temurin:17-jdk-jammy
+cmdline_tools     = 11076708
+android_platform  = android-36
+build_tools       = 36.0.0
+canonical_path    = /build/xchat

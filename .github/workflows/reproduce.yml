@@ -1,0 +1,60 @@
+name: reproducible-build
+
+# Produces the CANONICAL content-identity hash of the ӾChat APK on a native linux/amd64
+# runner (the reproducible-builds.org / F-Droid convention). This is the number a release
+# publishes and that anyone can match by running deploy/reproduce/reproduce-docker.sh.
+#
+# It builds inside the pinned container at the fixed canonical path /build/xchat, so the
+# hash is independent of who runs it or where. See deploy/reproduce/README.md.
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'app/**'
+      - 'deploy/reproduce/**'
+      - '.github/workflows/reproduce.yml'
+  workflow_dispatch:
+    inputs:
+      expect:
+        description: "Optional: assert the content hash equals this value"
+        required: false
+        default: ""
+
+jobs:
+  content-hash:
+    runs-on: ubuntu-latest   # native linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build reproduction image (pinned toolchain)
+        run: docker build -t xchat-repro deploy/reproduce
+
+      - name: Reproduce the APK at the canonical path and hash its content
+        id: repro
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/out":/out \
+            -e EXPECT="${{ github.event.inputs.expect }}" \
+            xchat-repro | tee repro.log
+          CH=$(grep -m1 '^content_hash:' repro.log | awk '{print $2}')
+          echo "content_hash=$CH" >> "$GITHUB_OUTPUT"
+          {
+            echo "## ӾChat reproducible build"
+            echo ""
+            echo "Built on \`linux/amd64\` at the canonical path \`/build/xchat\`."
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| content_hash | \`$CH\` |"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo ""
+            echo "Reproduce locally: \`REPRO_PLATFORM=linux/amd64 deploy/reproduce/reproduce-docker.sh $CH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reproduced APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: xchat-arm64-reproduced
+          path: out/*.apk
+          if-no-files-found: warn
