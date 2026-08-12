@@ -32,7 +32,7 @@ String kBase = kDefaultBase;
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.1'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.2.2'; // this build; the update checker compares against the signed release.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
 // 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
 // below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)
@@ -228,6 +228,17 @@ class UpdateDismiss {
       (await SharedPreferences.getInstance()).setString(_k, version);
 }
 
+// Whether the user has CONFIRMED (by re-entering characters from their backup) that they saved a
+// wallet's recovery seed. A random-seed wallet whose seed isn't backed up is unrecoverable if the app
+// is reinstalled, so a fresh wallet can't be entered until this is set, and existing wallets are nagged.
+class BackupStore {
+  static String _k(String acct) => 'xchat_backed_up_$acct';
+  static Future<bool> get(String acct) async =>
+      (await SharedPreferences.getInstance()).getBool(_k(acct)) ?? false;
+  static Future<void> set(String acct, bool v) async =>
+      (await SharedPreferences.getInstance()).setBool(_k(acct), v);
+}
+
 // OUTBOX: posts composed while OFFLINE are queued here (persisted across restarts) and auto-flushed
 // when connectivity returns. Each entry carries everything a later Api.post round-trip needs — the
 // head's seq/cid can only be assigned by the node (see the two-step prepare/submit), so we can't
@@ -305,12 +316,17 @@ class OnboardingScreen extends StatefulWidget {
 }
 
 class _OnboardingScreenState extends State<OnboardingScreen> {
-  String _step = 'choose'; // choose | backup | restore
+  String _step = 'choose'; // choose | backup | verify | restore
   String _newSeed = '';
   bool _saved = false;
   final _restoreC = TextEditingController();
   String? _err;
   bool _busy = false;
+  // mandatory backup verification: the user re-enters the seed characters at these positions FROM THEIR
+  // BACKUP (the seed is hidden here), proving they actually saved it — not just ticked a box.
+  List<int> _vpos = [];
+  final _vctl = [TextEditingController(), TextEditingController(), TextEditingController()];
+  String? _verr;
 
   @override
   Widget build(BuildContext context) {
@@ -323,7 +339,9 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
               ? _choose()
               : _step == 'backup'
                   ? _backup()
-                  : _restore(),
+                  : _step == 'verify'
+                      ? _verify()
+                      : _restore(),
         ),
       ),
     );
@@ -383,9 +401,66 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     style: TextStyle(color: kText, fontSize: 14))),
           ]),
         ),
+        const SizedBox(height: 8),
+        const Text("Next you'll confirm a few characters from your backup — the app can't recover this seed for you.",
+            style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
         const Spacer(),
-        _bigBtn(_busy ? 'Setting up…' : 'Enter ӾChat', _saved ? kAccent : kLine,
-            _saved ? Colors.black : kDim, _saved && !_busy ? () => _finish(_newSeed) : null),
+        _bigBtn('Continue', _saved ? kAccent : kLine, _saved ? Colors.black : kDim,
+            _saved ? () => _startVerify() : null),
+      ]);
+
+  void _startVerify() {
+    final rnd = math.Random();
+    // three distinct positions, one from each third of the 64-char seed, so they're spread + locatable
+    final p = <int>[rnd.nextInt(21), 21 + rnd.nextInt(21), 42 + rnd.nextInt(22)];
+    for (final c in _vctl) { c.clear(); }
+    setState(() { _vpos = p; _verr = null; _step = 'verify'; });
+  }
+
+  Widget _verify() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const SizedBox(height: 12),
+        Row(children: [
+          IconButton(
+              onPressed: () => setState(() => _step = 'backup'),
+              icon: const Icon(Icons.arrow_back, color: kText)),
+          const Text('Confirm your backup',
+              style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 22)),
+        ]),
+        const SizedBox(height: 8),
+        const Text('From the seed you just saved, enter the character at each position. (The seed is hidden here on purpose — use your written copy.)',
+            style: TextStyle(color: kDim, fontSize: 13, height: 1.5)),
+        const SizedBox(height: 22),
+        for (int i = 0; i < _vpos.length; i++) Padding(
+          padding: const EdgeInsets.only(bottom: 14),
+          child: Row(children: [
+            SizedBox(width: 120, child: Text('Character #${_vpos[i] + 1}',
+                style: const TextStyle(color: kText, fontSize: 15, fontWeight: FontWeight.w600))),
+            const SizedBox(width: 12),
+            Expanded(child: TextField(
+              controller: _vctl[i],
+              maxLength: 1,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: kAccent, fontFamily: 'monospace', fontSize: 20, letterSpacing: 2),
+              decoration: InputDecoration(
+                  counterText: '', filled: true, fillColor: kCard,
+                  enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: const BorderSide(color: kLine)),
+                  focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: const BorderSide(color: kAccent))),
+            )),
+          ]),
+        ),
+        if (_verr != null) Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(_verr!, style: const TextStyle(color: Color(0xFFEF6C9B), fontSize: 13))),
+        const Spacer(),
+        _bigBtn(_busy ? 'Setting up…' : 'Confirm & enter ӾChat', kAccent, Colors.black, _busy ? null : () {
+          for (int i = 0; i < _vpos.length; i++) {
+            if (_vctl[i].text.trim().toLowerCase() != _newSeed[_vpos[i]].toLowerCase()) {
+              setState(() => _verr = "That doesn't match your seed. Check your written copy (or go back to view it again).");
+              return;
+            }
+          }
+          _finish(_newSeed, backedUp: true);
+        }),
       ]);
 
   Widget _restore() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -428,12 +503,17 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   setState(() => _err = 'That is not a valid 64-hex seed.');
                   return;
                 }
-                _finish(s);
+                _finish(s, backedUp: true);   // they hold the seed already — it IS their backup
               }),
       ]);
 
-  Future<void> _finish(String seed) async {
+  Future<void> _finish(String seed, {bool backedUp = false}) async {
     setState(() => _busy = true);
+    // A restored seed is by definition already backed up (they just typed it in); a created one is
+    // backed up only after the verify step. Either way, record it so money features aren't gated.
+    if (backedUp) {
+      try { await BackupStore.set(NanoWallet(seed).account, true); } catch (_) {}
+    }
     await widget.onDone(seed);
   }
 
@@ -1513,6 +1593,7 @@ class _FeedScreenState extends State<FeedScreen> {
   List<Map<String, dynamic>> _outbox = []; // posts composed OFFLINE, queued + auto-flushed on reconnect
   bool _flushing = false;                  // guards _flushOutbox against re-entrancy
   Map<String, dynamic>? _update;           // a newer signed release found by the launch auto-check
+  bool _needsBackup = false;               // this wallet's seed isn't confirmed backed up (footgun guard)
   Set<String> _follows = {};
   Settings _settings = Settings();
   Map<String, dynamic> _engage = {}; // post_id -> {likes, reposts, tips_raw}
@@ -2634,6 +2715,8 @@ class _FeedScreenState extends State<FeedScreen> {
       final w = NanoWallet(seed);
       if (mounted) setState(() => _wallet = w);
       Api.headKeepUntil = await HeadKeep.get(w.account);   // resume any active keep-alive (issuer pin)
+      final backed = await BackupStore.get(w.account);     // seed confirmed backed up? (footgun guard)
+      if (mounted) setState(() => _needsBackup = !backed);
     }
     Api.dmKeyRegister();   // publish our signed DM public key so peers can encrypt to us
     _initFollows();
@@ -4360,9 +4443,116 @@ class _FeedScreenState extends State<FeedScreen> {
     );
   }
 
+  Widget _backupBanner() {
+    const warn = Color(0xFFE0A63A);
+    return Material(
+      color: warn.withOpacity(0.16),
+      child: InkWell(
+        onTap: _showBackupSheet,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 12, 10),
+          child: Row(children: const [
+            Icon(Icons.warning_amber_rounded, size: 18, color: warn),
+            SizedBox(width: 10),
+            Expanded(child: Text("Back up your recovery seed — it's the only way to recover this wallet. Tap to secure it.",
+                style: TextStyle(color: warn, fontWeight: FontWeight.w600, fontSize: 13))),
+            Icon(Icons.chevron_right, size: 18, color: warn),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  // Show-seed → verify flow for an EXISTING wallet that never confirmed a backup (the footgun guard).
+  void _showBackupSheet() {
+    final w = _wallet;
+    if (w == null) return;
+    final seed = w.seed;
+    String phase = 'show';
+    List<int> vpos = [];
+    final vctl = [TextEditingController(), TextEditingController(), TextEditingController()];
+    String? verr;
+    bool saved = false;
+    Widget bigBtn(String label, bool enabled, VoidCallback? onTap) => SizedBox(width: double.infinity,
+        child: ElevatedButton(onPressed: enabled ? onTap : null,
+            style: ElevatedButton.styleFrom(backgroundColor: enabled ? kAccent : kLine, foregroundColor: enabled ? Colors.black : kDim,
+                padding: const EdgeInsets.symmetric(vertical: 15), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14))),
+            child: Text(label, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700))));
+    showModalBottomSheet(
+      context: context, isScrollControlled: true, backgroundColor: kBg,
+      builder: (_) => StatefulBuilder(builder: (ctx, setSheet) => Padding(
+        padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+        child: Container(padding: const EdgeInsets.all(20),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start,
+            children: phase == 'show'
+              ? [
+                  const Text('Back up your recovery seed', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 20)),
+                  const SizedBox(height: 8),
+                  const Text('This 64-character seed IS your wallet. Write it down and keep it secret — anyone with it controls your account, and nobody can recover it for you.',
+                      style: TextStyle(color: kDim, fontSize: 13, height: 1.5)),
+                  const SizedBox(height: 16),
+                  Container(width: double.infinity, padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(12), border: Border.all(color: kLine)),
+                      child: SelectableText(seed, style: const TextStyle(color: kAccent, fontFamily: 'monospace', fontSize: 15, height: 1.5, letterSpacing: 1))),
+                  const SizedBox(height: 14),
+                  InkWell(onTap: () => setSheet(() => saved = !saved), child: Row(children: [
+                    Icon(saved ? Icons.check_box : Icons.check_box_outline_blank, color: saved ? kAccent : kDim),
+                    const SizedBox(width: 10),
+                    const Expanded(child: Text('I have written it down and stored it safely', style: TextStyle(color: kText, fontSize: 14))),
+                  ])),
+                  const SizedBox(height: 16),
+                  bigBtn('Continue', saved, () {
+                    final rnd = math.Random();
+                    vpos = [rnd.nextInt(21), 21 + rnd.nextInt(21), 42 + rnd.nextInt(22)];
+                    for (final c in vctl) { c.clear(); }
+                    setSheet(() { verr = null; phase = 'verify'; });
+                  }),
+                ]
+              : [
+                  const Text('Confirm your backup', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 20)),
+                  const SizedBox(height: 8),
+                  const Text('Enter the character at each position from your written seed (hidden here on purpose).',
+                      style: TextStyle(color: kDim, fontSize: 13, height: 1.5)),
+                  const SizedBox(height: 18),
+                  for (int i = 0; i < vpos.length; i++) Padding(padding: const EdgeInsets.only(bottom: 12), child: Row(children: [
+                    SizedBox(width: 116, child: Text('Character #${vpos[i] + 1}', style: const TextStyle(color: kText, fontSize: 15, fontWeight: FontWeight.w600))),
+                    const SizedBox(width: 12),
+                    Expanded(child: TextField(controller: vctl[i], maxLength: 1, textAlign: TextAlign.center,
+                        style: const TextStyle(color: kAccent, fontFamily: 'monospace', fontSize: 20, letterSpacing: 2),
+                        decoration: InputDecoration(counterText: '', filled: true, fillColor: kCard,
+                            enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: const BorderSide(color: kLine)),
+                            focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: const BorderSide(color: kAccent))))),
+                  ])),
+                  if (verr != null) Padding(padding: const EdgeInsets.only(top: 2), child: Text(verr!, style: const TextStyle(color: Color(0xFFEF6C9B), fontSize: 13))),
+                  const SizedBox(height: 8),
+                  Align(alignment: Alignment.centerLeft, child: TextButton(onPressed: () => setSheet(() => phase = 'show'),
+                      child: const Text('View seed again', style: TextStyle(color: kDim)))),
+                  const SizedBox(height: 6),
+                  bigBtn('Confirm', true, () async {
+                    for (int i = 0; i < vpos.length; i++) {
+                      if (vctl[i].text.trim().toLowerCase() != seed[vpos[i]].toLowerCase()) {
+                        setSheet(() => verr = "That doesn't match. Check your written seed.");
+                        return;
+                      }
+                    }
+                    await BackupStore.set(w.account, true);
+                    if (mounted) setState(() => _needsBackup = false);
+                    if (ctx.mounted) Navigator.pop(ctx);
+                    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                        backgroundColor: kCard, content: Text('✓ backup confirmed — your wallet is recoverable from your seed')));
+                  }),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+  }
+
   Widget _homeBody() {
     final posts = _homeFeed == 0 ? _forYouPosts() : _homePosts();
     return Column(children: [
+      if (_needsBackup) _backupBanner(),
       if (_update != null) _updateBanner(),
       // For You / Following segmented header (X-style), with a transparency ⓘ
       Container(
