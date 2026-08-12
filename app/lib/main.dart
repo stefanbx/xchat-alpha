@@ -32,10 +32,10 @@ String kBase = kDefaultBase;
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.0'; // this build; the update checker compares against the signed release
-// NB the version JUMPED 0.1.x → 2.2.0 on purpose: the older (keeltube-lineage) app reached ~v2.1.0, so a
-// 0.1.x release looked like a DOWNGRADE to those installs and was never offered. 2.2.0 supersedes every
-// prior lineage. (Cross-lineage installs that pin a different publisher key still need one manual sideload.)
+const String kAppVersion = '2.2.1'; // this build; the update checker compares against the signed release.
+// Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
+// 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
+// below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)
 // Alpha safety cap: the in-app wallet is meant to hold only a small tip float, not savings — so the
 // worst a bad app build could ever steal is small. Keep real funds in your own wallet.
 const double kWalletCapXno = 2.0;
@@ -1316,6 +1316,14 @@ String timeAgo(int ts) {
   return '${s ~/ 86400}d';
 }
 
+// a short, STABLE per-account tag (a discriminator, not a full address) so two accounts that share a
+// handle — e.g. the default "you.xno" everyone starts with — are still distinguishable at a glance.
+// Derived from the account's own pubkey encoding, so it's unforgeable: you can't fake someone's tag.
+String acctTag(String account) {
+  final p = account.startsWith('nano_') ? account.substring(5) : account;
+  return p.length >= 5 ? p.substring(0, 5) : p;
+}
+
 Color avatarColor(String h) {
   int n = 0;
   for (final c in h.codeUnits) {
@@ -1520,7 +1528,7 @@ class _FeedScreenState extends State<FeedScreen> {
   int _supporters = 0;
   final Battery _battery = Battery();
   StreamSubscription? _batSub, _connSub;
-  Timer? _republishTimer, _gossipTimer, _feedTimer;
+  Timer? _republishTimer, _gossipTimer, _feedTimer, _updateTimer;
   int _relayed = 0; // signed heads this phone has propagated (backfilled) this session
   bool get _supporterActive => _supporterOn && _charging && _wifi;
 
@@ -1541,6 +1549,9 @@ class _FeedScreenState extends State<FeedScreen> {
     _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) => Api.republish());
     // quietly poll the feed so posts from OTHER devices appear on their own (no manual refresh)
     _feedTimer = Timer.periodic(const Duration(seconds: 12), (_) => _refreshFeedQuiet());
+    // re-check for a newer release periodically, not only at launch — so a long-lived session still
+    // surfaces the update banner (the launch check is in _bootWallet).
+    _updateTimer = Timer.periodic(const Duration(hours: 4), (_) => _autoCheckUpdate());
   }
 
   @override
@@ -1550,6 +1561,7 @@ class _FeedScreenState extends State<FeedScreen> {
     _republishTimer?.cancel();
     _gossipTimer?.cancel();
     _feedTimer?.cancel();
+    _updateTimer?.cancel();
     _scroll.dispose();
     super.dispose();
   }
@@ -5061,7 +5073,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           const SizedBox(width: 6),
                           const Icon(Icons.verified, size: 17, color: kAccent),
                         ]),
-                        Text('@${widget.handle}', style: const TextStyle(color: kDim, fontSize: 14)),
+                        Text('@${widget.handle} ·${acctTag(widget.account)}',
+                            style: const TextStyle(color: kDim, fontSize: 14)),
                         if (bio.isNotEmpty) Padding(
                           padding: const EdgeInsets.only(top: 10),
                           child: Text(bio, style: const TextStyle(color: kText, fontSize: 14.5, height: 1.4)),
@@ -5369,6 +5382,9 @@ class _PostCardState extends State<PostCard> {
               ),
               const SizedBox(width: 6),
               const Icon(Icons.verified, size: 15, color: kAccent),
+              const SizedBox(width: 5),
+              Text('·${acctTag(p.account)}',   // account discriminator: distinguishes same-handle accounts
+                  style: const TextStyle(color: kDim, fontSize: 11.5, fontFamily: 'monospace')),
               const SizedBox(width: 6),
               Text('· ${timeAgo(p.ts)}', style: const TextStyle(color: kDim, fontSize: 13)),
               const Spacer(),

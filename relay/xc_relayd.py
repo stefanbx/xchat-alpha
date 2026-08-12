@@ -190,6 +190,35 @@ def blob_load_meta():                # startup: rebuild the small RAM index from
         for cid, size, last, tips in _db.execute('SELECT cid,size,last,tips FROM blob'):
             blob_meta[cid] = {'size': size, 'last': last, 'tips': tips or 0.0, 'reports': 0.0}
 
+def ensure_release_blob(cid):
+    # A signed release (an app update) is CRITICAL INFRA — every relay must hold it, independent of tips
+    # or the value-ranked sync budget. So: PIN it (never evict), and if we don't already have the bytes,
+    # pull them from a peer relay that does. Runs in a background thread (a 20 MB pull mustn't block a
+    # request). This is what makes an update propagate to the whole relay set on its own.
+    if not cid:
+        return
+    pinned[cid] = time.time() + 3650 * 86400          # ~never; releases are few (capped per publisher) and small
+    if blob_has(cid):
+        return
+    for r in list(known):
+        if r == SELF or '127.0.0.1' in r or 'localhost' in r:
+            continue                                   # a peer, not ourselves/loopback (we're here BECAUSE we lack it)
+        try:
+            d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + cid, timeout=90).read())
+            if d.get('b64'):
+                blob_put(cid, d['b64'])
+                return
+        except Exception:
+            pass
+
+def sync_release_blobs():
+    # on startup (and after gossip), make sure we hold every known release's bytes — catches a relay that
+    # was down when a release was published.
+    time.sleep(1.0)
+    for _pub, recs in list(releases.items()):
+        for rec in recs:
+            ensure_release_blob(rec.get('cid'))
+
 def grant_pin(cid, payhash):
     # PAY-TO-PIN: verify payhash is a confirmed Nano send TO this relay's account, then protect cid
     # from eviction for a span proportional to the amount. A public ledger read — no key needed, the
@@ -544,9 +573,12 @@ class H(BaseHTTPRequestHandler):
             try:
                 m = json.loads(raw); pub = m['publisher']
                 lst = releases.setdefault(pub, [])
-                if not any(x.get('sig') == m.get('sig') for x in lst):
+                fresh = not any(x.get('sig') == m.get('sig') for x in lst)
+                if fresh:
                     lst.append(m)
                 releases[pub] = lst[-24:]                 # cap; real record survives forged noise
+                if fresh and m.get('cid'):               # a NEW release → pull + pin its bytes so we can serve updates
+                    threading.Thread(target=ensure_release_blob, args=(m['cid'],), daemon=True).start()
                 self._send(200, json.dumps({'ok': True, 'stored': len(releases[pub])}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
@@ -625,4 +657,5 @@ class H(BaseHTTPRequestHandler):
 
 if BOOTSTRAPS:
     threading.Thread(target=bootstrap, daemon=True).start()
+threading.Thread(target=sync_release_blobs, daemon=True).start()   # catch up on any release bytes we're missing
 ThreadingHTTPServer((BIND, PORT), H).serve_forever()
