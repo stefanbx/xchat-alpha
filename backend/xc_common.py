@@ -43,26 +43,48 @@ def _transport_err(r):
     return not any(k in e for k in _NANO_ERRS)
 
 _session = [None]
+def _get_session():
+    # One shared, thread-safe requests.Session (urllib3 connection pool) for ALL outbound HTTP — the Nano
+    # RPC AND the relay fan-out. Keep-alive avoids a fresh TCP+TLS handshake per call (measured on the
+    # node: 0.5s->0.11s for the RPC). In the long-lived kt_server process it's reused across requests; in
+    # a spawned helper it's reused across the parallel fan-out. Raises ImportError if requests is absent.
+    if _session[0] is None:
+        import requests
+        from requests.adapters import HTTPAdapter
+        s = requests.Session()
+        ad = HTTPAdapter(pool_connections=16, pool_maxsize=64, max_retries=0)
+        s.mount('http://', ad); s.mount('https://', ad)
+        _session[0] = s
+    return _session[0]
+
 def _post_json(url, obj, timeout=20):
-    # Keep-alive HTTP: a fresh TCP+TLS handshake per RPC cost ~0.35s to a public node (measured: fresh
-    # 0.5s/call vs pooled 0.15s/call). A shared requests.Session pools connections per host — in the
-    # long-lived kt_server process it reuses them ACROSS requests (money-path account_state/receivables
-    # can't be cached, so this is their main win); within a spawned helper it reuses across the parallel
-    # RPC batch. Falls back to urllib if requests is somehow absent.
-    hdr = {'Content-Type': 'application/json', 'User-Agent': 'xchat-node/0.1'}
+    hdr = {'Content-Type': 'application/json', 'User-Agent': 'xchat-node/0.1'}   # public RPCs 403 the default UA
     data = json.dumps(obj).encode()
     try:
-        if _session[0] is None:
-            import requests
-            from requests.adapters import HTTPAdapter
-            s = requests.Session()
-            ad = HTTPAdapter(pool_connections=8, pool_maxsize=32, max_retries=0)
-            s.mount('http://', ad); s.mount('https://', ad)
-            _session[0] = s
-        return _session[0].post(url, data=data, headers=hdr, timeout=timeout).json()
+        return _get_session().post(url, data=data, headers=hdr, timeout=timeout).json()
     except ImportError:
-        return json.loads(urllib.request.urlopen(
-            urllib.request.Request(url, data, hdr), timeout=timeout).read())
+        return json.loads(urllib.request.urlopen(urllib.request.Request(url, data, hdr), timeout=timeout).read())
+
+# Pooled relay helpers (keep-alive). Relay reads/writes go through these so the fan-out reuses connections.
+def http_get_json(url, timeout=4):
+    try:
+        return _get_session().get(url, timeout=timeout).json()
+    except ImportError:
+        return json.loads(urllib.request.urlopen(url, timeout=timeout).read())
+
+def http_get_bytes(url, timeout=4):
+    try:
+        return _get_session().get(url, timeout=timeout).content
+    except ImportError:
+        return urllib.request.urlopen(url, timeout=timeout).read()
+
+def http_post_json(url, obj, timeout=4):
+    hdr = {'Content-Type': 'application/json'}
+    data = json.dumps(obj).encode()
+    try:
+        return _get_session().post(url, data=data, headers=hdr, timeout=timeout).json()
+    except ImportError:
+        return json.loads(urllib.request.urlopen(urllib.request.Request(url, data, hdr), timeout=timeout).read())
 
 def rpc(o):
     # public mainnet RPCs (e.g. rpc.nano.to) reject the default python User-Agent with 403 — send one.
@@ -277,9 +299,9 @@ def aggregate_reports(relays):
     # Returns post_id -> {'weight' (sum of its reporters' propagated trust), 'count', 'cid'}.
     per = {}                                                # pid -> {'accts': set(acc), 'cid': cid}
     reporters = {}                                          # acc -> set(pid) they reported
-    def _fetch(r):                                          # /reports from one relay (network I/O)
+    def _fetch(r):                                          # /reports from one relay (network I/O, pooled)
         try:
-            return json.loads(urllib.request.urlopen(r + '/reports', timeout=4).read()).get('reports', {})
+            return http_get_json(r + '/reports', timeout=4).get('reports', {})
         except Exception:
             return None
     fetched = []
