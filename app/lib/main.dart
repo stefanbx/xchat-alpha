@@ -32,7 +32,7 @@ String kBase = kDefaultBase;
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.2'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.2.3'; // this build; the update checker compares against the signed release.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
 // 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
 // below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)
@@ -2945,11 +2945,31 @@ class _FeedScreenState extends State<FeedScreen> {
               child: Text(_account, style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 12)),
             ),
             const SizedBox(height: 4),
-            const Text('tap to copy · share it to receive XNO from another wallet',
-                style: TextStyle(color: kDim, fontSize: 11)),
+            Text(_needsBackup ? 'tap to copy · this is your public identity' : 'tap to copy · share it to receive XNO from another wallet',
+                style: const TextStyle(color: kDim, fontSize: 11)),
             const SizedBox(height: 14),
-            // Receive QR: scan with any Nano wallet to send XNO to this account (mainnet).
-            Center(
+            // RECEIVE-GATE: bringing XNO into a wallet with NO backup risks the funds (a random seed, no
+            // recovery). So the receive QR is withheld until the seed is confirmed backed up.
+            if (_needsBackup)
+              InkWell(
+                onTap: () { Navigator.pop(ctx); _showBackupSheet(); },
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                      color: const Color(0xFFE0A63A).withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFFE0A63A).withOpacity(0.45))),
+                  child: Row(children: const [
+                    Icon(Icons.lock_outline, size: 18, color: Color(0xFFE0A63A)),
+                    SizedBox(width: 10),
+                    Expanded(child: Text("Back up your seed to receive XNO — a wallet with no backup can't be recovered. Tap to secure it.",
+                        style: TextStyle(color: Color(0xFFE0A63A), fontSize: 12.5, fontWeight: FontWeight.w600))),
+                    Icon(Icons.chevron_right, size: 18, color: Color(0xFFE0A63A)),
+                  ]),
+                ),
+              )
+            else Center(
               child: Column(children: [
                 Container(
                   padding: const EdgeInsets.all(10),
@@ -3005,6 +3025,9 @@ class _FeedScreenState extends State<FeedScreen> {
               Expanded(
                 child: OutlinedButton.icon(
                   onPressed: () async {
+                    if (_needsBackup) {   // don't claim funds into an unrecoverable wallet — back up first
+                      Navigator.pop(ctx); _showBackupSheet(); return;
+                    }
                     final r = await Api.receive();
                     await _load();
                     if (mounted) setSheet(() {});
@@ -3016,8 +3039,10 @@ class _FeedScreenState extends State<FeedScreen> {
                             ? '⬇ claimed $n incoming block${n == 1 ? '' : 's'}'
                             : 'nothing to receive right now')));
                   },
-                  style: OutlinedButton.styleFrom(foregroundColor: kText, side: const BorderSide(color: kLine)),
-                  icon: const Icon(Icons.arrow_downward, size: 18),
+                  style: OutlinedButton.styleFrom(
+                      foregroundColor: _needsBackup ? kDim : kText,
+                      side: BorderSide(color: _needsBackup ? const Color(0xFFE0A63A).withOpacity(0.5) : kLine)),
+                  icon: Icon(_needsBackup ? Icons.lock_outline : Icons.arrow_downward, size: 18),
                   label: const Text('Receive', style: TextStyle(fontWeight: FontWeight.w800)),
                 ),
               ),
