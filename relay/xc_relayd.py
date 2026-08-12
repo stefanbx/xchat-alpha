@@ -32,6 +32,10 @@ if not RELAY_ACCT and xc is not None:
     except Exception:
         RELAY_ACCT = ''
 engage = {}                                    # post_id -> {"likes": n, "tips_raw": int}
+# The pinned app-update publisher (public by nature). A joining relay backfills this publisher's
+# signed release records so it can serve updates immediately — the relay verifies nothing (clients do).
+PUBLISHER_ACCT = os.environ.get('XC_PUBLISHER_ACCOUNT',
+    'nano_3nefzmwosgqdo97pt6rzjiiazrgx5sf58eksbsbbhrmca7cg3fxisora1dp8')
 BOOTSTRAPS = sys.argv[3:]
 heads = {}
 notifs = {}
@@ -218,6 +222,52 @@ def sync_release_blobs():
     for _pub, recs in list(releases.items()):
         for rec in recs:
             ensure_release_blob(rec.get('cid'))
+
+def backfill():
+    # SYNC ON JOIN. bootstrap() learns the peer list but pulls no content, so a freshly launched
+    # relay used to come up blank and only accumulate what was pushed to it AFTER joining — it never
+    # mirrored the existing feed. Here a joining relay PULLS the current state from its peers so it
+    # catches up to the network. Heads (the feed) and signed release records (app updates) are the
+    # load-bearing state and both have bulk GETs; the relay verifies neither (clients/node do — same
+    # trust model as /push), so a peer can only fail to serve, never forge what we store.
+    time.sleep(1.5)                                   # let bootstrap() populate `known` first
+    peers = [r for r in list(known)
+             if r != SELF and '127.0.0.1' not in r and 'localhost' not in r]
+    # --- heads: newest-wins merge, identical rule to /push ---
+    for r in peers:
+        try:
+            d = json.loads(urllib.request.urlopen(r + '/heads', timeout=8).read())
+        except Exception:
+            continue
+        with _heads_lock:
+            for h in d.get('heads', []):
+                a = h.get('author')
+                if not a:
+                    continue
+                cur = heads.get(a)
+                if cur is None and len(heads) >= MAX_HEADS:
+                    heads.pop(min(heads, key=lambda x: head_score(x, heads[x])), None)
+                    cur = None
+                if cur is None or h.get('seq', 0) > cur.get('seq', 0) \
+                        or h.get('expires', 0) > cur.get('expires', 0):
+                    heads[a] = h
+    # --- releases: dedup by sig, then pull + pin each release's bytes so we can serve updates ---
+    for r in peers:
+        try:
+            d = json.loads(urllib.request.urlopen(r + '/releases?pub=' + PUBLISHER_ACCT, timeout=8).read())
+        except Exception:
+            continue
+        for m in d.get('records', []):
+            pub = m.get('publisher')
+            if not pub:
+                continue
+            lst = releases.setdefault(pub, [])
+            if not any(x.get('sig') == m.get('sig') for x in lst):
+                lst.append(m)
+            releases[pub] = lst[-24:]
+            if m.get('cid'):
+                threading.Thread(target=ensure_release_blob, args=(m['cid'],), daemon=True).start()
+    mark_dirty()                                      # persist the caught-up state
 
 def grant_pin(cid, payhash):
     # PAY-TO-PIN: verify payhash is a confirmed Nano send TO this relay's account, then protect cid
@@ -657,5 +707,6 @@ class H(BaseHTTPRequestHandler):
 
 if BOOTSTRAPS:
     threading.Thread(target=bootstrap, daemon=True).start()
+    threading.Thread(target=backfill, daemon=True).start()         # pull peers' heads + releases so a joining relay mirrors the net
 threading.Thread(target=sync_release_blobs, daemon=True).start()   # catch up on any release bytes we're missing
 ThreadingHTTPServer((BIND, PORT), H).serve_forever()
