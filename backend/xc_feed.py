@@ -3,21 +3,25 @@
 # signature and its key↔author binding, keep the HIGHEST valid seq per author (mutable
 # head resolution), then fetch each author's content by CID. One relay down / stale /
 # forging a head cannot break or censor the feed.
-import json, subprocess, os, base64, urllib.request
+import json, subprocess, os, base64, urllib.request, urllib.parse
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 spec = importlib.util.spec_from_file_location("xc_common", os.path.join(os.path.dirname(__file__), "xc_common.py"))
 xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
 
 RELAYS = xc.discover_relays()          # find the relay set from a bootstrap — no hardcoding
+WORKERS = int(os.environ.get('XC_FEED_WORKERS', '16'))   # parallel fan-out for relay + content fetches
 
 def get_content(cid):                  # content by CID: IPFS origin, else a relay CACHE (survives origin loss)
     try:
-        return subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': xc.IPFS_PATH}, timeout=8)
+        # ipfs runs --offline here, so a missing block fails FAST (no DHT); a low timeout just caps the
+        # rare slow local read. The old 8s cap × serial-per-post was the feed's cold-start bottleneck.
+        return subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': xc.IPFS_PATH}, timeout=3)
     except Exception:
         pass
     for r in RELAYS:
         try:
-            d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + cid, timeout=4).read())
+            d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + urllib.parse.quote(cid, safe=''), timeout=4).read())
             if d.get('b64'):
                 return base64.b64decode(d['b64'])
         except Exception:
@@ -30,15 +34,21 @@ def verify(pub, msg, sig):
     except Exception:
         return False
 
+def fetch_heads(r):                    # returns a head list, or None if the relay is down/slow
+    try:
+        return json.loads(urllib.request.urlopen(r + '/heads', timeout=4).read()).get('heads', [])
+    except Exception:
+        return None
+
+# PARALLEL relay fan-out: pull /heads from every relay at once (was a serial loop — N × round-trip).
 up = 0
 heads = []
-for r in RELAYS:
-    try:
-        d = json.loads(urllib.request.urlopen(r + '/heads', timeout=4).read())
-        up += 1
-        heads += d.get('heads', [])
-    except Exception:
-        pass
+if RELAYS:
+    with ThreadPoolExecutor(max_workers=min(WORKERS, len(RELAYS))) as ex:
+        for res in ex.map(fetch_heads, RELAYS):
+            if res is not None:
+                up += 1
+                heads += res
 
 import time
 now = time.time()
@@ -63,14 +73,18 @@ for h in heads:
 TAKEDOWN_W = float(os.environ.get('XC_TAKEDOWN_WEIGHT', '2'))
 taken = {pid for pid, e in xc.aggregate_reports(RELAYS).items() if e['weight'] >= TAKEDOWN_W}
 
+# PARALLEL content fetch: each author's content is fetched independently (IPFS, then relay cache), so
+# fetch them all at once instead of serially — this was the dominant cold-start cost (per-post I/O × N).
+best_heads = list(best.values())
 posts = []
-for h in best.values():
-    data = get_content(h['cid'])
-    if data:
-        try:
-            posts += [p for p in json.loads(data).get('posts', []) if p.get('id') not in taken]
-        except Exception:
-            pass
+if best_heads:
+    with ThreadPoolExecutor(max_workers=min(WORKERS, len(best_heads))) as ex:
+        for data in ex.map(lambda h: get_content(h['cid']), best_heads):
+            if data:
+                try:
+                    posts += [p for p in json.loads(data).get('posts', []) if p.get('id') not in taken]
+                except Exception:
+                    pass
 posts.sort(key=lambda p: p.get('ts', 0), reverse=True)
 # ATOMIC write: a reader (api_feed) must never see this file half-written, or the feed blinks empty.
 json.dump({"feed": "XChat", "posts": posts, "relays_up": up, "relays_total": len(RELAYS),

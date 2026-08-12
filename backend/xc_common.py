@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Shared helpers for the ӾChat per-user-thread backend (dev Nano network + IPFS).
 import json, subprocess, urllib.request, urllib.parse, base64, hashlib, os, time, ipaddress
+from concurrent.futures import ThreadPoolExecutor
 # Nano RPC endpoint(s). XC_NANO_RPC may be ONE url or a comma-separated list; defaults to the local
 # dev node. When a PUBLIC mainnet RPC is configured, known-good public fallbacks are appended —
 # because any single datacenter-hosted RPC (rpc.nano.to did, from Fly) can throttle or block a
@@ -61,6 +62,26 @@ def rpc(o):
         _rpc_good[0] = i
         return r
     raise last if last is not None else RuntimeError('no Nano RPC endpoint reachable')
+
+_rpc_cache = {}
+_RPC_CACHE_MAX = 5000
+def rpc_cached(o, ttl=8.0):
+    # A short-TTL cache for SLOW-CHANGING, DISPLAY-only ledger reads (the balance shown in the UI, the
+    # chain height). Each public-RPC round-trip costs ~0.66s, and these values are fine a few seconds
+    # stale. NEVER use this for block-building reads: a stale frontier/balance would build a block the
+    # ledger rejects — those must call rpc() directly. Keyed by the exact request; errors aren't cached
+    # (so a freshly-opened/funded account appears without waiting out the TTL).
+    key = json.dumps(o, sort_keys=True)
+    now = time.time()
+    c = _rpc_cache.get(key)
+    if c and now - c[1] < ttl:
+        return c[0]
+    r = rpc(o)
+    if not (isinstance(r, dict) and 'error' in r):
+        if len(_rpc_cache) >= _RPC_CACHE_MAX:
+            _rpc_cache.pop(next(iter(_rpc_cache)), None)
+        _rpc_cache[key] = (r, now)
+    return r
 
 IPFS_PATH = os.environ.get('IPFS_PATH', '/tmp/ipfsB')
 
@@ -199,10 +220,17 @@ def aggregate_reports(relays):
     # Returns post_id -> {'weight' (sum of its reporters' propagated trust), 'count', 'cid'}.
     per = {}                                                # pid -> {'accts': set(acc), 'cid': cid}
     reporters = {}                                          # acc -> set(pid) they reported
-    for r in relays:
+    def _fetch(r):                                          # /reports from one relay (network I/O)
         try:
-            d = json.loads(urllib.request.urlopen(r + '/reports', timeout=4).read()).get('reports', {})
+            return json.loads(urllib.request.urlopen(r + '/reports', timeout=4).read()).get('reports', {})
         except Exception:
+            return None
+    fetched = []
+    if relays:                                              # PARALLEL fan-out (was a serial per-relay loop)
+        with ThreadPoolExecutor(max_workers=min(16, len(relays))) as ex:
+            fetched = list(ex.map(_fetch, relays))
+    for d in fetched:
+        if d is None:
             continue
         for pid, recs in (d or {}).items():
             for acc, rec in (recs or {}).items():
@@ -542,17 +570,25 @@ def acct_seed():                         # account address -> seed byte (for dem
     return {acct(sb): sb for sb in SEEDMAP.values()}
 
 def discover_relays(bootstrap=None):     # gossip BFS: follow /relays from a bootstrap to the full set
+    # Parallel by LEVEL: fetch /relays from the whole current frontier at once, then descend. This runs
+    # on every helper spawn, and a serial BFS paid one round-trip PER relay (~N × RTT); a wave-parallel
+    # BFS pays one round-trip per HOP (the graph converges in 1-2 hops), so it's the slowest single call.
     seed = list(bootstrap or BOOTSTRAP)
-    seen = set(seed); found = set()
-    queue = list(seed)
-    while queue:
-        u = queue.pop()
+    seen = set(seed); found = set(); frontier = list(seed)
+    def _q(u):
         try:
-            d = json.loads(urllib.request.urlopen(u + '/relays', timeout=3).read())
-            found.add(u)
-            for r in d.get('relays', []):
-                if r not in seen and is_safe_relay_url(r):   # SSRF: don't chase gossiped internal targets
-                    seen.add(r); queue.append(r)
+            return u, json.loads(urllib.request.urlopen(u + '/relays', timeout=3).read()).get('relays', [])
         except Exception:
-            pass
+            return u, None
+    while frontier:
+        nxt = []
+        with ThreadPoolExecutor(max_workers=min(16, len(frontier))) as ex:
+            for u, relays in ex.map(_q, frontier):
+                if relays is None:
+                    continue
+                found.add(u)
+                for r in relays:
+                    if r not in seen and is_safe_relay_url(r):   # SSRF: don't chase gossiped internal targets
+                        seen.add(r); nxt.append(r)
+        frontier = nxt
     return sorted(found) if found else list(seed)

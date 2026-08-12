@@ -67,7 +67,7 @@ def api_me(acct):
     bal = '0'
     if acct:
         try:
-            ai = xc.rpc({'action': 'account_info', 'account': acct})
+            ai = xc.rpc_cached({'action': 'account_info', 'account': acct})  # display balance; a few s stale is fine
             bal = ai.get('balance', '0') if 'error' not in ai else '0'
         except Exception:
             bal = '0'
@@ -236,7 +236,7 @@ def api_head(acct):
 
 def api_status():
     try:
-        bc = xc.rpc({'action': 'block_count'})
+        bc = xc.rpc_cached({'action': 'block_count'}, ttl=10)  # chain height for display; 10s stale is invisible
         return json.dumps({'online': True, 'height': bc.get('count', '0')})
     except Exception:
         return '{"online":false}'
