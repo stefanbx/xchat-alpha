@@ -433,10 +433,12 @@ record is accepted and lands on the relay, and that a **tampered** one is refuse
 
 **Honest limits.** The seed is stored in the app's private `SharedPreferences`, which is not
 hardware-backed — a rooted or physically compromised phone can read it (moving to the platform
-keystore is the next step). **Wallet recovery is *only* your seed backup, and today's backup step is
-optional — a real footgun:** a wallet is a random seed, so if it isn't saved and the app is reinstalled,
-its funds are unrecoverable on-chain-but-unspendable. Mandatory-backup UX (and keystore storage) is a
-priority before wider use. **Update delivery works but isn't production-grade:** the download comes
+keystore is the next step). **Wallet recovery is *only* your seed backup** — a wallet is a random seed,
+so if it isn't saved and the app is reinstalled, its funds are unrecoverable (on-chain but unspendable).
+Backup is now **mandatory and verified**: creating a wallet requires re-entering the seed characters at
+random positions *from your written copy* (the seed is hidden during that check) before you can enter the
+app, and an existing wallet is nagged by a persistent banner until it confirms — closing the
+accidental-loss footgun. Still pending: the platform keystore, and gating fund-receipt on a confirmed backup. **Update delivery works but isn't production-grade:** the download comes
 direct from a relay and is hash-verified, but the hosted node and relays are small single instances
 that can get busy, so an in-app update can need a retry or two. Moderation labeling is minimal. Network metadata is **not** private (no
 onion routing yet — treat your IP as visible). The node is single-identity-per-instance for the
