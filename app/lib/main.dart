@@ -215,6 +215,22 @@ class BookmarkStore {
       (await SharedPreferences.getInstance()).setStringList(_k, s.toList());
 }
 
+// OUTBOX: posts composed while OFFLINE are queued here (persisted across restarts) and auto-flushed
+// when connectivity returns. Each entry carries everything a later Api.post round-trip needs — the
+// head's seq/cid can only be assigned by the node (see the two-step prepare/submit), so we can't
+// pre-sign the head offline; instead we hold the signed-when-sent COMPOSE INTENT and replay it, keeping
+// the original compose timestamp so ordering is preserved.
+class Outbox {
+  static const _k = 'xchat_outbox';
+  static Future<List<Map<String, dynamic>>> load() async =>
+      ((await SharedPreferences.getInstance()).getStringList(_k) ?? <String>[])
+          .map((e) => (jsonDecode(e) as Map).cast<String, dynamic>())
+          .toList();
+  static Future<void> saveAll(List<Map<String, dynamic>> items) async =>
+      (await SharedPreferences.getInstance())
+          .setStringList(_k, items.map((e) => jsonEncode(e)).toList());
+}
+
 bool validSeed(String s) => RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(s.trim());
 
 // gate: no seed → onboarding; seed → activate wallet on the engine, then the app
@@ -441,6 +457,7 @@ class Post {
   final int ts, likes, reposts;
   int localLikes;
   bool liked;
+  bool pending = false; // a locally-queued (offline) post not yet sent to any relay
   Post(this.id, this.handle, this.account, this.kind, this.text, this.title,
       this.media, this.thumb, this.dur, this.ts, this.likes, this.reposts,
       {this.quote, this.replyTo, this.poll})
@@ -892,22 +909,26 @@ class Api {
   // node assembles the thread, pins it, and returns the content CID + head seq; (2) sign the head
   // "account|seq|cid|expires" locally + POST to /api/post_submit — the node verifies + gossips it.
   // The seed never leaves the device; the node only assembles content and relays signed records.
-  static Future<String> post(String text, {String handle = 'you.xno', String media = '', String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = ''}) async {
+  static Future<String> post(String text, {String handle = 'you.xno', String media = '', String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = '', int? ts}) async {
     final w = gWallet;
     if (w == null) return '';
-    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    ts ??= DateTime.now().millisecondsSinceEpoch ~/ 1000;   // a flushed queued post keeps its compose time
     final mk = (mediaKind == 'photo' || mediaKind == 'movie') ? mediaKind : 'movie';
     final kind = poll.isNotEmpty ? 'poll' : (title.isNotEmpty ? 'article' : (media.isNotEmpty ? mk : 'post'));
     final id = 'u$ts';
     final pollOpts = poll.isEmpty ? <String>[] : poll.split('|').where((o) => o.trim().isNotEmpty).toList();
     final es = w.signMsg(w.postEventMsg(handle, kind, text, ts));   // sign the post event on-device
     try {
-      // 1) prepare — node verifies the event, builds + pins the thread, returns the CID/seq to sign
+      // 1) prepare — node verifies the event, builds + pins the thread, returns the CID/seq to sign.
+      // A timeout matters for the OFFLINE OUTBOX: a reconnect attempt fired while the link is still
+      // validating must FAIL FAST so the retry can re-send once the network is really up, instead of
+      // hanging on a dead socket for a minute.
+      const t = Duration(seconds: 15);
       final pr = await http.post(Uri.parse('$kBase/api/post_prepare'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({'id': id, 'handle': handle, 'account': w.account, 'kind': kind, 'text': text,
                             'ts': ts, 'media': media, 'title': title, 'quote': quote, 'reply_to': replyTo,
-                            'poll': pollOpts, 'sig': es['sig'], 'pub': es['pub']}));
+                            'poll': pollOpts, 'sig': es['sig'], 'pub': es['pub']})).timeout(t);
       final pj = jsonDecode(pr.body);
       if (pj['ok'] != true) return '';
       final seq = pj['seq'] as int;
@@ -918,7 +939,7 @@ class Api {
       final sr = await http.post(Uri.parse('$kBase/api/post_submit'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({'author': w.account, 'handle': handle, 'seq': seq, 'cid': cid,
-                            'expires': expires, 'sig': hs['sig'], 'pub': hs['pub']}));
+                            'expires': expires, 'sig': hs['sig'], 'pub': hs['pub']})).timeout(t);
       return jsonDecode(sr.body)['ok'] == true ? id : '';
     } catch (_) {
       return '';
@@ -1435,6 +1456,8 @@ class _FeedScreenState extends State<FeedScreen> {
   double _autoThreshold = 0.05, _autoCap = 1.0, _autoSpent = 0.0;
   int _tab = 0; // 0 = Home, 1 = Discover (everyone + search)
   int _homeFeed = 0; // 0 = For You (ranked), 1 = Following (chronological)
+  List<Map<String, dynamic>> _outbox = []; // posts composed OFFLINE, queued + auto-flushed on reconnect
+  bool _flushing = false;                  // guards _flushOutbox against re-entrancy
   Set<String> _follows = {};
   Settings _settings = Settings();
   Map<String, dynamic> _engage = {}; // post_id -> {likes, reposts, tips_raw}
@@ -1579,7 +1602,30 @@ class _FeedScreenState extends State<FeedScreen> {
     _connSub = Connectivity().onConnectivityChanged.listen((r) {
       setState(() => _wifi = wifiFrom(r));
       _syncSupporter();
+      if (_onlineFrom(r)) _retryFlush();     // connectivity is back → send anything queued offline
     });
+  }
+
+  bool _onlineFrom(List<ConnectivityResult> r) =>
+      r.isNotEmpty && r.any((x) => x != ConnectivityResult.none);
+  Future<bool> _onlineNow() async =>
+      _onlineFrom(await Connectivity().checkConnectivity());
+
+  // A "connectivity regained" event often arrives while the link is still validating (wifi shows "!"),
+  // so a single flush attempt can fail fast. Retry a few times with backoff until the queue drains.
+  bool _retrying = false;
+  Future<void> _retryFlush() async {
+    if (_retrying) return;
+    _retrying = true;
+    try {
+      for (final d in const [Duration.zero, Duration(seconds: 2), Duration(seconds: 5), Duration(seconds: 10)]) {
+        await Future.delayed(d);
+        if (_outbox.isEmpty || gWallet == null) return;
+        if (await _onlineNow()) await _flushOutbox();
+      }
+    } finally {
+      _retrying = false;
+    }
   }
 
   // register/deregister as a supporter, and start/stop the actual serving work
@@ -2532,6 +2578,66 @@ class _FeedScreenState extends State<FeedScreen> {
     }
     Api.dmKeyRegister();   // publish our signed DM public key so peers can encrypt to us
     _initFollows();
+    _outbox = await Outbox.load();          // restore anything queued offline in a previous session
+    if (mounted) setState(() {});
+    _flushOutbox();                          // and try to send it now (best-effort; no-op if offline)
+  }
+
+  // ---- OFFLINE OUTBOX: queue posts composed offline, auto-flush on reconnect ----
+  // Replay one queued compose intent through the normal Api path. Returns false on any failure
+  // (offline / node error) so the caller keeps it queued and retries later.
+  Future<bool> _sendJob(Map<String, dynamic> job) async {
+    String mediaCid = '';
+    final b64 = job['mediaB64'] as String?;
+    if (b64 != null && b64.isNotEmpty) {
+      mediaCid = await Api.blobPut(base64Decode(b64)) ?? '';
+      if (mediaCid.isEmpty) return false;                     // media upload needs the network
+    }
+    final segs = (job['segments'] as List).cast<String>();
+    final pollCsv = ((job['poll'] as List?)?.cast<String>() ?? const <String>[]).join('|');
+    String prev = '';
+    for (int i = 0; i < segs.length; i++) {
+      final id = await Api.post(segs[i], handle: job['handle'] as String,
+          media: i == 0 ? mediaCid : '', mediaKind: i == 0 ? (job['mediaKind'] as String? ?? '') : '',
+          quote: i == 0 ? (job['quote'] as String? ?? '') : '', replyTo: i == 0 ? '' : prev,
+          title: i == 0 ? (job['title'] as String? ?? '') : '', poll: i == 0 ? pollCsv : '',
+          ts: (job['ts'] as int?));                            // keep the original compose time + order
+      if (id.isEmpty) return false;
+      prev = id;
+    }
+    return true;
+  }
+
+  // Send queued posts oldest-first; stop at the first that won't go (still offline) and keep the rest.
+  Future<void> _flushOutbox() async {
+    if (_flushing || _outbox.isEmpty || gWallet == null) return;
+    _flushing = true;
+    int sent = 0;
+    try {
+      while (_outbox.isNotEmpty) {
+        final ok = await _sendJob(_outbox.first);
+        if (!ok) break;                                        // still offline / failed — try again later
+        _outbox.removeAt(0);
+        await Outbox.saveAll(_outbox);
+        sent++;
+        if (mounted) setState(() {});
+      }
+    } finally {
+      _flushing = false;
+    }
+    if (sent > 0) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            backgroundColor: kCard,
+            content: Text('sent $sent queued post${sent == 1 ? '' : 's'}')));
+      }
+      await _load();                                           // pull the now-sent posts into the feed
+    }
+  }
+
+  void _discardQueued(Map<String, dynamic> job) {
+    setState(() => _outbox.remove(job));
+    Outbox.saveAll(_outbox);
   }
 
   // load local follows, then merge the portable (signed, relay-published) list so a
@@ -3844,38 +3950,48 @@ class _FeedScreenState extends State<FeedScreen> {
       builder: (_) => ComposeSheet(handle: _handle, account: _account, quotedPost: quotedPost),
     );
     if (res == null || res.segments.isEmpty) return;
-    // upload any attachment first → content-addressed cid pinned to the relays
-    String mediaCid = '';
-    if (res.mediaBytes != null) {
+    // Build the compose intent. The head signs a node-assigned CID+seq that only exist after the node
+    // assembles the thread, so a post can't be fully signed offline — instead we hold the intent and
+    // replay it (Api.post) when we're back online, keeping the compose timestamp so order is preserved.
+    final job = <String, dynamic>{
+      'lid': 'o${DateTime.now().millisecondsSinceEpoch}',
+      'ts': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      'handle': _handle,
+      'segments': res.segments,
+      'title': res.title,
+      'quote': res.quote,
+      'mediaKind': res.mediaBytes != null ? res.mediaKind : '',
+      'mediaB64': res.mediaBytes != null ? base64Encode(res.mediaBytes!) : '',
+      'poll': res.pollOptions,
+    };
+    final n = res.segments.length;
+
+    // OFFLINE → queue immediately (don't lose the post). Flushes automatically on reconnect.
+    if (!await _onlineNow()) {
+      setState(() => _outbox.insert(0, job));
+      await Outbox.saveAll(_outbox);
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          duration: Duration(milliseconds: 1200), backgroundColor: kCard, content: Text('uploading media…')));
-      mediaCid = await Api.blobPut(res.mediaBytes!) ?? '';
-      if (mediaCid.isEmpty) {
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            duration: const Duration(seconds: 6),
-            backgroundColor: kCard, content: Text('media upload failed: ${Api.lastBlobErr ?? '?'}')));
-        return;
-      }
+          backgroundColor: kCard,
+          content: Text('you\'re offline — queued · will send when you\'re back online')));
+      return;
     }
-    // post segments in order; each later post links (reply_to) to the previous → a signed thread
-    String prev = '';
-    bool ok = true;
-    for (int i = 0; i < res.segments.length; i++) {
-      final id = await Api.post(res.segments[i], handle: _handle,
-          media: i == 0 ? mediaCid : '', mediaKind: i == 0 ? res.mediaKind : '',
-          quote: i == 0 ? res.quote : '', replyTo: i == 0 ? '' : prev,
-          title: i == 0 ? res.title : '',
-          poll: i == 0 ? res.pollOptions.join('|') : '');
-      if (id.isEmpty) { ok = false; break; }
-      prev = id;
+
+    if (res.mediaBytes != null && mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        duration: Duration(milliseconds: 1200), backgroundColor: kCard, content: Text('uploading media…')));
+    final ok = await _sendJob(job);
+    if (!ok) {
+      // online but the send failed (e.g. dropped mid-flight) → queue it rather than lose it
+      setState(() => _outbox.insert(0, job));
+      await Outbox.saveAll(_outbox);
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          duration: Duration(seconds: 5), backgroundColor: kCard,
+          content: Text('couldn\'t reach the relays — queued · will retry when you\'re back online')));
+      return;
     }
     if (mounted) {
-      final n = res.segments.length;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           backgroundColor: kCard,
-          content: Text(!ok
-              ? 'post failed'
-              : res.pollOptions.isNotEmpty
+          content: Text(res.pollOptions.isNotEmpty
                   ? '📊 poll posted · signed · 0 Nano blocks'
                   : res.title.isNotEmpty
                       ? '📄 published your article · signed · 0 Nano blocks'
@@ -4082,6 +4198,59 @@ class _FeedScreenState extends State<FeedScreen> {
     );
   }
 
+  // a queued (offline) post, pinned at the top of the feed until it sends. Shows what's waiting and
+  // lets the user send it now (when back online) or discard it.
+  Widget _queuedCard(Map<String, dynamic> job) {
+    const warn = Color(0xFFE0A63A);
+    final segs = (job['segments'] as List).cast<String>();
+    final hasMedia = (job['mediaB64'] as String? ?? '').isNotEmpty;
+    final title = (job['title'] as String? ?? '');
+    return Container(
+      color: warn.withOpacity(0.06),
+      padding: const EdgeInsets.fromLTRB(16, 12, 12, 10),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          CircleAvatar(radius: 20, backgroundColor: kAccent.withOpacity(0.3),
+              child: Text(_handle.isNotEmpty ? _handle[0].toUpperCase() : 'Y',
+                  style: const TextStyle(fontWeight: FontWeight.bold))),
+          const SizedBox(width: 10),
+          Flexible(child: Text(_handle, overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.bold))),
+          const SizedBox(width: 6),
+          const Text('· queued', style: TextStyle(color: kDim, fontSize: 13)),
+        ]),
+        const SizedBox(height: 6),
+        if (title.isNotEmpty)
+          Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+        Text(segs.first + (segs.length > 1 ? '  +${segs.length - 1} more' : ''),
+            maxLines: 4, overflow: TextOverflow.ellipsis),
+        if (hasMedia)
+          const Padding(padding: EdgeInsets.only(top: 4),
+              child: Text('📎 media attached', style: TextStyle(color: kDim, fontSize: 13))),
+        const SizedBox(height: 8),
+        Row(children: [
+          const Icon(Icons.cloud_off, size: 15, color: warn),
+          const SizedBox(width: 6),
+          const Expanded(child: Text('pending · will send when you\'re online',
+              style: TextStyle(color: warn, fontSize: 12.5))),
+          TextButton(
+              onPressed: _flushing ? null : () async {
+                if (await _onlineNow()) {
+                  _flushOutbox();
+                } else if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      backgroundColor: kCard, content: Text('still offline — it\'ll send automatically when you reconnect')));
+                }
+              },
+              child: const Text('Send now')),
+          TextButton(
+              onPressed: () => _discardQueued(job),
+              child: const Text('Discard', style: TextStyle(color: kDim))),
+        ]),
+      ]),
+    );
+  }
+
   Widget _homeBody() {
     final posts = _homeFeed == 0 ? _forYouPosts() : _homePosts();
     return Column(children: [
@@ -4112,17 +4281,23 @@ class _FeedScreenState extends State<FeedScreen> {
             child: ListView.separated(
               controller: _scroll,
               physics: const AlwaysScrollableScrollPhysics(),
-              itemCount: posts.length + 1,
+              // queued (offline) posts are pinned at the very top until they send
+              itemCount: _outbox.length + posts.length + 1,
               separatorBuilder: (_, __) => Container(color: kLine, height: 1),
               itemBuilder: (_, i) {
-                if (i == posts.length) {
+                if (i < _outbox.length) {
+                  return KeyedSubtree(
+                      key: ValueKey(_outbox[i]['lid']), child: _queuedCard(_outbox[i]));
+                }
+                final j = i - _outbox.length;
+                if (j == posts.length) {
                   return (_homeFeed == 1 && _follows.isEmpty)
                       ? const _DiscoverHint()
                       : const _LedgerFooter();
                 }
                 // stable identity per post so a feed refresh matches elements by post, not by slot —
                 // without this the list recycles cards across posts and their media gets mismatched
-                return KeyedSubtree(key: ValueKey(posts[i].id), child: _profileCard(posts[i]));
+                return KeyedSubtree(key: ValueKey(posts[j].id), child: _profileCard(posts[j]));
               },
             ),
           ),
