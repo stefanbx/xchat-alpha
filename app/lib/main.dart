@@ -79,7 +79,7 @@ Future<bool> resolveEndpoint() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.6'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.2.7'; // this build; the update checker compares against the signed release.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
 // 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
 // below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)
@@ -2811,7 +2811,9 @@ class _FeedScreenState extends State<FeedScreen> {
     _outbox = await Outbox.load();          // restore anything queued offline in a previous session
     if (mounted) setState(() {});
     _flushOutbox();                          // and try to send it now (best-effort; no-op if offline)
-    _autoCheckUpdate();                      // background: is there a newer signed release? (non-blocking)
+    // Defer the update check a few seconds so it's OFF the launch burst (the banner isn't urgent). Keeps
+    // the startup requests down to the essentials; the 4h periodic timer still covers ongoing checks.
+    Future.delayed(const Duration(seconds: 4), () { if (mounted) _autoCheckUpdate(); });
   }
 
   // AUTO-UPDATE CHECK: on launch, ask the relays for a newer signed release and, if there is one the user
@@ -4130,13 +4132,13 @@ class _FeedScreenState extends State<FeedScreen> {
       }
     }
     try {
-      final results = await Future.wait(
-          [Api.feed(), Api.me(), Api.labels(), Api.notify(), Api.engagement()]);
+      // Slim launch: fetch ONLY what the first paint needs — the feed, identity, and moderation labels
+      // (3 requests, not 5). Notifications + engagement counts aren't needed to render the feed, so they
+      // load just after (see _loadSecondary) — a lighter startup burst and a faster first frame.
+      final results = await Future.wait([Api.feed(), Api.me(), Api.labels()]);
       final fd = results[0] as FeedData;
       final me = results[1] as Map<String, dynamic>;
       final labelers = results[2] as List<Labeler>;
-      final notifs = results[3] as List<Map<String, dynamic>>;
-      final engage = results[4] as Map<String, dynamic>;
       setState(() {
         // Never blank a good feed with a momentarily-empty one (e.g. a just-restarted node whose feed
         // cache is still warming). Only replace when the fetch has posts, or we truly had none.
@@ -4151,13 +4153,12 @@ class _FeedScreenState extends State<FeedScreen> {
         _account = me['account'] ?? '';
         _balance = me['balance']?.toString() ?? '0';
         _labelers = labelers;
-        _notifs = notifs;
-        _engage = engage;
         _loading = false;
       });
       _syncSupporter(); // reflect current supporter state now that the account is known
       _initProfile();   // pull our own profile (name/avatar) into the cache
       _maybeSweep();    // keep only the safety-cap float here; forward the rest to savings
+      _loadSecondary(); // notifications + engagement counts, AFTER first paint (off the launch burst)
     } catch (e) {
       // The current endpoint failed — try to fail over to a healthy one from the list, then retry ONCE.
       if (!failedOver && await resolveEndpoint()) {
@@ -4169,6 +4170,19 @@ class _FeedScreenState extends State<FeedScreen> {
         if (_posts.isEmpty) _error = 'could not reach the ledger engine\n($kBase)';
       });
     }
+  }
+
+  // Secondary, non-first-paint data: the notification badge + engagement counts. Loaded just after the
+  // feed renders so the launch fires 3 requests instead of 5 (lighter burst on the node, faster first frame).
+  Future<void> _loadSecondary() async {
+    try {
+      final r = await Future.wait([Api.notify(), Api.engagement()]);
+      if (!mounted) return;
+      setState(() {
+        _notifs = r[0] as List<Map<String, dynamic>>;
+        _engage = r[1] as Map<String, dynamic>;
+      });
+    } catch (_) {}
   }
 
   // Auto-forward anything above the safety cap to the user's external savings address (which this
