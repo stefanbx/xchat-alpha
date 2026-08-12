@@ -189,4 +189,5 @@ else:                                                  # check: newest VALID sig
         json.dump({'ok': True, 'update': vt(best['version']) > vt(current), 'verified': True,
                    'publisher': PUBLISHER, 'current': current, 'version': best['version'],
                    'changelog': best['changelog'], 'cid': best['cid'], 'sha256': best['sha256'],
-                   'size': best['size']}, open('/tmp/xc_release_result.json', 'w'))
+                   'size': best['size'], 'url': best.get('url')},   # hash-verified download mirror (may be null)
+                  open('/tmp/xc_release_result.json', 'w'))
