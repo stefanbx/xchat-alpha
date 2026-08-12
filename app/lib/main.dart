@@ -711,6 +711,39 @@ class Api {
     }
   }
 
+  // Fetch a RELEASE APK (tens of MB) and verify its hash. Goes DIRECT to the public relays that hold the
+  // blob — NOT through the node's /api/media, which would have to re-fetch and re-serve the whole APK and
+  // chokes on it (a 512 MB node re-serializing a 20 MB APK as base64 JSON drops the response). A relay
+  // serves its own cached blob fine. Tries each relay until one returns bytes whose sha256 matches.
+  static Future<Uint8List?> fetchReleaseApk(String cid, String wantSha) async {
+    for (final url in await relayUrls()) {                // every discovered PUBLIC relay (not deduped by account)
+      try {
+        final r = await http.get(Uri.parse('$url/blob?cid=$cid')).timeout(const Duration(seconds: 120));
+        final b64 = jsonDecode(r.body)['b64'];
+        if (b64 is! String || b64.isEmpty) continue;
+        final bytes = base64Decode(b64);
+        if (sha256.convert(bytes).toString() == wantSha) return bytes;   // exact bytes the signed record names
+      } catch (_) {}
+    }
+    // last resort: the node's media path (works if the node happens to hold the blob locally)
+    final viaNode = await media(cid);
+    if (viaNode != null && sha256.convert(viaNode).toString() == wantSha) return viaNode;
+    return null;
+  }
+
+  // the discovered PUBLIC relay origins (https), from the on-chain relay directory — NOT deduped by pin
+  // account (pinTargets is), so a peer relay that actually holds a big blob is reachable directly.
+  static Future<List<String>> relayUrls() async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/relaydir')).timeout(const Duration(seconds: 25));
+      final d = jsonDecode(r.body);
+      final list = (d['relays'] as List?) ?? (d['active'] as List?) ?? const [];
+      return list.map((e) => '$e').where((u) => u.startsWith('https')).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
   // (Api.setWallet removed — the seed never leaves the device; there is no /api/wallet anymore.)
 
   // the issuer can keep their own post VISIBLE past the head TTL: republish signs the head with an
@@ -3604,9 +3637,10 @@ class _FeedScreenState extends State<FeedScreen> {
         Future<void> download() async {
           setSheet(() => phase = 'downloading');
           try {
-            final bytes = await Api.media('${rel['cid']}');      // pull the APK bytes to THIS device (via the relays)
             final want = '${rel['sha256']}';
-            if (bytes == null || sha256.convert(bytes).toString() != want) {   // re-verify on-device — don't trust the transport
+            // fetch DIRECT from the relays that hold the APK + verify the hash on-device (don't trust transport)
+            final bytes = await Api.fetchReleaseApk('${rel['cid']}', want);
+            if (bytes == null) {
               setSheet(() => phase = 'available');
               if (mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(

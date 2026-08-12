@@ -11,9 +11,14 @@ data = None
 try:
     data = subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': xc.IPFS_PATH}, timeout=10)
 except Exception:
+    # Fetch from a peer relay's cache. The timeout must fit a whole RELEASE APK (~20 MB) pulled across
+    # relays, not just a thumbnail — 5 s silently failed the in-app update download. Skip our own loopback
+    # relay (it's why we're here — it doesn't have it) so we spend the time on a peer that might.
     for r in xc.discover_relays():
+        if '127.0.0.1' in r or 'localhost' in r:
+            continue
         try:
-            d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + cid, timeout=5).read())
+            d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + cid, timeout=90).read())
             if d.get('b64'):
                 data = base64.b64decode(d['b64']); break
         except Exception:
