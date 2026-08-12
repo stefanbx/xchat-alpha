@@ -32,7 +32,7 @@ String kBase = kDefaultBase;
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '0.1.0'; // this build; the update checker compares against the signed release
+const String kAppVersion = '0.1.1'; // this build; the update checker compares against the signed release
 // Alpha safety cap: the in-app wallet is meant to hold only a small tip float, not savings — so the
 // worst a bad app build could ever steal is small. Keep real funds in your own wallet.
 const double kWalletCapXno = 2.0;
