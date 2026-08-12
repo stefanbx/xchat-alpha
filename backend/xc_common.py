@@ -633,6 +633,13 @@ HEAD_TTL = int(os.environ.get('XC_HEAD_TTL', '2592000'))  # 30-day backstop; the
 def acct_seed():                         # account address -> seed byte (for demo authors we can sign)
     return {acct(sb): sb for sb in SEEDMAP.values()}
 
+# The node's OWN public URL (the embedded relay's advertised identity). The node reaches that same relay
+# via loopback (127.0.0.1:7401), so its public URL in a relay set is a HAIRPIN: a helper fetching from it
+# calls the node through the edge and back. On a single-instance node under load every worker can end up
+# waiting on its own hairpin request while no worker is free to serve it — a self-deadlock that hung the
+# node repeatedly (feed/release_check timing out). Drop the hairpin; loopback covers it.
+_SELF_PUBLIC = os.environ.get('RELAY_PUBLIC_URL', '').rstrip('/')
+
 def discover_relays(bootstrap=None):     # gossip BFS: follow /relays from a bootstrap to the full set
     # Parallel by LEVEL: fetch /relays from the whole current frontier at once, then descend. This runs
     # on every helper spawn, and a serial BFS paid one round-trip PER relay (~N × RTT); a wave-parallel
@@ -655,4 +662,11 @@ def discover_relays(bootstrap=None):     # gossip BFS: follow /relays from a boo
                     if r not in seen and is_safe_relay_url(r):   # SSRF: don't chase gossiped internal targets
                         seen.add(r); nxt.append(r)
         frontier = nxt
-    return sorted(found) if found else list(seed)
+    result = sorted(found) if found else list(seed)
+    # Replace the hairpin with loopback only when we actually have a loopback twin (i.e. we ARE the node
+    # hosting this relay); a no-op on the standalone relay, which has no co-located loopback relay.
+    if _SELF_PUBLIC and any('127.0.0.1' in u or 'localhost' in u for u in result):
+        filtered = [u for u in result if u.rstrip('/') != _SELF_PUBLIC]
+        if filtered:
+            result = filtered
+    return result
