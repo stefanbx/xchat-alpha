@@ -36,7 +36,7 @@ const String kAppVersion = '0.1.0'; // this build; the update checker compares a
 // Alpha safety cap: the in-app wallet is meant to hold only a small tip float, not savings — so the
 // worst a bad app build could ever steal is small. Keep real funds in your own wallet.
 const double kWalletCapXno = 2.0;
-const int kHeadTtl = 3600; // seconds a signed head stays live before it must be republished (matches the node)
+const int kHeadTtl = 604800; // 7 days a signed head stays live before it must be republished (matches the node)
 const Color kAccent = Color(0xFF3E9BFF); // Nano blue
 const Color kBg = Color(0xFF000000);
 const Color kCard = Color(0xFF0A0A0A);

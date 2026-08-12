@@ -51,7 +51,7 @@ known = {SELF}                       # relays this relay knows about
 # junk — it can never appear in a feed or impersonate. These bounds stop an UNAUTHENTICATED flood
 # from growing one relay's RAM/CPU without limit. (The plural network already routes around a bad
 # relay; this keeps each individual relay standing.)
-HEAD_TTL    = int(os.environ.get('XC_HEAD_TTL', '3600'))      # a head lives at most this long (s)
+HEAD_TTL    = int(os.environ.get('XC_HEAD_TTL', '604800'))    # 7 days: a post survives a week offline
 HEAD_SKEW   = 900                                             # clock-skew slack on the max expiry
 MAX_HEADS   = int(os.environ.get('XC_MAX_HEADS', '50000'))    # hard cap on live authors (backstop)
 NOTIF_MAX   = int(os.environ.get('XC_NOTIF_MAX', '200'))      # per-recipient notification cap

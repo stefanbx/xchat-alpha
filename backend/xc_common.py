@@ -452,7 +452,8 @@ def _bootstrap():
     s = [u.rstrip('/') for u in dict.fromkeys(s) if u]
     return s or ['http://127.0.0.1:7401', 'http://127.0.0.1:7402', 'http://127.0.0.1:7403']
 BOOTSTRAP = _bootstrap()
-HEAD_TTL = 3600                          # a head is live for this long; must be republished
+HEAD_TTL = int(os.environ.get('XC_HEAD_TTL', '604800'))   # 7 days: a post survives a week offline
+                                         # (the app refreshes it while open; pay-to-pin extends it further)
 
 def acct_seed():                         # account address -> seed byte (for demo authors we can sign)
     return {acct(sb): sb for sb in SEEDMAP.values()}
