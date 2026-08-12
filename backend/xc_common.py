@@ -189,12 +189,48 @@ REP_TTL      = float(os.environ.get('XC_REP_TTL', '300'))       # cache an accou
 REP_TELEPORT = float(os.environ.get('XC_REP_TELEPORT', '0.5'))  # EigenTrust anchor back to on-chain pre-trust
 REP_ITERS    = int(os.environ.get('XC_REP_ITERS', '25'))        # trust-propagation iterations to convergence
 _rep_cache = {}
+# DISK-BACKED rep cache. Each account_rep miss is a ~0.66s mainnet RPC, and the feed re-aggregates every
+# few seconds in a FRESH helper process — so an in-memory-only cache re-fetched every reporter's rep on
+# every refresh. Persisting it (like the onchain-relay cache) lets spawns share it: within REP_TTL the
+# background refresh does zero rep RPCs. Bounded naturally to accounts seen within REP_TTL.
+_REP_CACHE_FILE = os.environ.get('XC_REP_CACHE', '/tmp/xc_rep_cache.json')
+_rep_loaded = [False]
+_rep_dirty = [False]
+
+def _load_rep_cache():
+    if _rep_loaded[0]:
+        return
+    _rep_loaded[0] = True
+    try:
+        d = json.load(open(_REP_CACHE_FILE))
+        now = time.time()
+        for a, v in d.items():
+            if isinstance(v, (list, tuple)) and len(v) == 2 and now - v[1] < REP_TTL:
+                _rep_cache.setdefault(a, (v[0], v[1]))          # keep only still-fresh entries
+    except Exception:
+        pass
+
+def flush_rep_cache():
+    # Atomically persist the fresh entries. Called once after a batch of account_rep lookups (e.g. at the
+    # end of aggregate_reports) so a burst of parallel misses costs one write, not one per account.
+    if not _rep_dirty[0]:
+        return
+    now = time.time()
+    fresh = {a: [v[0], v[1]] for a, v in _rep_cache.items() if now - v[1] < REP_TTL}
+    try:
+        tmp = _REP_CACHE_FILE + '.tmp'
+        json.dump(fresh, open(tmp, 'w'))
+        os.replace(tmp, _REP_CACHE_FILE)
+        _rep_dirty[0] = False
+    except Exception:
+        pass
 
 def account_rep(account):
     # Reputation in [0,1]. An UNOPENED account (a fresh throwaway) weighs 0. An opened account gets a
     # small floor plus credit for balance and chain height, then DECAYS by on-chain inactivity: an
     # account dormant on the ledger (its last block is old) loses weight on a half-life, so stale
-    # standing fades. All read from the ledger — trustless. Cached (keeps the aggregation cheap).
+    # standing fades. All read from the ledger — trustless. Cached in RAM + on disk (shared across spawns).
+    _load_rep_cache()
     now = time.time()
     c = _rep_cache.get(account)
     if c and now - c[1] < REP_TTL:
@@ -212,6 +248,7 @@ def account_rep(account):
     except Exception:
         rep = 0.0
     _rep_cache[account] = (rep, now)
+    _rep_dirty[0] = True
     return rep
 
 def aggregate_reports(relays):
@@ -255,6 +292,7 @@ def aggregate_reports(relays):
     if accts:
         with ThreadPoolExecutor(max_workers=min(16, len(accts))) as ex:
             p = dict(zip(accts, ex.map(account_rep, accts)))
+        flush_rep_cache()                            # persist the batch so the next spawn reuses it (no re-RPC)
     else:
         p = {}
     if sum(p.values()) <= 0:                                # no real reputation anywhere -> no takedowns
