@@ -25,6 +25,7 @@ PY = os.environ.get('XC_PYTHON', sys.executable or 'python3')
 DM_PY = os.environ.get('XC_DM_PYTHON', PY)                  # kept as an override; xc_dm needs no extras now
 sys.path.insert(0, HERE)
 import xc_common as xc                                       # for api_me + wallet paths
+import xc_engage                                             # hot engagement path, called IN-PROCESS (no spawn)
 
 def _env():
     return {**os.environ, 'XC_NS': NS,
@@ -271,15 +272,16 @@ def route(path, query, body):
     # tips, sends and the wallet seed are all on-device now (see /api/post_prepare + /api/post_submit and
     # /api/block_process). The node never receives, stores, or signs with a seed.
 
-    if path.startswith('/api/like'):         spawn('xc_engage.py', 'like', b('post_id'), b('delta'));        return read('/tmp/xc_engage_result.json', '{}')
-    if path.startswith('/api/repost'):       put('/tmp/xc_reshare_rec.json', json.dumps(body)); spawn('xc_engage.py','repost'); return read('/tmp/xc_engage_result.json','{}')
-    if path.startswith('/api/tipstat'):      spawn('xc_engage.py', 'tip', b('post_id'), b('raw'));           return read('/tmp/xc_engage_result.json', '{}')
-    if path.startswith('/api/view'):         spawn('xc_engage.py', 'view', b('post_id'), b('delta'));        return read('/tmp/xc_engage_result.json', '{}')
-    if path.startswith('/api/engagement'):   spawn('xc_engage.py', 'get');                                    return read('/tmp/xc_engage_result.json', '{}')
+    # Hottest endpoints — IN-PROCESS (no subprocess spawn / /tmp round-trip). ~0.18s/call saved + better
+    # under concurrency; they're just relay fan-out (fire-and-forget writes, aggregated reads).
+    if path.startswith('/api/like'):         return json.dumps(xc_engage.like(b('post_id'), b('delta')))
+    if path.startswith('/api/repost'):       return json.dumps(xc_engage.repost(body))   # body = app-signed reshare rec
+    if path.startswith('/api/tipstat'):      return json.dumps(xc_engage.tip(b('post_id'), b('raw')))
+    if path.startswith('/api/view'):         return json.dumps(xc_engage.view(b('post_id'), b('delta')))
+    if path.startswith('/api/engagement'):   return json.dumps(xc_engage.get())
     if path.startswith('/api/notify_push'):
-        for k, fn in (('to','xc_np_to'),('from','xc_np_from'),('kind','xc_np_kind'),('text','xc_np_text')):
-            put(f'/tmp/{fn}.txt', b(k))
-        spawn('xc_engage.py', 'notify');     return read('/tmp/xc_engage_result.json', '{}')
+        return json.dumps(xc_engage.notify({'to': b('to'), 'from': b('from'), 'kind': b('kind'),
+                                            'text': b('text'), 'ts': int(time.time())}))
     if path.startswith('/api/notify'):       spawn('xc_notify.py');                                           return read('/tmp/xc_notify.json', '{}')
 
     # on-device money: the app builds + signs every state block; the node only reads ledger state and
