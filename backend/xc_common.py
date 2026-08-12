@@ -589,7 +589,7 @@ _KNOWN_RELAYS = '/tmp/xc_known_relays.json'  # the list the client keeps: reconn
 def onchain_relays(ttl=120):  # SCAN the ledger for self-announced relays (no directory, no SPOF)
     try:                                            # short on-disk cache: one ledger scan per helper wave, not per spawn
         c = json.load(open(_ONCHAIN_CACHE))
-        if time.time() - c['ts'] < ttl and c.get('relays'):
+        if time.time() - c['ts'] < ttl and 'relays' in c:   # honor an EMPTY result too — see below
             return c['relays']
     except Exception:
         pass
@@ -598,12 +598,21 @@ def onchain_relays(ttl=120):  # SCAN the ledger for self-announced relays (no di
         relays = sorted({u for a in _relay_accounts() if (u := _relay_url(a))})
     except Exception:
         relays = []
+    # ALWAYS cache the scan result, INCLUDING an empty one. On a node where no relay has announced
+    # on-chain (the mainnet default until the operator does a funded announce) the scan returns [], and
+    # the old check (`c.get('relays')` truthy) treated that as "no cache" — so EVERY helper spawn re-ran
+    # the slow mainnet ledger scan. Under the app's launch burst that meant many concurrent scans, which
+    # pegged the node and hung it. Caching [] fixes it. Only a NON-empty set is mirrored into the
+    # persisted known-relays list (never wipe that list with an empty scan).
+    try:
+        json.dump({'ts': time.time(), 'relays': relays}, open(_ONCHAIN_CACHE, 'w'))
+    except Exception:
+        pass
     if relays:
-        for f in (_ONCHAIN_CACHE, _KNOWN_RELAYS):
-            try:
-                json.dump({'ts': time.time(), 'relays': relays}, open(f, 'w'))
-            except Exception:
-                pass
+        try:
+            json.dump({'ts': time.time(), 'relays': relays}, open(_KNOWN_RELAYS, 'w'))
+        except Exception:
+            pass
     return relays
 
 def known_relays():  # the persisted list — used to reconnect directly before any fresh scan

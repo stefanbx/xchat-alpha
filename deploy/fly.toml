@@ -15,6 +15,14 @@ primary_region = "iad"
     type = "requests"
     soft_limit = 100
     hard_limit = 250
+  # Self-healing: if the node stops answering (a hang under load), Fly restarts the machine within ~30s
+  # instead of leaving it dead — so a hang is a brief blip, not an outage. /api/status is cheap + cached.
+  [[http_service.checks]]
+    grace_period = "40s"
+    interval = "15s"
+    timeout = "10s"
+    method = "GET"
+    path = "/api/status"
 [[vm]]
   cpu_kind = "shared"
   cpus = 2
