@@ -21,7 +21,7 @@ def get_content(cid):                  # content by CID: IPFS origin, else a rel
         pass
     for r in RELAYS:
         try:
-            d = xc.http_get_json(r + '/blob?cid=' + urllib.parse.quote(cid, safe=''), timeout=4)   # pooled
+            d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + urllib.parse.quote(cid, safe=''), timeout=4).read())
             if d.get('b64'):
                 return base64.b64decode(d['b64'])
         except Exception:
@@ -36,7 +36,7 @@ def verify(pub, msg, sig):
 
 def fetch_heads(r):                    # returns a head list, or None if the relay is down/slow
     try:
-        return xc.http_get_json(r + '/heads', timeout=4).get('heads', [])   # pooled/keep-alive
+        return json.loads(urllib.request.urlopen(r + '/heads', timeout=4).read()).get('heads', [])
     except Exception:
         return None
 

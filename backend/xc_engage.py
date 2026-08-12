@@ -16,7 +16,8 @@ def _relays():
 def post(path, obj, relays=None):
     for r in (relays or _relays()):
         try:
-            xc.http_post_json(r + path, obj, timeout=4)      # pooled/keep-alive relay write (fire-and-forget)
+            urllib.request.urlopen(urllib.request.Request(r + path, json.dumps(obj).encode(),
+                                   {'Content-Type': 'application/json'}), timeout=4).read()
         except Exception:
             pass
 
@@ -50,7 +51,7 @@ def get():
     relays = _relays()
     def _fetch(r):
         try:
-            return xc.http_get_json(r + '/engagement', timeout=4).get('engage', {})   # pooled relay read
+            return json.loads(urllib.request.urlopen(r + '/engagement', timeout=4).read()).get('engage', {})
         except Exception:
             return None
     agg = {}
