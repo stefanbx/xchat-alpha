@@ -1678,7 +1678,8 @@ class _FeedScreenState extends State<FeedScreen> {
   bool _autoSettle = false;
   double _autoThreshold = 0.05, _autoCap = 1.0, _autoSpent = 0.0;
   int _tab = 0; // 0 = Home, 1 = Discover (everyone + search)
-  int _homeFeed = 0; // 0 = For You (ranked), 1 = Following (chronological)
+  int _homeFeed = 1; // 0 = For You (ranked), 1 = Following (chronological, newest-first) — default so a
+  // user's own just-made post reliably lands on top ("last on top"); For You is one tap away.
   List<Map<String, dynamic>> _outbox = []; // posts composed OFFLINE, queued + auto-flushed on reconnect
   bool _flushing = false;                  // guards _flushOutbox against re-entrancy
   Map<String, dynamic>? _update;           // a newer signed release found by the launch auto-check
