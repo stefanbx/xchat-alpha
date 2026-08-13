@@ -79,7 +79,7 @@ Future<bool> resolveEndpoint() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.9'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.2.10'; // this build; the update checker compares against the signed release.
 // 2.2.9: adds the network-announcement banner (publisher-signed, shown only during a coordinated event).
 // Signing format is UNCHANGED from 2.2.x — fully compatible with the live backend.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
