@@ -20,7 +20,10 @@ except Exception:
         try:
             d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + cid, timeout=90).read())
             if d.get('b64'):
-                data = base64.b64decode(d['b64']); break
+                b = base64.b64decode(d['b64'])
+                if xc.content_matches_cid(cid, b):     # a rogue relay can't swap content for the requested CID
+                    data = b; break
+                # bytes don't hash to the CID — skip this lying/corrupt relay, try the next
         except Exception:
             pass
 json.dump({"cid": cid, "b64": base64.b64encode(data).decode() if data else None,

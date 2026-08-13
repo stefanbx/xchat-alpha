@@ -23,7 +23,10 @@ def get_content(cid):                  # content by CID: IPFS origin, else a rel
         try:
             d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + urllib.parse.quote(cid, safe=''), timeout=4).read())
             if d.get('b64'):
-                return base64.b64decode(d['b64'])
+                b = base64.b64decode(d['b64'])
+                if xc.content_matches_cid(cid, b):     # a rogue relay can't swap content for a signed CID
+                    return b
+                # bytes don't hash to the CID — this relay is lying/corrupt; try the next one
         except Exception:
             pass
     return None
