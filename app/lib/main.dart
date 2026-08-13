@@ -81,7 +81,7 @@ Future<bool> resolveEndpoint() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.3.0'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.3.1'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -1394,6 +1394,18 @@ class Api {
     }
   }
 
+  // The RAW (unverified) profile record straight from the relay (the node proxies non-/api paths to it).
+  // Used only to recover our OWN display name whose signed record was invalidated by a signing-format
+  // change, so we can re-sign it under the current scheme. Not trusted for other accounts.
+  static Future<Map<String, dynamic>?> profileRaw(String account) async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/profile?account=$account'));
+      return (jsonDecode(r.body)['record'] as Map?)?.cast<String, dynamic>();
+    } catch (_) {
+      return null;
+    }
+  }
+
   // on-device signed: the app signs the profile record locally; the node only verifies + relays.
   static Future<Map<String, dynamic>?> profileSet(String display, String bio, String avatar, String banner, {NanoWallet? signer, String type = ''}) async {
     final w = signer ?? gWallet;   // `signer` lets a channel set ITS OWN profile (name/desc/avatar)
@@ -2365,7 +2377,10 @@ class _FeedScreenState extends State<FeedScreen> {
         onReport: () => _reportPost(post),
         onComment: () => _openComments(post),
         onReply: () => _compose(replyToPost: post),                 // X-style reply → new post w/ reply_to
-        replyCount: _posts.where((x) => x.replyTo == post.id).length,
+        // count replies from the live list AND the buffered "new posts" — otherwise a reply that arrives
+        // via the quiet poll (held in _newPosts until the pill is tapped) wouldn't bump the count.
+        replyCount: _posts.where((x) => x.replyTo == post.id).length
+            + _newPosts.where((x) => x.replyTo == post.id).length,
         replyingToHandle: post.replyTo == null ? '' : (_postById(post.replyTo)?.handle ?? ''),
         onQuote: () => _quotePost(post),
         onOpenThread: () => _openThread(post),
@@ -2707,7 +2722,23 @@ class _FeedScreenState extends State<FeedScreen> {
   Future<void> _initProfile() async {
     if (_account.isEmpty) return;
     final p = await Api.profileGet(_account);
-    if (p != null) ProfileCache.I.put(_account, p);
+    if (p != null && '${p['display'] ?? ''}'.trim().isNotEmpty) {
+      ProfileCache.I.put(_account, p);
+      return;
+    }
+    // Our signed profile didn't verify (its record predates the current signing scheme), so our name
+    // shows as the default handle. AUTO-HEAL: recover the display name from the raw relay record and
+    // re-publish it signed under the current scheme — so names come back on their own after a migration,
+    // no manual re-entry. Only our OWN account, and only when the raw record is actually ours.
+    final raw = await Api.profileRaw(_account);
+    final display = '${raw?['display'] ?? ''}'.trim();
+    if (raw != null && raw['account'] == _account && display.isNotEmpty) {
+      await Api.profileSet(display, '${raw['bio'] ?? ''}', '${raw['avatar'] ?? ''}', '${raw['banner'] ?? ''}');
+      final fresh = await Api.profileGet(_account);
+      if (fresh != null) ProfileCache.I.put(_account, fresh);
+    } else if (p != null) {
+      ProfileCache.I.put(_account, p);
+    }
   }
 
   // edit-profile sheet: display name, bio, pick avatar/banner → upload (content-addressed) → publish
