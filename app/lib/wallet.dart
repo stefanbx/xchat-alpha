@@ -56,6 +56,18 @@ class NanoWallet {
     };
   }
 
+  /// A CHANNEL is a distinct publishing identity: its own keypair, deterministically derived from this
+  /// seed so it's restorable on any device from the same seed, and followable like any account.
+  /// channelSeed = blake2b256(seed || "xchat-channel:" + name). Returns a NanoWallet you sign with to
+  /// publish/manage the channel.
+  NanoWallet channelWallet(String name) {
+    final cs = Blake2b.digest256([
+      _bytesOfHex(seed),
+      Uint8List.fromList(utf8.encode('xchat-channel:${name.trim().toLowerCase()}')),
+    ]);
+    return NanoWallet(_hexOfBytes(cs));
+  }
+
   // ---- canonical message builders (must match the node's helpers exactly) ----
   // Unambiguous signing preimage — the exact mirror of the node's xc_common.sig_canon (issue #2):
   // a domain+type tag so a signature for one message type can't be replayed as another, and each

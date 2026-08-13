@@ -318,6 +318,32 @@ def api_release_check(current):
             _relcheck_cache.pop(next(iter(_relcheck_cache)), None)
     return r
 
+# The pinned publisher account — the ONLY identity whose announcement the node will serve. Overridable
+# for self-hosters, but defaults to the same account that signs releases.
+PUBLISHER_ACCT = (os.environ.get('XC_PUBLISHER_ACCOUNT', '')
+                  or 'nano_3nefzmwosgqdo97pt6rzjiiazrgx5sf58eksbsbbhrmca7cg3fxisora1dp8')
+
+def api_announcement():
+    # A coordinated-event banner (e.g. a network migration). Served ONLY if a publisher-SIGNED, unexpired
+    # record is present — so a rogue relay or a node operator without the publisher key can't forge the
+    # "back up your seed / move your funds" message. No record => nothing shown (normal operation).
+    raw = os.environ.get('XC_ANNOUNCEMENT', '')
+    if not raw:
+        try:
+            with open(os.path.join(HERE, 'announcement.json'), encoding='utf-8') as f:
+                raw = f.read()
+        except Exception:
+            return '{"active": false}'
+    try:
+        a = json.loads(raw)
+        canon = xc.sig_canon('announce', a['text'], a['ts'], a['expires'])
+        if (xc.pub_to_addr(a['pub']) == PUBLISHER_ACCT and xc.verify_msg(a['pub'], canon, a['sig'])
+                and int(time.time()) < int(a['expires'])):
+            return json.dumps({'active': True, 'text': a['text'], 'expires': int(a['expires'])})
+    except Exception:
+        pass
+    return '{"active": false}'
+
 def api_status():
     try:
         bc = xc.rpc_cached({'action': 'block_count'}, ttl=10)  # chain height for display; 10s stale is invisible
@@ -340,6 +366,7 @@ def route(path, query, body):
             put('/tmp/xc_media_cid.txt', q('cid')); spawn('xc_media.py'); return read('/tmp/xc_media_result.json', '{}')
     if path.startswith('/api/me'):           return api_me(q('account'))
     if path.startswith('/api/status'):       return api_status()
+    if path.startswith('/api/announcement'):  return api_announcement()
     if path.startswith('/api/labels'):       return api_labels()
 
     # on-device posting: two-step round-trip. These are prefixes of /api/post, so match them FIRST.
@@ -372,6 +399,7 @@ def route(path, query, body):
                                             'text': b('text'), 'ts': int(time.time())}))
     if path.startswith('/api/notify'):
         with ipc_lock('notify'):
+            put('/tmp/xc_notify_acct.txt', q('account'))   # route by the viewer's unique account, not a shared handle
             spawn('xc_notify.py'); return read('/tmp/xc_notify.json', '{}')
 
     # on-device money: the app builds + signs every state block; the node only reads ledger state and

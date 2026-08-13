@@ -1,4 +1,4 @@
-// ӾChat — a censorship-free X. The "Ӿ" is the XNO (Nano) symbol.
+// Ӿ Chat — a censorship-free X. The "Ӿ" is the XNO (Nano) symbol.
 // Identity = a Nano keypair. Feed = read from the ledger. Tips = feeless Nano.
 // Backend = the Keel engine (same censorship-free stack as KeelTube).
 import 'dart:async';
@@ -10,6 +10,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:video_compress/video_compress.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:http/http.dart' as http;
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:battery_plus/battery_plus.dart';
@@ -108,14 +110,22 @@ class XChatApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'ӾChat',
+      title: 'Ӿ Chat',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
         scaffoldBackgroundColor: kBg,
         colorScheme: const ColorScheme.dark(primary: kAccent, surface: kBg),
-        fontFamily: 'Roboto',
+        // No explicit fontFamily: pinning one family exclusively suppressed Flutter's glyph FALLBACK,
+        // so emoji (and the Cyrillic Ӿ) rendered blank. The platform default is still Roboto but keeps
+        // the full fallback chain (Noto Color Emoji + Cyrillic), so emoji and Ӿ now render. [verify on build]
+        // Snackbars override their bg to the near-black kCard, but M3's default content text assumes the
+        // light inverse-surface — so the text came out dark-on-dark. Pin light text on the dark surface.
+        snackBarTheme: const SnackBarThemeData(
+          backgroundColor: kCard,
+          contentTextStyle: TextStyle(color: kText, fontSize: 14),
+        ),
       ),
       home: const RootGate(),
     );
@@ -399,7 +409,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   Widget _brand() => Column(children: const [
         NanoMark(size: 64),
         SizedBox(height: 14),
-        Text('ӾChat',
+        Text('Ӿ Chat',
             style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 28)),
         SizedBox(height: 6),
         Text('a censorship-free X. your account is a Nano keypair — no email, no server.',
@@ -501,7 +511,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
             padding: const EdgeInsets.only(top: 4),
             child: Text(_verr!, style: const TextStyle(color: Color(0xFFEF6C9B), fontSize: 13))),
         const Spacer(),
-        _bigBtn(_busy ? 'Setting up…' : 'Confirm & enter ӾChat', kAccent, Colors.black, _busy ? null : () {
+        _bigBtn(_busy ? 'Setting up…' : 'Confirm & enter Ӿ Chat', kAccent, Colors.black, _busy ? null : () {
           for (int i = 0; i < _vpos.length; i++) {
             if (_vctl[i].text.trim().toLowerCase() != _newSeed[_vpos[i]].toLowerCase()) {
               setState(() => _verr = "That doesn't match your seed. Check your written copy (or go back to view it again).");
@@ -1022,13 +1032,34 @@ class Api {
   }
 
   static Future<List<Map<String, dynamic>>> notify() async {
+    final w = gWallet;
+    if (w == null) return [];
     try {
-      final r = await http.get(Uri.parse('$kBase/api/notify'));
+      // key notifications by the UNIQUE account, not the shared 'you.xno' handle — otherwise every
+      // user reads one common bucket and sees everyone else's tip/like alerts (issue: alerts predating
+      // your own install). The relay routes by whatever string it's given, so the account rides the
+      // existing 'handle' param end-to-end (no relay change needed).
+      final r = await http.get(Uri.parse('$kBase/api/notify?account=${w.account}'));
       final d = jsonDecode(r.body);
       return ((d['notifs'] as List?) ?? []).cast<Map<String, dynamic>>();
     } catch (_) {
       return [];
     }
+  }
+
+  // A coordinated-event banner (network migration etc.). The node returns it ONLY when a valid,
+  // publisher-signed, unexpired record is configured — so normal operation returns {active:false} and
+  // the app shows nothing. Returns the banner text, or null.
+  static Future<String?> announcement() async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/announcement'));
+      final d = jsonDecode(r.body);
+      if (d is Map && d['active'] == true) {
+        final t = '${d['text'] ?? ''}'.trim();
+        return t.isEmpty ? null : t;
+      }
+    } catch (_) {}
+    return null;
   }
 
   static Future<Map<String, dynamic>?> supporter(bool on, String account) async {
@@ -1124,8 +1155,8 @@ class Api {
   // node assembles the thread, pins it, and returns the content CID + head seq; (2) sign the head
   // "account|seq|cid|expires" locally + POST to /api/post_submit — the node verifies + gossips it.
   // The seed never leaves the device; the node only assembles content and relays signed records.
-  static Future<String> post(String text, {String handle = 'you.xno', String media = '', String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = '', int? ts}) async {
-    final w = gWallet;
+  static Future<String> post(String text, {String handle = 'you.xno', String media = '', String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = '', int? ts, NanoWallet? signer}) async {
+    final w = signer ?? gWallet;   // `signer` lets a post be authored by a channel identity, not the user
     if (w == null) return '';
     ts ??= DateTime.now().millisecondsSinceEpoch ~/ 1000;   // a flushed queued post keeps its compose time
     final mk = (mediaKind == 'photo' || mediaKind == 'movie') ? mediaKind : 'movie';
@@ -1364,8 +1395,8 @@ class Api {
   }
 
   // on-device signed: the app signs the profile record locally; the node only verifies + relays.
-  static Future<Map<String, dynamic>?> profileSet(String display, String bio, String avatar, String banner) async {
-    final w = gWallet;
+  static Future<Map<String, dynamic>?> profileSet(String display, String bio, String avatar, String banner, {NanoWallet? signer, String type = ''}) async {
+    final w = signer ?? gWallet;   // `signer` lets a channel set ITS OWN profile (name/desc/avatar)
     if (w == null) return null;
     final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final s = w.signMsg(w.profileMsg(ts, display, bio, avatar, banner));
@@ -1373,7 +1404,8 @@ class Api {
       final r = await http.post(Uri.parse('$kBase/api/profile_set'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({'account': w.account, 'display': display, 'bio': bio, 'avatar': avatar,
-                            'banner': banner, 'ts': ts, 'sig': s['sig'], 'pub': s['pub']}));
+                            'banner': banner, 'ts': ts, 'sig': s['sig'], 'pub': s['pub'],
+                            if (type.isNotEmpty) 'type': type}));
       return jsonDecode(r.body);
     } catch (_) {
       return null;
@@ -1693,6 +1725,9 @@ class _FeedScreenState extends State<FeedScreen> {
   final Set<String> _viewed = {}; // ids counted as viewed this session (dedup)
   final Map<String, int> _commentCount = {}; // post_id -> comment count (lazy)
   List<Map<String, dynamic>> _notifs = []; // push payloads (mentions/replies)
+  int _dmUnread = 0;   // conversations with an incoming DM newer than _dmSeenTs (drives the mail badge)
+  int _dmSeenTs = 0;   // unix-s of the last time DMs were opened; persisted so the badge survives restarts
+  String? _announcement;  // publisher-signed coordinated-event banner text; null in normal operation
   String _account = '';
   // supporter mode: contribute (relay/pin) ONLY when charging + on Wi-Fi
   bool _supporterOn = false, _charging = false, _wifi = false;
@@ -1716,6 +1751,10 @@ class _FeedScreenState extends State<FeedScreen> {
     MuteStore.get().then((m) { if (mounted) setState(() => _muted = m); });
     BlockStore.get().then((b) { if (mounted) setState(() => _blocked = b); });
     BookmarkStore.get().then((b) { if (mounted) setState(() => _bookmarks = b); });
+    SharedPreferences.getInstance().then((sp) {
+      if (mounted) setState(() => _dmSeenTs = sp.getInt('dm_seen_ts') ?? 0);
+    });
+    _loadChannels();
     // keep our own head alive on the relays (republish < TTL); also backfills new relays
     _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) => Api.republish());
     // quietly poll the feed so posts from OTHER devices appear on their own (no manual refresh)
@@ -1753,6 +1792,10 @@ class _FeedScreenState extends State<FeedScreen> {
     // most polls are incremental (only new posts, for the pill); every 5th (~60s) pulls the full set
     // so we can also DROP posts whose head expired / was removed — the incremental slice can't show that.
     final reconcile = (++_pollTick % 5 == 0);
+    _refreshDmBadge();   // keep the mail-icon unread count live between full loads
+    if (_pollTick % 10 == 0) {   // ~every 2 min: pick up a newly-activated announcement without a relaunch
+      Api.announcement().then((a) { if (mounted && a != _announcement) setState(() => _announcement = a); });
+    }
     try {
       // since-1 re-includes the boundary second (ts filter is strict '>'), so a post arriving in the
       // same second as our newest isn't missed; the id-dedupe below drops the tiny overlap.
@@ -1838,8 +1881,13 @@ class _FeedScreenState extends State<FeedScreen> {
 
   bool _onlineFrom(List<ConnectivityResult> r) =>
       r.isNotEmpty && r.any((x) => x != ConnectivityResult.none);
-  Future<bool> _onlineNow() async =>
-      _onlineFrom(await Connectivity().checkConnectivity());
+  Future<bool> _onlineNow() async {
+    if (_onlineFrom(await Connectivity().checkConnectivity())) return true;
+    // connectivity_plus can report "none" even when the network is fine (emulators, some VPNs / Android
+    // builds). Don't strand posts in the outbox on its say-so — confirm with a real reachability probe
+    // against the node before deciding we're offline.
+    return _endpointHealthy(kBase);
+  }
 
   // A "connectivity regained" event often arrives while the link is still validating (wifi shows "!"),
   // so a single flush attempt can fail fast. Retry a few times with backoff until the queue drains.
@@ -1915,7 +1963,7 @@ class _FeedScreenState extends State<FeedScreen> {
     });
     Api.tipstat(p.id, _rawOf(amt));
     if (p.account != _account && _settings.notifyTip) {
-      Api.notifyPush(p.handle, _handle, 'tip', 'tipped your post ${amt.toStringAsFixed(2)} XNO');
+      Api.notifyPush(p.account, _handle, 'tip', 'tipped your post ${amt.toStringAsFixed(2)} XNO');
     }
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         duration: const Duration(milliseconds: 1200),
@@ -2268,7 +2316,7 @@ class _FeedScreenState extends State<FeedScreen> {
     });
     Api.like(p.id, liked ? -1 : 1);
     if (!liked && p.account != _account && _settings.notifyLike) {
-      Api.notifyPush(p.handle, _handle, 'like',
+      Api.notifyPush(p.account, _handle, 'like',
           'liked: ${p.text.length > 40 ? '${p.text.substring(0, 40)}…' : p.text}');
     }
   }
@@ -2281,7 +2329,7 @@ class _FeedScreenState extends State<FeedScreen> {
     });
     Api.repost(p.id, rp ? -1 : 1, _account); // record WHO reshared (reward attribution)
     if (!rp && p.account != _account) {
-      Api.notifyPush(p.handle, _handle, 'repost', 'reposted your post');
+      Api.notifyPush(p.account, _handle, 'repost', 'reposted your post');
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           backgroundColor: kCard,
           content: Text('🔁 reposted — spreads to your followers; you earn a cut of its future tips')));
@@ -2316,6 +2364,9 @@ class _FeedScreenState extends State<FeedScreen> {
         onRepost: () => _toggleRepost(post),
         onReport: () => _reportPost(post),
         onComment: () => _openComments(post),
+        onReply: () => _compose(replyToPost: post),                 // X-style reply → new post w/ reply_to
+        replyCount: _posts.where((x) => x.replyTo == post.id).length,
+        replyingToHandle: post.replyTo == null ? '' : (_postById(post.replyTo)?.handle ?? ''),
         onQuote: () => _quotePost(post),
         onOpenThread: () => _openThread(post),
         onOpenProfile: () => _openProfile(post.account, post.handle),
@@ -2366,6 +2417,7 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   void _openThread(Post p) {
+    if (p.kind == 'article') { _openArticle(p); return; }   // long-form → full-screen reader
     final root = _threadRoot(p);
     final chain = _threadChain(root);
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => Scaffold(
@@ -2377,6 +2429,212 @@ class _FeedScreenState extends State<FeedScreen> {
         separatorBuilder: (_, __) => Container(color: kLine, height: 1),
         itemBuilder: (_, i) => _profileCard(chain[i]),
       ),
+    )));
+  }
+
+  // full-screen article reader: cover + title + author + markdown body + engagement (reuses feed handlers)
+  void _openArticle(Post p) {
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => Scaffold(
+      backgroundColor: kBg,
+      appBar: AppBar(backgroundColor: kBg, elevation: 0, iconTheme: const IconThemeData(color: kText),
+          title: const Text('Article', style: TextStyle(color: kText, fontWeight: FontWeight.w800))),
+      body: ListView(children: [
+        if (p.media != null && p.media!.isNotEmpty)
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 240),
+            child: SizedBox(width: double.infinity, child: MediaImage(cid: p.media!, fit: BoxFit.cover)),
+          ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(18, 18, 18, 32),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(p.title ?? '',
+                style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 26, height: 1.25)),
+            const SizedBox(height: 14),
+            GestureDetector(
+              onTap: () => _openProfile(p.account, p.handle),
+              child: Row(children: [
+                AuthorAvatar(account: p.account, handle: p.handle, radius: 18),
+                const SizedBox(width: 10),
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  AnimatedBuilder(
+                      animation: ProfileCache.I,
+                      builder: (_, __) => Text(ProfileCache.I.displayName(p.account, p.handle),
+                          style: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 15))),
+                  Text('@${p.handle} · ${timeAgo(p.ts)}', style: const TextStyle(color: kDim, fontSize: 12.5)),
+                ]),
+              ]),
+            ),
+            const SizedBox(height: 18),
+            MarkdownBody(
+              data: p.text,
+              styleSheet: MarkdownStyleSheet(
+                p: const TextStyle(color: kText, fontSize: 17, height: 1.6),
+                h1: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 24, height: 1.3),
+                h2: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 20, height: 1.3),
+                h3: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 18),
+                a: const TextStyle(color: kAccent),
+                blockquote: const TextStyle(color: kDim, fontSize: 16, height: 1.5),
+                code: const TextStyle(color: kAccent, fontFamily: 'monospace'),
+                listBullet: const TextStyle(color: kText, fontSize: 17),
+              ),
+            ),
+            const SizedBox(height: 24),
+            Container(height: 1, color: kLine),
+            const SizedBox(height: 12),
+            _readerActionRow(p),
+          ]),
+        ),
+      ]),
+    )));
+  }
+
+  Widget _readerActionRow(Post p) {
+    final e = _eng(p.id);
+    final liked = _liked.contains(p.id);
+    final reposted = _reposted.contains(p.id);
+    final tips = (e['tips_xno'] is num) ? (e['tips_xno'] as num).toDouble() : 0.0;
+    Widget act(IconData ic, String label, Color c, VoidCallback onTap) => InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+            child: Row(children: [
+              Icon(ic, size: 20, color: c),
+              const SizedBox(width: 6),
+              Text(label, style: TextStyle(color: c, fontSize: 13.5, fontWeight: FontWeight.w600)),
+            ]),
+          ),
+        );
+    return Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+      act(liked ? Icons.favorite : Icons.favorite_border, '${e['likes'] ?? 0}', liked ? kAccent : kDim,
+          () => _toggleLike(p)),
+      act(Icons.mode_comment_outlined, '${_commentCount[p.id] ?? 0}', kDim, () => _openComments(p)),
+      act(Icons.repeat, '${e['reposts'] ?? 0}', reposted ? kAccent : kDim, () => _toggleRepost(p)),
+      act(Icons.bolt, tips > 0 ? 'Ӿ ${tips.toStringAsFixed(2)}' : 'Tip', kAccent, () => _tallyTip(p)),
+    ]);
+  }
+
+  // ---- CHANNELS: seed-derived publishing identities (like Medium publications) ----
+  List<String> _myChannels = [];
+  Future<void> _loadChannels() async {
+    final p = await SharedPreferences.getInstance();
+    if (mounted) setState(() => _myChannels = p.getStringList('xchat_channels') ?? []);
+  }
+  Future<void> _saveChannels() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setStringList('xchat_channels', _myChannels);
+  }
+  String _channelHandle(String name) => name.trim().toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
+
+  InputDecoration _chanDeco(String hint) => InputDecoration(
+        hintText: hint, hintStyle: const TextStyle(color: kDim), counterText: '',
+        enabledBorder: const UnderlineInputBorder(borderSide: BorderSide(color: kLine)),
+        focusedBorder: const UnderlineInputBorder(borderSide: BorderSide(color: kAccent)),
+      );
+
+  void _createChannel() {
+    final nameCtl = TextEditingController();
+    final descCtl = TextEditingController();
+    final picker = ImagePicker();
+    String avatarCid = '';
+    bool saving = false, uploadingA = false;
+    showModalBottomSheet(
+      context: context, isScrollControlled: true, backgroundColor: kBg,
+      builder: (_) => StatefulBuilder(builder: (ctx, setSheet) {
+        Future<void> pickAvatar() async {
+          final x = await picker.pickImage(
+              source: ImageSource.gallery, maxWidth: 480, maxHeight: 480, imageQuality: 82);
+          if (x == null) return;
+          setSheet(() => uploadingA = true);
+          final bytes = await x.readAsBytes();
+          final cid = await Api.blobPut(bytes);
+          setSheet(() { if (cid != null) avatarCid = cid; uploadingA = false; });
+        }
+        return Padding(
+          padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('New channel', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+              const SizedBox(height: 4),
+              const Text('A publication with its own identity — restorable from your seed, followable by anyone.',
+                  style: TextStyle(color: kDim, fontSize: 12.5, height: 1.4)),
+              const SizedBox(height: 16),
+              // channel photo — the publication's avatar (a content-addressed blob, like a profile picture)
+              Row(children: [
+                GestureDetector(
+                  onTap: uploadingA ? null : pickAvatar,
+                  child: Container(
+                    width: 64, height: 64, clipBehavior: Clip.antiAlias,
+                    decoration: BoxDecoration(shape: BoxShape.circle, color: kCard, border: Border.all(color: kLine)),
+                    child: uploadingA
+                        ? const Center(child: SizedBox(height: 20, width: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: kAccent)))
+                        : (avatarCid.isEmpty
+                            ? const Icon(Icons.add_a_photo_outlined, color: kDim, size: 24)
+                            : MediaImage(cid: avatarCid, fit: BoxFit.cover)),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(child: Text(avatarCid.isEmpty ? 'Add a channel photo (optional)' : 'Photo added — tap to change',
+                    style: const TextStyle(color: kDim, fontSize: 13))),
+              ]),
+              const SizedBox(height: 14),
+              TextField(controller: nameCtl, maxLength: 40, style: const TextStyle(color: kText, fontSize: 15),
+                  decoration: _chanDeco('Channel name')),
+              const SizedBox(height: 8),
+              TextField(controller: descCtl, maxLength: 160, minLines: 2, maxLines: 3,
+                  style: const TextStyle(color: kText, fontSize: 15), decoration: _chanDeco('Description')),
+              const SizedBox(height: 12),
+              SizedBox(width: double.infinity, child: FilledButton(
+                onPressed: saving ? null : () async {
+                  final name = nameCtl.text.trim();
+                  final w = gWallet;
+                  if (name.isEmpty || w == null || _myChannels.contains(name)) { Navigator.pop(ctx); return; }
+                  setSheet(() => saving = true);
+                  final ch = w.channelWallet(name);
+                  await Api.profileSet(name, descCtl.text.trim(), avatarCid, '', signer: ch, type: 'channel');
+                  // surface the new channel's name/photo everywhere at once (don't wait for a relay round-trip)
+                  ProfileCache.I.put(ch.account, {'display': name, 'bio': descCtl.text.trim(), 'avatar': avatarCid});
+                  setState(() => _myChannels.add(name));
+                  await _saveChannels();
+                  if (!_follows.contains(ch.account)) { _follows.add(ch.account); _publishFollows(); }
+                  if (!mounted) return;
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      backgroundColor: kCard, content: Text('channel created — publish articles under it')));
+                },
+                style: FilledButton.styleFrom(backgroundColor: kAccent, foregroundColor: Colors.black),
+                child: Text(saving ? 'Creating…' : 'Create channel', style: const TextStyle(fontWeight: FontWeight.w800)),
+              )),
+            ]),
+          ),
+        );
+      }),
+    );
+  }
+
+  void _openChannels() {
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => Scaffold(
+      backgroundColor: kBg,
+      appBar: AppBar(backgroundColor: kBg, elevation: 0, iconTheme: const IconThemeData(color: kText),
+          title: const Text('Channels', style: TextStyle(color: kText, fontWeight: FontWeight.w800)),
+          actions: [IconButton(icon: const Icon(Icons.add, color: kAccent),
+              onPressed: () { Navigator.pop(context); _createChannel(); }, tooltip: 'New channel')]),
+      body: _myChannels.isEmpty
+          ? const Center(child: Padding(padding: EdgeInsets.all(32),
+              child: Text('No channels yet.\nCreate one to publish articles under a publication identity.',
+                  textAlign: TextAlign.center, style: TextStyle(color: kDim, height: 1.6))))
+          : ListView(children: [
+              for (final name in _myChannels)
+                ListTile(
+                  leading: AuthorAvatar(account: gWallet?.channelWallet(name).account ?? '',
+                      handle: _channelHandle(name), radius: 20),
+                  title: Text(name, style: const TextStyle(color: kText, fontWeight: FontWeight.w700)),
+                  subtitle: Text('@${_channelHandle(name)}', style: const TextStyle(color: kDim, fontSize: 12.5)),
+                  trailing: const Icon(Icons.chevron_right, color: kDim),
+                  onTap: () => _openProfile(gWallet?.channelWallet(name).account ?? '', _channelHandle(name)),
+                ),
+            ]),
     )));
   }
 
@@ -2405,11 +2663,39 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   void _openDms() {
+    // opening the inbox marks everything up to now as seen, so the mail badge clears
+    final nowTs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    _dmSeenTs = nowTs;
+    SharedPreferences.getInstance().then((sp) => sp.setInt('dm_seen_ts', nowTs));
+    setState(() => _dmUnread = 0);
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => DmInboxScreen(
       handleOf: _handleFor,
       isBlocked: (acc) => _blocked.contains(acc), // blocked people's DMs don't reach you
       onOpen: (acc, h) => _openChat(acc, h),
     )));
+  }
+
+  // Count conversations whose newest INCOMING message is newer than the last time DMs were opened.
+  // Runs on launch and on the same quiet cadence as the feed, so a DM that arrives while you're in the
+  // app lights the mail icon on its own (matching the bell). Best-effort: a failed poll leaves it as-is.
+  Future<void> _refreshDmBadge() async {
+    if (gWallet == null) return;
+    try {
+      final convos = await Api.dmInbox();
+      var unread = 0;
+      for (final c in convos) {
+        final msgs = (c['messages'] as List?) ?? const [];
+        var lastIn = 0;
+        for (final m in msgs) {
+          if ((m as Map)['outgoing'] != true) {
+            final ts = (m['ts'] ?? 0) as int;
+            if (ts > lastIn) lastIn = ts;
+          }
+        }
+        if (lastIn > _dmSeenTs) unread++;
+      }
+      if (mounted) setState(() => _dmUnread = unread);
+    } catch (_) {}
   }
 
   Future<void> _openChat(String account, String handle) async {
@@ -2552,7 +2838,7 @@ class _FeedScreenState extends State<FeedScreen> {
         onTipComment: _tallyCommentTip,
         onCommented: () {
           if (p.account != _account && _settings.notifyComment) {
-            Api.notifyPush(p.handle, _handle, 'comment', 'commented on your post');
+            Api.notifyPush(p.account, _handle, 'comment', 'commented on your post');
           }
         },
       ),
@@ -2574,7 +2860,7 @@ class _FeedScreenState extends State<FeedScreen> {
     });
     if (cid.isNotEmpty) Api.tipstat(cid, _rawOf(amt));
     if (acct != _account && _settings.notifyTip) {
-      Api.notifyPush(handle, _handle, 'tip', 'tipped your comment ${amt.toStringAsFixed(2)} XNO');
+      Api.notifyPush(acct, _handle, 'tip', 'tipped your comment ${amt.toStringAsFixed(2)} XNO');
     }
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         duration: const Duration(milliseconds: 1200),
@@ -2846,14 +3132,21 @@ class _FeedScreenState extends State<FeedScreen> {
     final segs = (job['segments'] as List).cast<String>();
     final pollCsv = ((job['poll'] as List?)?.cast<String>() ?? const <String>[]).join('|');
     final baseTs = job['ts'] as int?;
+    // publish under a channel identity if one was chosen: sign with the channel's derived key + its handle
+    final channel = (job['channel'] as String?) ?? '';
+    final signer = (channel.isNotEmpty && gWallet != null) ? gWallet!.channelWallet(channel) : null;
+    final postHandle = channel.isNotEmpty ? _channelHandle(channel) : (job['handle'] as String);
     String prev = '';
     for (int i = 0; i < segs.length; i++) {
       // A post's id is 'u<ts>' (seconds), so every segment MUST get a distinct ts — else a queued thread
       // (all segments share the job's single ts) collapses to one id and the reply chain breaks. +i keeps
       // order and makes each unique. (Also fixes a fast online thread posting >1 segment in the same second.)
-      final id = await Api.post(segs[i], handle: job['handle'] as String,
+      final id = await Api.post(segs[i], handle: postHandle, signer: signer,
           media: i == 0 ? mediaCid : '', mediaKind: i == 0 ? (job['mediaKind'] as String? ?? '') : '',
-          quote: i == 0 ? (job['quote'] as String? ?? '') : '', replyTo: i == 0 ? '' : prev,
+          // first segment threads under the post being replied to (X-style reply); later segments chain
+          // to the previous segment so a multi-part reply stays a self-thread under that first reply.
+          quote: i == 0 ? (job['quote'] as String? ?? '') : '',
+          replyTo: i == 0 ? (job['reply_to'] as String? ?? '') : prev,
           title: i == 0 ? (job['title'] as String? ?? '') : '', poll: i == 0 ? pollCsv : '',
           ts: baseTs == null ? null : baseTs + i);
       if (id.isEmpty) return false;
@@ -3232,6 +3525,14 @@ class _FeedScreenState extends State<FeedScreen> {
               subtitle: const Text('privately saved posts · on-device', style: TextStyle(color: kDim, fontSize: 12)),
               trailing: Text('${_bookmarks.length}', style: const TextStyle(color: kDim, fontSize: 13)),
               onTap: () { Navigator.pop(ctx); _openBookmarks(); },
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.dashboard_customize_outlined, color: kText, size: 20),
+              title: const Text('Channels', style: TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 15)),
+              subtitle: const Text('your publications · long-form articles', style: TextStyle(color: kDim, fontSize: 12)),
+              trailing: Text('${_myChannels.length}', style: const TextStyle(color: kDim, fontSize: 13)),
+              onTap: () { Navigator.pop(ctx); _openChannels(); },
             ),
             ListTile(
               contentPadding: EdgeInsets.zero,
@@ -3897,7 +4198,7 @@ class _FeedScreenState extends State<FeedScreen> {
           if (res.type != ResultType.done && mounted) {
             ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                 backgroundColor: kCard,
-                content: Text('Couldn’t open the installer (${res.message}). Allow “Install unknown apps” for ӾChat, then tap Install again.')));
+                content: Text('Couldn’t open the installer (${res.message}). Allow “Install unknown apps” for Ӿ Chat, then tap Install again.')));
           }
         }
 
@@ -4187,6 +4488,8 @@ class _FeedScreenState extends State<FeedScreen> {
         _engage = r[1] as Map<String, dynamic>;
       });
     } catch (_) {}
+    _refreshDmBadge();   // mail-icon unread count (fire-and-forget)
+    Api.announcement().then((a) { if (mounted) setState(() => _announcement = a); });  // coordinated-event banner
   }
 
   // Auto-forward anything above the safety cap to the user's external savings address (which this
@@ -4254,12 +4557,13 @@ class _FeedScreenState extends State<FeedScreen> {
     );
   }
 
-  Future<void> _compose({Post? quotedPost}) async {
+  Future<void> _compose({Post? quotedPost, Post? replyToPost}) async {
     final res = await showModalBottomSheet<ComposeResult>(
       context: context,
       isScrollControlled: true,
       backgroundColor: kBg,
-      builder: (_) => ComposeSheet(handle: _handle, account: _account, quotedPost: quotedPost),
+      builder: (_) => ComposeSheet(handle: _handle, account: _account, quotedPost: quotedPost,
+          replyToPost: replyToPost, channels: _myChannels),
     );
     if (res == null || res.segments.isEmpty) return;
     // Build the compose intent. The head signs a node-assigned CID+seq that only exist after the node
@@ -4272,9 +4576,11 @@ class _FeedScreenState extends State<FeedScreen> {
       'segments': res.segments,
       'title': res.title,
       'quote': res.quote,
+      'reply_to': replyToPost?.id ?? '',   // X-style reply: this post threads under replyToPost
       'mediaKind': res.mediaBytes != null ? res.mediaKind : '',
       'mediaB64': res.mediaBytes != null ? base64Encode(res.mediaBytes!) : '',
       'poll': res.pollOptions,
+      'channel': res.channel,
     };
     final n = res.segments.length;
 
@@ -4353,7 +4659,21 @@ class _FeedScreenState extends State<FeedScreen> {
             constraints: const BoxConstraints(),
             padding: const EdgeInsets.symmetric(horizontal: 6),
             onPressed: _openDms,
-            icon: const Icon(Icons.mail_outline, size: 21, color: kText),
+            icon: Stack(clipBehavior: Clip.none, children: [
+              const Icon(Icons.mail_outline, size: 21, color: kText),
+              if (_dmUnread > 0)
+                Positioned(
+                  right: -3, top: -3,
+                  child: Container(
+                    padding: const EdgeInsets.all(3),
+                    decoration: const BoxDecoration(color: Color(0xFFEF6C9B), shape: BoxShape.circle),
+                    constraints: const BoxConstraints(minWidth: 15, minHeight: 15),
+                    child: Text('$_dmUnread',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w800)),
+                  ),
+                ),
+            ]),
           ),
           // push wakeups: bell with unread count
           IconButton(
@@ -4703,6 +5023,7 @@ class _FeedScreenState extends State<FeedScreen> {
   Widget _homeBody() {
     final posts = _homeFeed == 0 ? _forYouPosts() : _homePosts();
     return Column(children: [
+      if (_announcement != null) _AnnouncementMarquee(text: _announcement!),
       if (_needsBackup) _backupBanner(),
       if (_update != null) _updateBanner(),
       // For You / Following segmented header (X-style), with a transparency ⓘ
@@ -5643,10 +5964,12 @@ class PostCard extends StatefulWidget {
   final bool liked, reposted;
   final int commentCount;
   final VoidCallback onTip, onLike, onRepost, onReport, onComment;
-  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete;
+  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete, onReply;
   final bool muted, blocked, bookmarked;
   final Post? quoted; // resolved quoted post (for a quote-post), rendered inline
   final bool inThread; // part of an author thread → show a thread affordance
+  final int replyCount;       // number of reply-posts to this post (X-style reply counter on the bubble)
+  final String replyingToHandle; // if this post is itself a reply, the handle it replies to ('' if none/unknown)
   final String repostedBy; // handle of the resharer who spread this to you (X-style header)
   const PostCard(
       {super.key,
@@ -5675,6 +5998,9 @@ class PostCard extends StatefulWidget {
       this.bookmarked = false,
       this.quoted,
       this.inThread = false,
+      this.onReply,
+      this.replyCount = 0,
+      this.replyingToHandle = '',
       this.repostedBy = ''});
   static void _noop() {}
   @override
@@ -5742,6 +6068,30 @@ class _PostCardState extends State<PostCard> {
               ),
             ]),
             const SizedBox(height: 3),
+            // X-style reply context: "Replying to @handle" when this post threads under another
+            if (p.replyTo != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 3),
+                child: GestureDetector(
+                  onTap: widget.onOpenThread,
+                  child: Text(
+                      widget.replyingToHandle.isNotEmpty
+                          ? 'Replying to @${widget.replyingToHandle}'
+                          : 'Replying to a post',
+                      style: const TextStyle(color: kDim, fontSize: 13)),
+                ),
+              ),
+            if (p.kind == 'article' && p.media != null && p.media!.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(14),
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 170),
+                    child: SizedBox(width: double.infinity, child: MediaImage(cid: p.media!, fit: BoxFit.cover)),
+                  ),
+                ),
+              ),
             if (p.kind == 'article' && p.title != null)
               Padding(
                 padding: const EdgeInsets.only(bottom: 4),
@@ -5804,13 +6154,13 @@ class _PostCardState extends State<PostCard> {
             _Actions(
               likes: (e['likes'] ?? 0) as int,
               reposts: (e['reposts'] ?? 0) as int,
-              comments: widget.commentCount,
+              replies: widget.replyCount,
               tipsXno: ((e['tips_xno'] ?? 0) as num).toDouble(),
               liked: widget.liked,
               reposted: widget.reposted,
               pending: widget.pending,
               views: (e['views'] ?? 0) as int,
-              onComment: widget.onComment,
+              onReply: widget.onReply,
               onLike: widget.onLike,
               onRepost: widget.onRepost,
               onQuote: widget.onQuote,
@@ -5830,6 +6180,16 @@ class _PostCardState extends State<PostCard> {
       backgroundColor: kBg,
       builder: (_) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // Comments live on as a lightweight "quiet reply" tier alongside the X-style reply-posts —
+          // reachable here from the overflow so the primary bubble stays the reply action.
+          ListTile(
+            leading: const Icon(Icons.mode_comment_outlined, color: kText),
+            title: Text(widget.commentCount > 0 ? 'Comments (${widget.commentCount})' : 'Comments',
+                style: const TextStyle(color: kText, fontWeight: FontWeight.w600)),
+            subtitle: const Text('quiet replies attached under this post',
+                style: TextStyle(color: kDim, fontSize: 11)),
+            onTap: () { Navigator.pop(context); widget.onComment(); },
+          ),
           if (widget.onBookmark != null)
             ListTile(
               leading: Icon(widget.bookmarked ? Icons.bookmark : Icons.bookmark_border, color: kAccent),
@@ -6176,12 +6536,69 @@ class _VideoScreenState extends State<VideoScreen> {
   }
 }
 
+// A right-to-left scrolling banner, shown ONLY during a coordinated event (a publisher-signed
+// announcement the node has verified). Continuous loop; speed is roughly constant regardless of length.
+class _AnnouncementMarquee extends StatefulWidget {
+  final String text;
+  const _AnnouncementMarquee({required this.text});
+  @override
+  State<_AnnouncementMarquee> createState() => _AnnouncementMarqueeState();
+}
+
+class _AnnouncementMarqueeState extends State<_AnnouncementMarquee> with SingleTickerProviderStateMixin {
+  static const _style = TextStyle(color: Colors.black, fontSize: 13, fontWeight: FontWeight.w700, height: 1.0);
+  late final AnimationController _ac;
+  late double _textW;
+
+  @override
+  void initState() {
+    super.initState();
+    _textW = _measure(widget.text);
+    final secs = (_textW / 90 + 5).clamp(10, 45).round();   // ~90 px/s, so long and short banners read alike
+    _ac = AnimationController(vsync: this, duration: Duration(seconds: secs))..repeat();
+  }
+
+  double _measure(String t) {
+    final tp = TextPainter(text: TextSpan(text: t, style: _style), textDirection: TextDirection.ltr, maxLines: 1)..layout();
+    return tp.width;
+  }
+
+  @override
+  void dispose() { _ac.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 30, width: double.infinity,
+      color: const Color(0xFFF5C518),   // warning amber — deliberately unlike the normal chrome
+      child: ClipRect(
+        child: LayoutBuilder(builder: (ctx, cons) {
+          final w = cons.maxWidth;
+          final total = w + _textW;
+          return AnimatedBuilder(
+            animation: _ac,
+            builder: (_, __) {
+              final dx = w - _ac.value * total;   // starts just off the right edge, exits off the left
+              return Stack(children: [
+                Positioned(
+                  left: dx, top: 0, bottom: 0,
+                  child: Center(child: Text(widget.text, maxLines: 1, softWrap: false, style: _style)),
+                ),
+              ]);
+            },
+          );
+        }),
+      ),
+    );
+  }
+}
+
 class _Actions extends StatelessWidget {
-  final int likes, reposts, comments, views;
+  final int likes, reposts, replies, views;
   final double tipsXno, pending;
   final bool liked, reposted;
   final VoidCallback onLike, onRepost, onTip;
-  final VoidCallback? onComment, onQuote;
+  final VoidCallback? onReply, onQuote;
   const _Actions(
       {required this.likes,
       required this.reposts,
@@ -6191,9 +6608,9 @@ class _Actions extends StatelessWidget {
       required this.onLike,
       required this.onRepost,
       required this.onTip,
-      this.comments = 0,
+      this.replies = 0,
       this.views = 0,
-      this.onComment,
+      this.onReply,
       this.onQuote,
       this.pending = 0});
   @override
@@ -6201,7 +6618,7 @@ class _Actions extends StatelessWidget {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        _act(Icons.chat_bubble_outline, comments > 0 ? '$comments' : '', kDim, onComment),
+        _act(Icons.chat_bubble_outline, replies > 0 ? '$replies' : '', kDim, onReply),
         Builder(builder: (ctx) => _act(Icons.repeat, reposts > 0 ? '$reposts' : '',
             reposted ? const Color(0xFF4DD0A7) : kDim,
             onQuote == null ? onRepost : () => _repostMenu(ctx))),
@@ -6595,19 +7012,23 @@ class ComposeResult {
   final List<String> pollOptions; // non-empty → a poll (segments.first is the question)
   final Uint8List? mediaBytes;    // an attached photo/GIF/video (goes on the first post)
   final String mediaKind;         // 'photo' or 'movie'
+  final String channel;           // publish under this channel identity (name); '' = as yourself
   ComposeResult(this.segments, this.quote,
-      {this.title = '', this.pollOptions = const [], this.mediaBytes, this.mediaKind = ''});
+      {this.title = '', this.pollOptions = const [], this.mediaBytes, this.mediaKind = '', this.channel = ''});
 }
 
 class ComposeSheet extends StatefulWidget {
   final String handle, account;
   final Post? quotedPost; // when set, this is a quote-post embedding that post
-  const ComposeSheet({super.key, required this.handle, required this.account, this.quotedPost});
+  final Post? replyToPost; // when set, this post is an X-style reply threaded under that post
+  final List<String> channels; // the author's channels — an article can be published under one
+  const ComposeSheet({super.key, required this.handle, required this.account, this.quotedPost, this.replyToPost, this.channels = const []});
   @override
   State<ComposeSheet> createState() => _ComposeSheetState();
 }
 
 class _ComposeSheetState extends State<ComposeSheet> {
+  String _asChannel = ''; // '' = publish as yourself; else the channel name
   final List<TextEditingController> _cs = [TextEditingController()];
   final _titleCtl = TextEditingController();
   final List<TextEditingController> _pollOpts = [TextEditingController(), TextEditingController()];
@@ -6617,19 +7038,48 @@ class _ComposeSheetState extends State<ComposeSheet> {
   final _picker = ImagePicker();
 
   bool get _isQuote => widget.quotedPost != null;
+  bool get _isReply => widget.replyToPost != null;
   bool get _isThread => _cs.length > 1;
   bool get _hasMedia => _mediaBytes != null;
+
+  bool _compressing = false;
 
   Future<void> _attach(bool video) async {
     final x = video
         ? await _picker.pickVideo(source: ImageSource.gallery)
         : await _picker.pickImage(source: ImageSource.gallery, imageQuality: 88, maxWidth: 1600);
     if (x == null) return;
-    final bytes = await x.readAsBytes();
-    // relay pin cap is ~6 MB — refuse larger so the blob actually survives
-    if (bytes.length > 6 * 1024 * 1024) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          backgroundColor: kCard, content: Text('too large — attachments cap at 6 MB (relay pin limit)')));
+
+    Uint8List bytes;
+    if (video) {
+      // On-device compression so more clips fit under the ~6 MB relay pin cap. Falls back to the
+      // original bytes if compression fails or isn't supported; the size check below is the backstop.
+      setState(() => _compressing = true);
+      try {
+        final info = await VideoCompress.compressVideo(
+            x.path, quality: VideoQuality.MediumQuality, deleteOrigin: false, includeAudio: true);
+        final f = info?.file;
+        bytes = (f != null) ? await f.readAsBytes() : await x.readAsBytes();
+      } catch (_) {
+        bytes = await x.readAsBytes();
+      } finally {
+        if (mounted) setState(() => _compressing = false);
+      }
+    } else {
+      bytes = await x.readAsBytes();
+    }
+
+    // relay pin cap is ~6 MB — refuse larger so the blob actually survives the relays
+    const capMb = 6;
+    if (bytes.length > capMb * 1024 * 1024) {
+      final mb = (bytes.length / (1024 * 1024)).toStringAsFixed(1);
+      final what = video ? 'Video' : 'Photo';
+      final tip = video
+          ? 'Even compressed it’s over $capMb MB — try a shorter clip.'
+          : 'Try a smaller image.';
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          backgroundColor: kCard,
+          content: Text('$what is $mb MB — the limit is $capMb MB. $tip')));
       return;
     }
     setState(() { _mediaBytes = bytes; _mediaKind = video ? 'movie' : 'photo'; });
@@ -6640,6 +7090,7 @@ class _ComposeSheetState extends State<ComposeSheet> {
     for (final c in _cs) { c.dispose(); }
     for (final c in _pollOpts) { c.dispose(); }
     _titleCtl.dispose();
+    VideoCompress.deleteAllCache();   // compressed clips are already read into memory; drop the disk cache
     super.dispose();
   }
 
@@ -6658,13 +7109,14 @@ class _ComposeSheetState extends State<ComposeSheet> {
         _article ? [segs.first] : segs, // an article is a single long-form post
         _isQuote ? widget.quotedPost!.id : '',
         title: _article ? _titleCtl.text.trim() : '',
-        mediaBytes: _mediaBytes, mediaKind: _mediaKind));
+        mediaBytes: _mediaBytes, mediaKind: _mediaKind,
+        channel: _article ? _asChannel : ''));   // articles can be published under a channel
   }
 
   @override
   Widget build(BuildContext context) {
     final bottom = MediaQuery.of(context).viewInsets.bottom;
-    final btnLabel = _isQuote ? 'Quote' : (_article ? 'Publish' : (_isThread ? 'Post all' : 'Post'));
+    final btnLabel = _isReply ? 'Reply' : (_isQuote ? 'Quote' : (_article ? 'Publish' : (_isThread ? 'Post all' : 'Post')));
     final segCount = (_article || _poll) ? 1 : _cs.length; // article/poll bodies are single
     return Padding(
       padding: EdgeInsets.only(bottom: bottom),
@@ -6679,19 +7131,50 @@ class _ComposeSheetState extends State<ComposeSheet> {
             // attach a photo/GIF or a video (not for article/poll)
             if (!_article && !_poll) ...[
               IconButton(
-                onPressed: () => _attach(false),
+                onPressed: _compressing ? null : () => _attach(false),
                 visualDensity: VisualDensity.compact,
                 icon: const Icon(Icons.image_outlined, size: 21, color: kAccent),
                 tooltip: 'Photo / GIF',
               ),
               IconButton(
-                onPressed: () => _attach(true),
+                onPressed: _compressing ? null : () => _attach(true),
                 visualDensity: VisualDensity.compact,
-                icon: const Icon(Icons.videocam_outlined, size: 21, color: kAccent),
-                tooltip: 'Video',
+                icon: _compressing
+                    ? const SizedBox(width: 18, height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: kAccent))
+                    : const Icon(Icons.videocam_outlined, size: 21, color: kAccent),
+                tooltip: _compressing ? 'Compressing…' : 'Video',
               ),
             ],
+            if (_article)
+              IconButton(
+                onPressed: () => _attach(false),      // cover reuses the media field (kind stays 'article')
+                visualDensity: VisualDensity.compact,
+                icon: Icon(_hasMedia ? Icons.image : Icons.add_photo_alternate_outlined, size: 21, color: kAccent),
+                tooltip: 'Cover image',
+              ),
             const Spacer(),
+            if (_article && widget.channels.isNotEmpty)
+              PopupMenuButton<String>(
+                initialValue: _asChannel,
+                onSelected: (v) => setState(() => _asChannel = v),
+                color: kCard,
+                itemBuilder: (_) => [
+                  const PopupMenuItem<String>(value: '', child: Text('You', style: TextStyle(color: kText))),
+                  for (final c in widget.channels)
+                    PopupMenuItem<String>(value: c, child: Text(c, style: const TextStyle(color: kText))),
+                ],
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.person_outline, size: 15, color: kAccent),
+                    const SizedBox(width: 3),
+                    Text(_asChannel.isEmpty ? 'You' : _asChannel,
+                        style: const TextStyle(color: kAccent, fontSize: 12.5, fontWeight: FontWeight.w600)),
+                    const Icon(Icons.arrow_drop_down, size: 16, color: kAccent),
+                  ]),
+                ),
+              ),
             if (!_isQuote && !_isThread && !_poll)
               // toggle long-form article mode (adds a title)
               IconButton(
@@ -6728,6 +7211,13 @@ class _ComposeSheetState extends State<ComposeSheet> {
           Flexible(
             child: SingleChildScrollView(
               child: Column(mainAxisSize: MainAxisSize.min, children: [
+                if (_isReply) Padding(
+                  padding: const EdgeInsets.only(left: 52, bottom: 8),
+                  child: Row(children: [
+                    Text('Replying to @${widget.replyToPost!.handle}',
+                        style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
+                  ]),
+                ),
                 if (_article) Padding(
                   padding: const EdgeInsets.only(bottom: 6),
                   child: TextField(

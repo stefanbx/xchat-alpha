@@ -22,7 +22,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # 2.2.1 → 2.2.2 …; anchored at 2.2.x because the phone already installed 2.2.0 and the version doubles as
 # the update-check comparison — can't go below it. NB the emitted versionCode may differ from N; only
 # that it INCREASES matters — verify with `aapt2 dump badging` if unsure.)
-version: 2.2.7+20207
+version: 2.3.0+22300
 
 environment:
   sdk: ^3.12.2
@@ -42,6 +42,8 @@ dependencies:
   shared_preferences: ^2.3.2
   video_player: ^2.9.2
   image_picker: ^1.1.2
+  video_compress: ^3.1.4   # on-device video compression so more clips fit under the relay pin cap
+  flutter_markdown: ^0.7.4 # render article bodies (long-form) as formatted markdown
   open_filex: ^4.5.0
   path_provider: ^2.1.4
   crypto: ^3.0.5
@@ -64,6 +66,18 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.1
+
+# App launcher icon (the Ӿ mark). Generate the Android mipmaps with:
+#   dart run flutter_launcher_icons
+# then commit the generated android/**/mipmap-* files (keeps the build reproducible).
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/icon/icon.png"
+  adaptive_icon_background: "assets/icon/background.png"
+  adaptive_icon_foreground: "assets/icon/foreground.png"
+  min_sdk_android: 21
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
