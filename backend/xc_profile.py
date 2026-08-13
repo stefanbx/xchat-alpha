@@ -19,7 +19,7 @@ def rd(p, d=''):
         return d
 
 def canon(acc, ts, display, bio, avatar, banner):
-    return f"{acc}|{ts}|{display}|{bio}|{avatar}|{banner}"
+    return xc.sig_canon('profile', acc, ts, display, bio, avatar, banner)
 
 def verify(pub, msg, sig):
     try:

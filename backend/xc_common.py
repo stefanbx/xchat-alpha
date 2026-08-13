@@ -189,6 +189,23 @@ def _verify_ok(pub, msg, sig):                                 # was /tmp/xc_ver
 def verify_msg(pub, msg, sig):
     return _verify_ok(pub, msg, sig) == 'ok'
 
+def sig_canon(msg_type, *fields):
+    # Unambiguous signing preimage (issue #2). Two defenses against one signature being valid for a
+    # different message than intended:
+    #   1) DOMAIN + TYPE TAG ('xchat/sig/v2/<type>') — a signature over a 'post' can't be replayed as a
+    #      'profile'/'follow'/etc.; each type has a disjoint preimage space.
+    #   2) LENGTH-PREFIXED fields ('<utf8_bytelen>:<field>') — the old 'a|b|c' join was ambiguous
+    #      because a field could itself contain '|' (free text, handles, bios), so distinct field
+    #      tuples could produce identical bytes. Prefixing every field with its exact UTF-8 byte length
+    #      makes the encoding injective: distinct tuples always yield distinct bytes.
+    # Signed as UTF-8 bytes. The Dart app builds the IDENTICAL string in NanoWallet.sigCanon — keep the
+    # two in lockstep (this is a hard wire-format break; old-format signatures no longer verify).
+    out = 'xchat/sig/v2/' + msg_type
+    for f in fields:
+        s = f if isinstance(f, str) else str(f)
+        out += '|' + str(len(s.encode('utf-8'))) + ':' + s
+    return out
+
 def keyof(seedbyte):
     return hashlib.blake2b(bytes([seedbyte] * 32) + bytes(4), digest_size=32).hexdigest()
 

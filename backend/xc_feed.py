@@ -58,7 +58,7 @@ now = time.time()
 best = {}
 for h in heads:
     exp = h.get('expires', 9e18)
-    msg = f"{h['author']}|{h['seq']}|{h['cid']}|{exp}"
+    msg = xc.sig_canon('head', h['author'], h['seq'], h['cid'], exp)
     if exp < now:
         continue                                   # expired head — ignore (needs republish)
     if not verify(h['pub'], msg, h['sig']):

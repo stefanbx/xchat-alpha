@@ -79,7 +79,10 @@ Future<bool> resolveEndpoint() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.7'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.3.0'; // this build; the update checker compares against the signed release.
+// 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
+// (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
+// heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
 // 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
 // below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)

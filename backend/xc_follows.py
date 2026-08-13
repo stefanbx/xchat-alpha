@@ -21,7 +21,7 @@ def rd(p, d=''):
         return d
 
 def canon(account, ts, follows):
-    return f"{account}|{ts}|{','.join(sorted(follows))}"
+    return xc.sig_canon('follow', account, ts, ','.join(sorted(follows)))
 
 def verify(pub, msg, sig):
     try:

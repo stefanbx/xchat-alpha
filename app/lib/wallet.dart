@@ -57,22 +57,40 @@ class NanoWallet {
   }
 
   // ---- canonical message builders (must match the node's helpers exactly) ----
-  String headMsg(int seq, String cid, int expires) => '$account|$seq|$cid|$expires';
-  String postEventMsg(String handle, String kind, String text, int ts) => '$handle|$kind|$text|$ts';
-  String commentMsg(String postId, int ts, String text, String parent) =>
-      '$postId|$account|$ts|$text|$parent';
-  String followMsg(int ts, List<String> follows) {
-    final s = [...follows]..sort();
-    return '$account|$ts|${s.join(',')}';
+  // Unambiguous signing preimage — the exact mirror of the node's xc_common.sig_canon (issue #2):
+  // a domain+type tag so a signature for one message type can't be replayed as another, and each
+  // field length-prefixed by its UTF-8 byte count so a '|' inside free text can't shift boundaries
+  // and collide two different tuples. Signed as UTF-8 bytes. HARD wire break: keep in lockstep with
+  // the node; old-format signatures no longer verify.
+  String sigCanon(String type, List<Object> fields) {
+    var out = 'xchat/sig/v2/$type';
+    for (final f in fields) {
+      final s = f is String ? f : f.toString();
+      out += '|${utf8.encode(s).length}:$s';
+    }
+    return out;
   }
-  String pollMsg(String pollId, String option, int ts) => '$pollId|$account|$option|$ts';
+
+  String headMsg(int seq, String cid, int expires) => sigCanon('head', [account, seq, cid, expires]);
+  String postEventMsg(String handle, String kind, String text, int ts) =>
+      sigCanon('post', [handle, kind, text, ts]);
+  String commentMsg(String postId, int ts, String text, String parent) =>
+      sigCanon('comment', [postId, account, ts, text, parent]);
+  String followMsg(int ts, List<String> follows) {
+    // dedupe + sort to match the node's canon (sorted(set(...))): a duplicate in the list would
+    // otherwise make the app sign a preimage the node never reconstructs, and the write is rejected.
+    final s = {...follows}.toList()..sort();
+    return sigCanon('follow', [account, ts, s.join(',')]);
+  }
+  String pollMsg(String pollId, String option, int ts) => sigCanon('poll', [pollId, account, option, ts]);
   String profileMsg(int ts, String display, String bio, String avatar, String banner) =>
-      '$account|$ts|$display|$bio|$avatar|$banner';
-  String dmKeyMsg(int ts, String dmPub) => '$account|$ts|$dmPub';
+      sigCanon('profile', [account, ts, display, bio, avatar, banner]);
+  String dmKeyMsg(int ts, String dmPub) => sigCanon('dmkey', [account, ts, dmPub]);
+  // report/reshare stay on the legacy 'report|…' / 'reshare|…' preimage for now: those are ALSO
+  // verified by the separately-deployed relay, so migrating them needs a coordinated relay deploy
+  // (tracked as a follow-up to issue #2). Their literal-prefix already gives partial type separation.
   String reportMsg(String postId, int ts) => 'report|$account|$postId|$ts';
-  String deleteMsg(String postId, int ts) => 'delete|$account|$postId|$ts';
-  // A reshare earns a slice of every tip to the post, so it is SIGNED like a report: the relay verifies
-  // it before crediting the resharer, blocking a forged "first resharer" from skimming others' tips.
+  String deleteMsg(String postId, int ts) => sigCanon('delete', [account, postId, ts]);
   String reshareMsg(String postId, int ts) => 'reshare|$account|$postId|$ts';
 
   // ---- encrypted DMs (on-device): a SEPARATE X25519 keypair derived from the seed, sealing with
