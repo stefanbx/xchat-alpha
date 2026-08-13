@@ -79,7 +79,9 @@ Future<bool> resolveEndpoint() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.7'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.2.9'; // this build; the update checker compares against the signed release.
+// 2.2.9: adds the network-announcement banner (publisher-signed, shown only during a coordinated event).
+// Signing format is UNCHANGED from 2.2.x — fully compatible with the live backend.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
 // 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
 // below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)
@@ -113,6 +115,13 @@ class XChatApp extends StatelessWidget {
         scaffoldBackgroundColor: kBg,
         colorScheme: const ColorScheme.dark(primary: kAccent, surface: kBg),
         fontFamily: 'Roboto',
+        // Snackbars override their background to the near-black kCard, but M3's default content text
+        // color assumes the light inverse-surface — so the text came out dark-on-dark (e.g. the
+        // "0 XNO — receive some before you can tip" notice). Pin light text on the dark surface.
+        snackBarTheme: const SnackBarThemeData(
+          backgroundColor: kCard,
+          contentTextStyle: TextStyle(color: kText, fontSize: 14),
+        ),
       ),
       home: const RootGate(),
     );
@@ -1028,6 +1037,21 @@ class Api {
     }
   }
 
+  // A coordinated-event banner (network migration etc.). The node returns it ONLY when a valid,
+  // publisher-signed, unexpired record is configured — so normal operation returns {active:false} and
+  // the app shows nothing. Returns the banner text, or null.
+  static Future<String?> announcement() async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/announcement'));
+      final d = jsonDecode(r.body);
+      if (d is Map && d['active'] == true) {
+        final t = '${d['text'] ?? ''}'.trim();
+        return t.isEmpty ? null : t;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   static Future<Map<String, dynamic>?> supporter(bool on, String account) async {
     try {
       final r = await http.post(Uri.parse('$kBase/api/supporter'),
@@ -1689,6 +1713,7 @@ class _FeedScreenState extends State<FeedScreen> {
   final Set<String> _viewed = {}; // ids counted as viewed this session (dedup)
   final Map<String, int> _commentCount = {}; // post_id -> comment count (lazy)
   List<Map<String, dynamic>> _notifs = []; // push payloads (mentions/replies)
+  String? _announcement;  // publisher-signed coordinated-event banner text; null in normal operation
   String _account = '';
   // supporter mode: contribute (relay/pin) ONLY when charging + on Wi-Fi
   bool _supporterOn = false, _charging = false, _wifi = false;
@@ -1749,6 +1774,9 @@ class _FeedScreenState extends State<FeedScreen> {
     // most polls are incremental (only new posts, for the pill); every 5th (~60s) pulls the full set
     // so we can also DROP posts whose head expired / was removed — the incremental slice can't show that.
     final reconcile = (++_pollTick % 5 == 0);
+    if (_pollTick % 10 == 0) {   // ~every 2 min: pick up a newly-activated announcement without a relaunch
+      Api.announcement().then((a) { if (mounted && a != _announcement) setState(() => _announcement = a); });
+    }
     try {
       // since-1 re-includes the boundary second (ts filter is strict '>'), so a post arriving in the
       // same second as our newest isn't missed; the id-dedupe below drops the tiny overlap.
@@ -4183,6 +4211,7 @@ class _FeedScreenState extends State<FeedScreen> {
         _engage = r[1] as Map<String, dynamic>;
       });
     } catch (_) {}
+    Api.announcement().then((a) { if (mounted) setState(() => _announcement = a); });  // coordinated-event banner
   }
 
   // Auto-forward anything above the safety cap to the user's external savings address (which this
@@ -4699,6 +4728,7 @@ class _FeedScreenState extends State<FeedScreen> {
   Widget _homeBody() {
     final posts = _homeFeed == 0 ? _forYouPosts() : _homePosts();
     return Column(children: [
+      if (_announcement != null) _AnnouncementMarquee(text: _announcement!),
       if (_needsBackup) _backupBanner(),
       if (_update != null) _updateBanner(),
       // For You / Following segmented header (X-style), with a transparency ⓘ
@@ -6167,6 +6197,63 @@ class _VideoScreenState extends State<VideoScreen> {
                         child: VideoPlayer(_c!)),
                   )
                 : const CircularProgressIndicator(color: kAccent),
+      ),
+    );
+  }
+}
+
+// A right-to-left scrolling banner, shown ONLY during a coordinated event (a publisher-signed
+// announcement the node has verified). Continuous loop; speed is roughly constant regardless of length.
+class _AnnouncementMarquee extends StatefulWidget {
+  final String text;
+  const _AnnouncementMarquee({required this.text});
+  @override
+  State<_AnnouncementMarquee> createState() => _AnnouncementMarqueeState();
+}
+
+class _AnnouncementMarqueeState extends State<_AnnouncementMarquee> with SingleTickerProviderStateMixin {
+  static const _style = TextStyle(color: Colors.black, fontSize: 13, fontWeight: FontWeight.w700, height: 1.0);
+  late final AnimationController _ac;
+  late double _textW;
+
+  @override
+  void initState() {
+    super.initState();
+    _textW = _measure(widget.text);
+    final secs = (_textW / 90 + 5).clamp(10, 45).round();   // ~90 px/s, so long and short banners read alike
+    _ac = AnimationController(vsync: this, duration: Duration(seconds: secs))..repeat();
+  }
+
+  double _measure(String t) {
+    final tp = TextPainter(text: TextSpan(text: t, style: _style), textDirection: TextDirection.ltr, maxLines: 1)..layout();
+    return tp.width;
+  }
+
+  @override
+  void dispose() { _ac.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 30, width: double.infinity,
+      color: const Color(0xFFF5C518),   // warning amber — deliberately unlike the normal chrome
+      child: ClipRect(
+        child: LayoutBuilder(builder: (ctx, cons) {
+          final w = cons.maxWidth;
+          final total = w + _textW;
+          return AnimatedBuilder(
+            animation: _ac,
+            builder: (_, __) {
+              final dx = w - _ac.value * total;   // starts just off the right edge, exits off the left
+              return Stack(children: [
+                Positioned(
+                  left: dx, top: 0, bottom: 0,
+                  child: Center(child: Text(widget.text, maxLines: 1, softWrap: false, style: _style)),
+                ),
+              ]);
+            },
+          );
+        }),
       ),
     );
   }
