@@ -158,6 +158,15 @@ def _verify_ok(pub, msg, sig):                                 # was /tmp/xc_ver
 def verify_msg(pub, msg, sig):
     return _verify_ok(pub, msg, sig) == 'ok'
 
+def sig_canon(msg_type, *fields):
+    # Domain+type tag + length-prefixed fields (used by the network-announcement record only; the
+    # post/head/etc. signing paths on this build are UNCHANGED / old-format).
+    out = 'xchat/sig/v2/' + msg_type
+    for f in fields:
+        s = f if isinstance(f, str) else str(f)
+        out += '|' + str(len(s.encode('utf-8'))) + ':' + s
+    return out
+
 def keyof(seedbyte):
     return hashlib.blake2b(bytes([seedbyte] * 32) + bytes(4), digest_size=32).hexdigest()
 

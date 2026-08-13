@@ -13,6 +13,7 @@ cd "$(dirname "$0")/.."
 
 rm -rf deploy/app && mkdir -p deploy/app
 cp backend/*.py deploy/app/
+cp backend/*.html deploy/app/ 2>/dev/null || true   # front-door download page
 cp relay/xc_relayd.py deploy/app/
 echo "staged $(ls deploy/app | wc -l | tr -d ' ') files into deploy/app"
 

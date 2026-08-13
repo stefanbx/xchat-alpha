@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ӾChat — download</title>
+<meta name="description" content="A censorship-free X (Twitter) on the Nano ledger. You are your key. Posts on plural relays, feeless XNO tips, self-updating. Download the Android APK.">
+<style>
+  :root{
+    --bg:#050607; --bg2:#0c0f12; --card:#0f1317; --line:#1c2228;
+    --ink:#eef3f7; --muted:#93a1ad; --accent:#2ca6e0; --accent2:#4fd1c5; --good:#38c172;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:
+      radial-gradient(1100px 620px at 50% -160px, rgba(44,166,224,.16), transparent 60%),
+      var(--bg);
+    color:var(--ink);
+    font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:680px;margin:0 auto;padding:56px 22px 72px}
+  .brand{display:flex;align-items:center;gap:12px;justify-content:center;margin-bottom:26px}
+  .mark{
+    font-weight:800;font-size:30px;line-height:1;color:#fff;
+    width:52px;height:52px;border-radius:14px;display:grid;place-items:center;
+    background:linear-gradient(150deg,var(--accent),#1b6fa8);
+    box-shadow:0 8px 30px rgba(44,166,224,.35);
+  }
+  .brand b{font-size:22px;letter-spacing:.2px}
+  h1{font-size:30px;line-height:1.18;text-align:center;margin:6px 0 10px;letter-spacing:-.3px;text-wrap:balance}
+  .sub{text-align:center;color:var(--muted);max-width:56ch;margin:0 auto 30px}
+  .sub b{color:var(--ink);font-weight:600}
+  .cta{display:block;text-decoration:none;text-align:center;margin:0 auto 12px;max-width:420px;
+    background:linear-gradient(150deg,var(--accent),#1b7bb5);color:#fff;font-weight:700;font-size:18px;
+    padding:17px 22px;border-radius:14px;box-shadow:0 10px 34px rgba(44,166,224,.32);transition:transform .08s ease}
+  .cta:active{transform:translateY(1px)}
+  .cta small{display:block;font-weight:500;font-size:12.5px;opacity:.85;margin-top:3px}
+  .osnote{text-align:center;color:var(--muted);font-size:13px;margin-bottom:34px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px 20px;margin:16px 0}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin:0 0 14px;font-weight:700}
+  ol.steps{margin:0;padding:0;list-style:none;counter-reset:s}
+  ol.steps li{counter-increment:s;position:relative;padding:0 0 14px 40px;color:var(--ink)}
+  ol.steps li:last-child{padding-bottom:0}
+  ol.steps li::before{content:counter(s);position:absolute;left:0;top:-2px;width:26px;height:26px;border-radius:8px;
+    background:rgba(44,166,224,.14);color:var(--accent);font-weight:700;font-size:13px;display:grid;place-items:center}
+  ol.steps b{color:#fff}
+  .muted{color:var(--muted)}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .hash{background:#080b0d;border:1px solid var(--line);border-radius:10px;padding:12px 12px;overflow-x:auto;
+    font-size:12.5px;color:var(--accent2);white-space:nowrap}
+  .verify{background:#080b0d;border:1px solid var(--line);border-radius:10px;padding:12px 12px;overflow-x:auto;
+    font-size:12.5px;color:var(--ink);white-space:nowrap;margin-top:10px}
+  .why{display:grid;gap:12px}
+  .why div{padding-left:16px;border-left:2px solid rgba(44,166,224,.4)}
+  .why b{color:#fff}
+  .foot{text-align:center;color:var(--muted);font-size:13px;margin-top:32px;line-height:1.9}
+  .foot a{color:var(--accent);text-decoration:none}
+  .foot a:hover{text-decoration:underline}
+  .pill{display:inline-block;font-size:12px;color:var(--good);border:1px solid rgba(56,193,114,.35);
+    background:rgba(56,193,114,.08);border-radius:999px;padding:3px 10px;margin:0 auto 22px;}
+  .center{text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="brand"><span class="mark">Ӿ</span><b>ӾChat</b></div>
+
+  <div class="center"><span class="pill">● alpha · live network</span></div>
+
+  <h1>A censorship-free X — you are your key.</h1>
+  <p class="sub">No email, no password, no company. Your account is a <b>Nano keypair</b> on your phone.
+     Posts are signed events on <b>plural relays anyone can run</b>; tips are <b>real, feeless XNO</b>;
+     and the app <b>updates itself</b> over its own network — no app store in the path.</p>
+
+  <a class="cta" href="https://github.com/stefanbx/xchat-alpha/raw/master/apk/xchat-alpha.apk">
+    Download for Android
+    <small>signed APK · 20 MB · verify the checksum below</small>
+  </a>
+  <p class="osnote">Android only for now (Apple gates sideloading). iOS is on the roadmap.</p>
+
+  <div class="card">
+    <h2>Install (60 seconds)</h2>
+    <ol class="steps">
+      <li>Tap <b>Download for Android</b> above and open the file.</li>
+      <li>Android asks to <b>allow installing unknown apps</b> — allow it (it's a signed build; verify the hash to be sure).</li>
+      <li>Open ӾChat, <b>create a wallet</b>, and <b>back up your seed</b> — it <i>is</i> your account; lose it and it's gone.</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>Verify it's the real build</h2>
+    <p class="muted" style="margin:0 0 10px">SHA-256 of <span class="mono">xchat-alpha.apk</span>:</p>
+    <div class="hash">bc93eb567b27fb470f05ab0d0f6f5fdd81b7c8ac6efb7bd7d21180314ba7f86f</div>
+    <div class="verify">shasum -a 256 xchat-alpha.apk</div>
+    <p class="muted" style="margin:12px 0 0;font-size:13px">The whole app is open source and the build is
+       reproducible — you can rebuild this exact APK yourself from the repo.</p>
+  </div>
+
+  <div class="card">
+    <h2>Why it's different</h2>
+    <div class="why">
+      <div><b>You are your key.</b> Restore your seed on any phone and your posts, follows and tips come back. Nothing to seize.</div>
+      <div><b>No gatekeeper.</b> The app finds relays by scanning the Nano ledger — no hardcoded server, no directory anyone can take down.</div>
+      <div><b>Real, feeless tips.</b> A tip is actual XNO, settled from your phone with your own key. Getting paid for a post, not begging for engagement.</div>
+      <div><b>It updates itself.</b> New versions arrive over the app's own relays — publisher-signed and hash-checked on your phone before you tap install.</div>
+    </div>
+  </div>
+
+  <p class="foot">
+    Source &amp; checksums → <a href="https://github.com/stefanbx/xchat-alpha">github.com/stefanbx/xchat-alpha</a><br>
+    How it works → <a href="https://github.com/stefanbx/xchat-alpha/blob/master/docs/WHITEPAPER.md">read the whitepaper</a><br>
+    <span class="muted">Ӿ is the XNO symbol · served by a ӾChat node, not a third party</span>
+  </p>
+
+</div>
+</body>
+</html>

@@ -27,6 +27,21 @@ sys.path.insert(0, HERE)
 import xc_common as xc                                       # for api_me + wallet paths
 import xc_engage                                             # hot engagement path, called IN-PROCESS (no spawn)
 
+# Human landing / download page, served on the node's PUBLIC url (/, /download, /get, /app). The node
+# is the app's front door AND its own relay, so hosting the page here means ӾChat's own censorship-
+# resistant infra serves its download — no third party (app store, artifact host, Pages) can pull it.
+# Loaded once at startup; a minimal inline fallback keeps the front door serving if the file is missing.
+try:
+    with open(os.path.join(HERE, 'download.html'), encoding='utf-8') as _f:
+        DOWNLOAD_PAGE = _f.read()
+except Exception:
+    DOWNLOAD_PAGE = ('<!doctype html><meta charset=utf-8><title>ӾChat</title>'
+                     '<body style="background:#050607;color:#eef3f7;font-family:sans-serif;text-align:center;padding:14vh 6vw">'
+                     '<h1>ӾChat</h1><p>A censorship-free X on the Nano ledger.</p>'
+                     '<p><a style="color:#2ca6e0" href="https://github.com/stefanbx/xchat-alpha/raw/master/apk/xchat-alpha.apk">Download the Android APK</a></p>'
+                     '<p><a style="color:#2ca6e0" href="https://github.com/stefanbx/xchat-alpha">Source &amp; checksums</a></p></body>')
+DOWNLOAD_PATHS = ('/', '/download', '/get', '/app')
+
 def _env():
     return {**os.environ, 'XC_NS': NS,
             'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin')}
@@ -59,6 +74,21 @@ def read(path, default=''):
     except Exception:
         pass
     return out or default
+
+# The server is a ThreadingHTTPServer, but the file-based helpers talk over FIXED /tmp paths
+# (/tmp/xc_<group>_rec.json + _result.json). Two concurrent requests to the same helper would
+# race: A writes its rec, B overwrites it before A's helper reads it (A verifies B's payload), or
+# B's result is read back as A's answer. Serialize the whole put→spawn→read triple PER HELPER
+# GROUP so different endpoints stay concurrent while same-endpoint requests can't interleave on
+# their shared files. (The hot like/repost/view path is in-process and never touches these files.)
+_ipc_locks = {}
+_ipc_locks_guard = threading.Lock()
+def ipc_lock(group):
+    with _ipc_locks_guard:
+        lk = _ipc_locks.get(group)
+        if lk is None:
+            lk = _ipc_locks[group] = threading.Lock()
+        return lk
 
 # ---- inline routes ----
 def api_me(acct):
@@ -274,9 +304,10 @@ def api_release_check(current):
     c = _relcheck_cache.get(current)
     if c and now - c[1] < 20:
         return c[0]
-    put('/tmp/xc_rel_current.txt', current)
-    spawn('xc_release.py', 'check')
-    r = read('/tmp/xc_release_result.json', '{}')
+    with ipc_lock('release'):
+        put('/tmp/xc_rel_current.txt', current)
+        spawn('xc_release.py', 'check')
+        r = read('/tmp/xc_release_result.json', '{}')
     try:
         ok = json.loads(r).get('ok') is True
     except Exception:
@@ -286,6 +317,32 @@ def api_release_check(current):
         if len(_relcheck_cache) > 64:
             _relcheck_cache.pop(next(iter(_relcheck_cache)), None)
     return r
+
+# The pinned publisher account — the ONLY identity whose announcement the node will serve. Overridable
+# for self-hosters, but defaults to the same account that signs releases.
+PUBLISHER_ACCT = (os.environ.get('XC_PUBLISHER_ACCOUNT', '')
+                  or 'nano_3nefzmwosgqdo97pt6rzjiiazrgx5sf58eksbsbbhrmca7cg3fxisora1dp8')
+
+def api_announcement():
+    # A coordinated-event banner (e.g. a network migration). Served ONLY if a publisher-SIGNED, unexpired
+    # record is present — so a rogue relay or a node operator without the publisher key can't forge the
+    # "back up your seed / move your funds" message. No record => nothing shown (normal operation).
+    raw = os.environ.get('XC_ANNOUNCEMENT', '')
+    if not raw:
+        try:
+            with open(os.path.join(HERE, 'announcement.json'), encoding='utf-8') as f:
+                raw = f.read()
+        except Exception:
+            return '{"active": false}'
+    try:
+        a = json.loads(raw)
+        canon = xc.sig_canon('announce', a['text'], a['ts'], a['expires'])
+        if (xc.pub_to_addr(a['pub']) == PUBLISHER_ACCT and xc.verify_msg(a['pub'], canon, a['sig'])
+                and int(time.time()) < int(a['expires'])):
+            return json.dumps({'active': True, 'text': a['text'], 'expires': int(a['expires'])})
+    except Exception:
+        pass
+    return '{"active": false}'
 
 def api_status():
     try:
@@ -304,21 +361,27 @@ def route(path, query, body):
     if path.startswith('/api/pin_targets'):  return api_pin_targets()
     # prefix collisions: /api/media_relay must precede /api/media, which must precede /api/me.
     if path.startswith('/api/media_relay'):   return api_media_relay(q('cid'))
-    if path.startswith('/api/media'):        put('/tmp/xc_media_cid.txt', q('cid')); spawn('xc_media.py');    return read('/tmp/xc_media_result.json', '{}')
+    if path.startswith('/api/media'):
+        with ipc_lock('media'):
+            put('/tmp/xc_media_cid.txt', q('cid')); spawn('xc_media.py'); return read('/tmp/xc_media_result.json', '{}')
     if path.startswith('/api/me'):           return api_me(q('account'))
     if path.startswith('/api/status'):       return api_status()
+    if path.startswith('/api/announcement'):  return api_announcement()
     if path.startswith('/api/labels'):       return api_labels()
 
     # on-device posting: two-step round-trip. These are prefixes of /api/post, so match them FIRST.
     if path.startswith('/api/post_prepare'):
-        put('/tmp/xc_post_rec.json', json.dumps(body)); spawn('xc_post.py', 'prepare')   # app-signed post event
-        return read('/tmp/xc_post_result.json', '{}')
+        with ipc_lock('post'):
+            put('/tmp/xc_post_rec.json', json.dumps(body)); spawn('xc_post.py', 'prepare')   # app-signed post event
+            return read('/tmp/xc_post_result.json', '{}')
     if path.startswith('/api/post_delete'):
-        put('/tmp/xc_delete_rec.json', json.dumps(body)); spawn('xc_post.py', 'delete')  # app-signed delete event
-        return read('/tmp/xc_post_result.json', '{}')
+        with ipc_lock('post'):
+            put('/tmp/xc_delete_rec.json', json.dumps(body)); spawn('xc_post.py', 'delete')  # app-signed delete event
+            return read('/tmp/xc_post_result.json', '{}')
     if path.startswith('/api/post_submit'):
-        put('/tmp/xc_head_rec.json', json.dumps(body)); spawn('xc_post.py', 'submit')     # app-signed head
-        return read('/tmp/xc_post_result.json', '{}')
+        with ipc_lock('post'):
+            put('/tmp/xc_head_rec.json', json.dumps(body)); spawn('xc_post.py', 'submit')     # app-signed head
+            return read('/tmp/xc_post_result.json', '{}')
 
     # SEEDLESS NODE: the legacy node-signed /api/post, /api/wallet and /api/settle are removed. Posting,
     # tips, sends and the wallet seed are all on-device now (see /api/post_prepare + /api/post_submit and
@@ -334,50 +397,87 @@ def route(path, query, body):
     if path.startswith('/api/notify_push'):
         return json.dumps(xc_engage.notify({'to': b('to'), 'from': b('from'), 'kind': b('kind'),
                                             'text': b('text'), 'ts': int(time.time())}))
-    if path.startswith('/api/notify'):       spawn('xc_notify.py');                                           return read('/tmp/xc_notify.json', '{}')
+    if path.startswith('/api/notify'):
+        with ipc_lock('notify'):
+            put('/tmp/xc_notify_acct.txt', q('account'))   # route by the viewer's unique account, not a shared handle
+            spawn('xc_notify.py'); return read('/tmp/xc_notify.json', '{}')
 
     # on-device money: the app builds + signs every state block; the node only reads ledger state and
     # adds delegated PoW + broadcasts a fully-signed block (send / receive / open / change / settle).
     if path.startswith('/api/account_state'): return api_account_state(q('account'))
     if path.startswith('/api/receivables'):   return api_receivables(q('account'))
     if path.startswith('/api/block_process'):
-        put('/tmp/xc_block_in.json', json.dumps(body)); spawn('xc_blockproc.py')   # app-signed block; node adds PoW + broadcasts
-        return read('/tmp/xc_block_result.json', '{}')
+        with ipc_lock('block'):
+            put('/tmp/xc_block_in.json', json.dumps(body)); spawn('xc_blockproc.py')   # app-signed block; node adds PoW + broadcasts
+            return read('/tmp/xc_block_result.json', '{}')
 
-    if path.startswith('/api/report'):       put('/tmp/xc_report_rec.json', json.dumps(body)); spawn('xc_report.py'); return read('/tmp/xc_report_result.json', '{}')
-    if path.startswith('/api/follows_set'):  put('/tmp/xc_follows_rec.json', json.dumps(body)); spawn('xc_follows.py','pub'); return read('/tmp/xc_follows_result.json','{}')
-    if path.startswith('/api/follows_get'):  put('/tmp/xc_follows_acct.txt', q('account')); spawn('xc_follows.py', 'get');  return read('/tmp/xc_follows_result.json', '{}')
+    if path.startswith('/api/report'):
+        with ipc_lock('report'):
+            put('/tmp/xc_report_rec.json', json.dumps(body)); spawn('xc_report.py'); return read('/tmp/xc_report_result.json', '{}')
+    if path.startswith('/api/follows_set'):
+        with ipc_lock('follows'):
+            put('/tmp/xc_follows_rec.json', json.dumps(body)); spawn('xc_follows.py','pub'); return read('/tmp/xc_follows_result.json','{}')
+    if path.startswith('/api/follows_get'):
+        with ipc_lock('follows'):
+            put('/tmp/xc_follows_acct.txt', q('account')); spawn('xc_follows.py', 'get');  return read('/tmp/xc_follows_result.json', '{}')
 
     if path.startswith('/api/comment_post'):
-        put('/tmp/xc_comment_rec.json', json.dumps(body))   # app-signed record; node verifies + relays
-        spawn('xc_comments.py', 'post');     return read('/tmp/xc_comments_result.json', '{}')
-    if path.startswith('/api/comments_get'): put('/tmp/xc_comment_post.txt', q('post')); spawn('xc_comments.py','get'); return read('/tmp/xc_comments_result.json','{}')
+        with ipc_lock('comment'):
+            put('/tmp/xc_comment_rec.json', json.dumps(body))   # app-signed record; node verifies + relays
+            spawn('xc_comments.py', 'post');     return read('/tmp/xc_comments_result.json', '{}')
+    if path.startswith('/api/comments_get'):
+        with ipc_lock('comment'):
+            put('/tmp/xc_comment_post.txt', q('post')); spawn('xc_comments.py','get'); return read('/tmp/xc_comments_result.json','{}')
 
     if path.startswith('/api/profile_set'):
-        put('/tmp/xc_profile_rec.json', json.dumps(body))   # app-signed record; node verifies + relays
-        spawn('xc_profile.py', 'pub');       return read('/tmp/xc_profile_result.json', '{}')
-    if path.startswith('/api/profile_get'):  put('/tmp/xc_profile_account.txt', q('account')); spawn('xc_profile.py','get'); return read('/tmp/xc_profile_result.json','{}')
+        with ipc_lock('profile'):
+            put('/tmp/xc_profile_rec.json', json.dumps(body))   # app-signed record; node verifies + relays
+            spawn('xc_profile.py', 'pub');       return read('/tmp/xc_profile_result.json', '{}')
+    if path.startswith('/api/profile_get'):
+        with ipc_lock('profile'):
+            put('/tmp/xc_profile_account.txt', q('account')); spawn('xc_profile.py','get'); return read('/tmp/xc_profile_result.json','{}')
 
-    if path.startswith('/api/poll_vote'):    put('/tmp/xc_poll_rec.json', json.dumps(body)); spawn('xc_poll.py','vote'); return read('/tmp/xc_poll_result.json','{}')
-    if path.startswith('/api/poll_get'):     put('/tmp/xc_poll_id.txt', q('poll')); put('/tmp/xc_poll_acct.txt', q('account')); spawn('xc_poll.py','get'); return read('/tmp/xc_poll_result.json', '{}')
+    if path.startswith('/api/poll_vote'):
+        with ipc_lock('poll'):
+            put('/tmp/xc_poll_rec.json', json.dumps(body)); spawn('xc_poll.py','vote'); return read('/tmp/xc_poll_result.json','{}')
+    if path.startswith('/api/poll_get'):
+        with ipc_lock('poll'):
+            put('/tmp/xc_poll_id.txt', q('poll')); put('/tmp/xc_poll_acct.txt', q('account')); spawn('xc_poll.py','get'); return read('/tmp/xc_poll_result.json', '{}')
 
     # on-device DMs: the app seals/opens locally; the node verifies the signed key record + relays ciphertext.
-    if path.startswith('/api/dm_key_set'):   put('/tmp/xc_dm_rec.json', json.dumps(body)); spawn('xc_dm.py','register'); return read('/tmp/xc_dm_result.json','{}')
-    if path.startswith('/api/dm_key_get'):   put('/tmp/xc_dm_peer.txt', q('account')); spawn('xc_dm.py','keyget');       return read('/tmp/xc_dm_result.json','{}')
-    if path.startswith('/api/dm_send'):      put('/tmp/xc_dm_msg.json', json.dumps(body)); spawn('xc_dm.py','send');    return read('/tmp/xc_dm_result.json','{}')
-    if path.startswith('/api/dm_inbox'):     put('/tmp/xc_dm_acct.txt', q('account')); spawn('xc_dm.py','inbox');       return read('/tmp/xc_dm_result.json','{}')
+    if path.startswith('/api/dm_key_set'):
+        with ipc_lock('dm'):
+            put('/tmp/xc_dm_rec.json', json.dumps(body)); spawn('xc_dm.py','register'); return read('/tmp/xc_dm_result.json','{}')
+    if path.startswith('/api/dm_key_get'):
+        with ipc_lock('dm'):
+            put('/tmp/xc_dm_peer.txt', q('account')); spawn('xc_dm.py','keyget');       return read('/tmp/xc_dm_result.json','{}')
+    if path.startswith('/api/dm_send'):
+        with ipc_lock('dm'):
+            put('/tmp/xc_dm_msg.json', json.dumps(body)); spawn('xc_dm.py','send');    return read('/tmp/xc_dm_result.json','{}')
+    if path.startswith('/api/dm_inbox'):
+        with ipc_lock('dm'):
+            put('/tmp/xc_dm_acct.txt', q('account')); spawn('xc_dm.py','inbox');       return read('/tmp/xc_dm_result.json','{}')
 
-    if path.startswith('/api/blob_put'):     put('/tmp/xc_blob_in.txt', b('b64')); spawn('xc_blobput.py');    return read('/tmp/xc_blobput_result.json', '{}')
+    if path.startswith('/api/blob_put'):
+        with ipc_lock('blob'):
+            put('/tmp/xc_blob_in.txt', b('b64')); spawn('xc_blobput.py');    return read('/tmp/xc_blobput_result.json', '{}')
 
     if path.startswith('/api/release_check'): return api_release_check(q('current'))
-    if path.startswith('/api/release_fetch'): put('/tmp/xc_rel_cid.txt', b('cid')); put('/tmp/xc_rel_sha.txt', b('sha256')); spawn('xc_release.py','fetch'); return read('/tmp/xc_release_result.json','{}')
+    if path.startswith('/api/release_fetch'):
+        with ipc_lock('release'):
+            put('/tmp/xc_rel_cid.txt', b('cid')); put('/tmp/xc_rel_sha.txt', b('sha256')); spawn('xc_release.py','fetch'); return read('/tmp/xc_release_result.json','{}')
 
     if path.startswith('/api/head'):         return api_head(q('account'))   # app re-signs it to republish (seedless)
-    if path.startswith('/api/gossip'):       spawn('xc_gossip.py');                                           return read('/tmp/xc_gossip_result.json', '{}')
-    if path.startswith('/api/pincontent'):   spawn('xc_pin.py');                                              return read('/tmp/xc_pin_result.json', '{}')
+    if path.startswith('/api/gossip'):
+        with ipc_lock('gossip'):
+            spawn('xc_gossip.py'); return read('/tmp/xc_gossip_result.json', '{}')
+    if path.startswith('/api/pincontent'):
+        with ipc_lock('pin'):
+            spawn('xc_pin.py'); return read('/tmp/xc_pin_result.json', '{}')
     if path.startswith('/api/supporter'):
-        put('/tmp/xc_supporter_in.json', json.dumps({'account': b('account'), 'on': b('on'), 'ts': b('ts')}))
-        spawn('xc_supporter.py');            return read('/tmp/xc_supporter_result.json', '{}')
+        with ipc_lock('supporter'):
+            put('/tmp/xc_supporter_in.json', json.dumps({'account': b('account'), 'on': b('on'), 'ts': b('ts')}))
+            spawn('xc_supporter.py');            return read('/tmp/xc_supporter_result.json', '{}')
 
     return '{"error":"not found"}'
 
@@ -392,6 +492,16 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_html(self, html):
+        data = html.encode() if isinstance(html, str) else html
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Cache-Control', 'public, max-age=300')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -415,6 +525,8 @@ class H(BaseHTTPRequestHandler):
 
     def _handle(self, body, raw=b''):
         u = urllib.parse.urlparse(self.path)
+        if self.command == 'GET' and u.path in DOWNLOAD_PATHS:  # human landing / download page (front door)
+            return self._send_html(DOWNLOAD_PAGE)
         if not u.path.startswith('/api/') and u.path != '/':   # /api/* is kt_server's; the rest is the relay's
             return self._proxy_relay(raw)
         self._send(route(u.path, urllib.parse.parse_qs(u.query), body))
