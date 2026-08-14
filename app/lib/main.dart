@@ -1798,8 +1798,8 @@ class _FeedScreenState extends State<FeedScreen> {
   bool _autoSettle = false;
   double _autoThreshold = 0.05, _autoCap = 1.0, _autoSpent = 0.0;
   int _tab = 0; // 0 = Home, 1 = Discover (everyone + search)
-  int _homeFeed = 1; // 0 = For You (ranked), 1 = Following (chronological, newest-first) — default so a
-  // user's own just-made post reliably lands on top ("last on top"); For You is one tap away.
+  int _homeFeed = 0; // 0 = For You (ranked), 1 = Following (STRICT: only accounts you follow). Open on
+  // For You so a user who follows nobody isn't greeted by an empty Following tab.
   List<Map<String, dynamic>> _outbox = []; // posts composed OFFLINE, queued + auto-flushed on reconnect
   bool _flushing = false;                  // guards _flushOutbox against re-entrancy
   Map<String, dynamic>? _update;           // a newer signed release found by the launch auto-check
@@ -2489,10 +2489,17 @@ class _FeedScreenState extends State<FeedScreen> {
 
   // Home shows the people you follow (+ your own posts); everyone if you follow no one yet
   List<Post> _homePosts() {
-    final base = _follows.isEmpty
-        ? _posts
-        : _posts.where((p) => _follows.contains(p.account) || p.account == _account);
-    return base.where((p) => !_reported.contains(p.id) && !_hidden(p.account)).toList();
+    // STRICT Following: only accounts you follow (+ your own). Follow nobody → empty, and the feed shows
+    // a discover prompt instead of falling back to everyone. Roots only (replyTo == null) — replies are
+    // rendered NESTED under their parent via _threadGroup, not as separate top-level entries.
+    if (_follows.isEmpty) return const [];
+    return _posts
+        .where((p) =>
+            (_follows.contains(p.account) || p.account == _account) &&
+            !_reported.contains(p.id) &&
+            !_hidden(p.account) &&
+            p.replyTo == null)
+        .toList();
   }
 
   // ---- "For You": a TRANSPARENT, tunable ranking (unlike a black-box algorithm) ----
@@ -2642,6 +2649,43 @@ class _FeedScreenState extends State<FeedScreen> {
       }
     }
     return n;
+  }
+
+  // Every reply in the thread below a post, in reading order (depth-first, oldest-first at each level).
+  // Used to render replies NESTED under their parent in the feed. Spans the loaded feed + new posts.
+  List<Post> _threadReplies(String rootId) {
+    final kids = <String, List<Post>>{};
+    for (final p in [..._posts, ..._newPosts]) {
+      final parent = p.replyTo;
+      if (parent != null && parent.isNotEmpty) (kids[parent] ??= []).add(p);
+    }
+    final out = <Post>[];
+    final seen = <String>{};
+    void walk(String id) {
+      final cs = (kids[id] ?? [])..sort((a, b) => a.ts.compareTo(b.ts));
+      for (final c in cs) {
+        if (seen.add(c.id)) { out.add(c); walk(c.id); }
+      }
+    }
+    walk(rootId);
+    return out;
+  }
+
+  // A feed entry = a root post plus its replies nested beneath it (comment-section style). A left rule
+  // + indent marks the replies as belonging to the post above. Replies reuse the same card (so tip /
+  // like / reply / moderation all work identically); moderation/hidden handling stays per-post.
+  Widget _threadGroup(Post root) {
+    final replies = _threadReplies(root.id);
+    if (replies.isEmpty) return _profileCard(root);
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      _profileCard(root),
+      ...replies.map((r) => Container(
+            padding: const EdgeInsets.only(left: 22),
+            decoration: const BoxDecoration(
+                border: Border(left: BorderSide(color: kLine, width: 2))),
+            child: _profileCard(r),
+          )),
+    ]);
   }
 
   Post _threadRoot(Post p) {
@@ -5337,8 +5381,9 @@ class _FeedScreenState extends State<FeedScreen> {
                       : const _LedgerFooter();
                 }
                 // stable identity per post so a feed refresh matches elements by post, not by slot —
-                // without this the list recycles cards across posts and their media gets mismatched
-                return KeyedSubtree(key: ValueKey(posts[j].id), child: _profileCard(posts[j]));
+                // without this the list recycles cards across posts and their media gets mismatched.
+                // _threadGroup renders the root plus its replies nested beneath it (comment-section style).
+                return KeyedSubtree(key: ValueKey(posts[j].id), child: _threadGroup(posts[j]));
               },
             ),
           ),
@@ -5645,7 +5690,7 @@ class _DiscoverHint extends StatelessWidget {
         padding: const EdgeInsets.all(22),
         alignment: Alignment.center,
         child: const Text(
-            '👋 you follow no one yet — showing everyone.\ntap Discover to find people to follow.',
+            '👋 you follow no one yet.\nFollowing shows only people you follow — tap Discover to find some, or switch to For You.',
             textAlign: TextAlign.center,
             style: TextStyle(color: kDim, fontSize: 12, height: 1.6)),
       );
