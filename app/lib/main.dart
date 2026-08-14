@@ -277,6 +277,29 @@ class BookmarkStore {
       (await SharedPreferences.getInstance()).setStringList(_k, s.toList());
 }
 
+// On-device record of every settled tip — what ACTUALLY moved on-chain, per leg (creator / relay /
+// reposter), each with its Nano block hash. This is the TIPPER's own receipt trail: the network only
+// notifies the recipient, so without this the sender had no way to see, or independently verify, what
+// they paid. Newest first, capped; each entry a small JSON blob.
+class TxLogStore {
+  static const _k = 'xchat_txlog';
+  static const _cap = 300;
+  static Future<List<Map<String, dynamic>>> get() async {
+    final raw = (await SharedPreferences.getInstance()).getStringList(_k) ?? const <String>[];
+    return raw
+        .map((s) { try { return Map<String, dynamic>.from(jsonDecode(s)); } catch (_) { return <String, dynamic>{}; } })
+        .where((m) => m.isNotEmpty)
+        .toList();
+  }
+  static Future<void> add(Map<String, dynamic> tx) async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getStringList(_k) ?? <String>[];
+    raw.insert(0, jsonEncode(tx));
+    if (raw.length > _cap) raw.removeRange(_cap, raw.length);
+    await sp.setStringList(_k, raw);
+  }
+}
+
 // remembers the update version the user dismissed, so the auto-check banner nags once per version, not
 // every launch. ("" = nothing dismissed.)
 class UpdateDismiss {
@@ -738,15 +761,33 @@ class Api {
       final relayRaw = relay.isNotEmpty ? amtRaw * BigInt.from(sp) ~/ BigInt.from(100) : BigInt.zero;
       final reposterRaw = reposter.isNotEmpty ? amtRaw * BigInt.from(rp) ~/ BigInt.from(100) : BigInt.zero;
       final creatorRaw = amtRaw - relayRaw - reposterRaw;
-      // sequential on-device sends (each consumes the frontier)
-      final ch = await _sendRaw(w, to, creatorRaw);
-      if (relay.isNotEmpty && relayRaw > BigInt.zero) await _sendRaw(w, relay, relayRaw);
-      if (reposter.isNotEmpty && reposterRaw > BigInt.zero) await _sendRaw(w, reposter, reposterRaw);
+      // Split legs, creator first so a partial chain still pays the creator. All legs are sent as ONE
+      // locally-chained sequence (see _sendChain) — the old code re-read the frontier over RPC between
+      // legs, so the relay/reposter block was signed on a not-yet-observed frontier and silently
+      // rejected as a fork. Every follow-on leg was dropped and the failure never surfaced.
+      final legs = <Map<String, dynamic>>[
+        {'role': 'creator', 'to': to, 'raw': creatorRaw},
+        if (relay.isNotEmpty && relayRaw > BigInt.zero) {'role': 'relay', 'to': relay, 'raw': relayRaw},
+        if (reposter.isNotEmpty && reposterRaw > BigInt.zero)
+          {'role': 'reposter', 'to': reposter, 'raw': reposterRaw},
+      ];
+      final results = await _sendChain(w, legs);
+      final creatorLeg = results.firstWhere((r) => r['role'] == 'creator', orElse: () => {'ok': false});
+      final paidRaw = results
+          .where((r) => r['ok'] == true)
+          .fold<BigInt>(BigInt.zero, (a, r) => a + (r['raw'] as BigInt));
       return {
-        'ok': ch != null, 'to': to, 'amount': amount, 'hash': ch,
-        'creator_xno': creatorRaw / BigInt.from(10).pow(30),
-        'relay': relay.isEmpty ? null : relay, 'relay_xno': relayRaw / BigInt.from(10).pow(30),
-        'reposter': reposter.isEmpty ? null : reposter, 'reposter_xno': reposterRaw / BigInt.from(10).pow(30),
+        // "settled" means the CREATOR was actually paid — not merely that the tally was cleared.
+        'ok': creatorLeg['ok'] == true,
+        'to': to, 'amount': amount, 'hash': creatorLeg['hash'],
+        'legs': results
+            .map((r) => {
+                  'role': r['role'], 'to': r['to'],
+                  'xno': (r['raw'] as BigInt) / BigInt.from(10).pow(30),
+                  'ok': r['ok'] == true, 'hash': r['hash'], 'error': r['error'],
+                })
+            .toList(),
+        'paid_xno': paidRaw / BigInt.from(10).pow(30),
         'split_pct': sp, 'repost_pct': rp, 'work_delegated': true,
       };
     } catch (e) {
@@ -852,6 +893,41 @@ class Api {
     final r = await blockProcess(block, 'send');
     if (r?['ok'] == true) return r?['hash'] as String?;
     return null;
+  }
+
+  // Send several amounts from ONE account as a single locally-chained sequence. Each block uses the
+  // PREVIOUS leg's own block hash as its `previous` (the node returns it on process), so a follow-on
+  // leg never re-reads a frontier the just-broadcast block may not be reflected in yet — that stale
+  // RPC read is exactly what made the relay/reposter leg fork and get silently dropped. Advances the
+  // local balance/frontier only on a confirmed broadcast; stops the chain at the first failure so no
+  // later leg is stranded on an unknown `previous`. Returns one result row per leg (never throws).
+  static Future<List<Map<String, dynamic>>> _sendChain(
+      NanoWallet w, List<Map<String, dynamic>> legs) async {
+    final out = <Map<String, dynamic>>[];
+    final st = await accountState(w.account);
+    if (st == null || st['opened'] != true) {
+      for (final l in legs) out.add({...l, 'ok': false, 'hash': null, 'error': 'wallet empty'});
+      return out;
+    }
+    var prev = '${st['frontier']}';
+    var bal = BigInt.parse('${st['balance']}');
+    final rep = '${st['representative']}';
+    var broken = false;
+    for (final l in legs) {
+      final to = l['to'] as String;
+      final raw = l['raw'] as BigInt;
+      if (broken) { out.add({...l, 'ok': false, 'hash': null, 'error': 'skipped (prior leg failed)'}); continue; }
+      if (raw <= BigInt.zero) { out.add({...l, 'ok': false, 'hash': null, 'error': 'zero amount'}); continue; }
+      if (bal < raw) { out.add({...l, 'ok': false, 'hash': null, 'error': 'insufficient balance'}); broken = true; continue; }
+      final newBal = bal - raw;
+      final block = w.signStateBlock(previous: prev, representative: rep, balance: newBal, link: w.pubOf(to));
+      final r = await blockProcess(block, 'send');
+      final ok = r?['ok'] == true;
+      final hash = r?['hash'] as String?;
+      out.add({...l, 'ok': ok, 'hash': ok ? hash : null, 'error': ok ? null : (r?['error']?.toString() ?? 'broadcast failed')});
+      if (ok && hash != null) { prev = hash; bal = newBal; } else { broken = true; }
+    }
+    return out;
   }
 
   // identity: the app already holds the account (on-device key); the node only reads the balance.
@@ -1763,6 +1839,7 @@ class _FeedScreenState extends State<FeedScreen> {
     MuteStore.get().then((m) { if (mounted) setState(() => _muted = m); });
     BlockStore.get().then((b) { if (mounted) setState(() => _blocked = b); });
     BookmarkStore.get().then((b) { if (mounted) setState(() => _bookmarks = b); });
+    _refreshTxLog();
     SharedPreferences.getInstance().then((sp) {
       if (mounted) setState(() => _dmSeenTs = sp.getInt('dm_seen_ts') ?? 0);
     });
@@ -2085,29 +2162,154 @@ class _FeedScreenState extends State<FeedScreen> {
 
   Future<void> _settle() async {
     final entries = _pending.entries.toList();
-    int blocks = 0, failedCount = 0;
+    int paidCreators = 0, blocks = 0, failedCreators = 0, legShorts = 0;
     String? err;
     for (final e in entries) {
+      final handle = _handleOf[e.key] ?? 'creator';
       final r = await Api.settle(e.key, e.value.toStringAsFixed(2),
           split: _settings.relaySplit, rsplit: _settings.reposterSplit,
           reposter: _reposterOf[e.key] ?? '', media: _mediaOf[e.key] ?? '');
-      if (r != null && r['ok'] == true) {
-        blocks++;
-        // clear ONLY what actually settled — an unpaid tally must stay pending, not silently vanish
+      final legs = (r?['legs'] as List?)?.cast<Map<String, dynamic>>() ?? const <Map<String, dynamic>>[];
+      final creatorPaid = r != null && r['ok'] == true;
+      if (creatorPaid) {
+        paidCreators++;
+        blocks += legs.where((l) => l['ok'] == true).length;
+        if (legs.any((l) => l['role'] != 'creator' && l['ok'] == false)) legShorts++;
+        // Persist the receipt — the tipper's own on-chain trail (roles, amounts, block hashes) — and
+        // tell the creator the money actually MOVED (settle time), not just that a tally was pledged.
+        await TxLogStore.add({
+          'ts': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          'handle': handle, 'account': e.key,
+          'total': e.value, 'paid': r['paid_xno'], 'legs': legs,
+        });
+        if (e.key != _account && _settings.notifyTip) {
+          Api.notifyPush(e.key, _handle, 'tip', 'settled ${e.value.toStringAsFixed(2)} XNO to you on-chain');
+        }
+        // clear ONLY what actually paid the creator — an unpaid tally must stay pending, not vanish
         setState(() { _pending.remove(e.key); _reposterOf.remove(e.key); _mediaOf.remove(e.key); });
       } else {
-        failedCount++;
-        err ??= r?['error']?.toString();
+        failedCreators++;
+        err ??= r?['error']?.toString() ??
+            (legs.firstWhere((l) => l['role'] == 'creator', orElse: () => const {})['error']?.toString());
       }
     }
+    await _refreshTxLog();
     await _load(); // refresh the footprint meter
     if (!mounted) return;
-    final msg = failedCount == 0
-        ? 'settled ${entries.length} creator${entries.length == 1 ? '' : 's'} in $blocks Nano block${blocks == 1 ? '' : 's'} · ⚙ PoW delegated (0 ms on device)'
-        : blocks > 0
-            ? 'settled $blocks of ${entries.length} · $failedCount unpaid (${err ?? 'failed'}) — still pending'
+    final msg = failedCreators == 0
+        ? (legShorts == 0
+            ? '✓ settled $paidCreators creator${paidCreators == 1 ? '' : 's'} · $blocks Nano block${blocks == 1 ? '' : 's'} on-chain'
+            : '✓ paid $paidCreators · $legShorts split leg${legShorts == 1 ? '' : 's'} failed — see Transactions')
+        : paidCreators > 0
+            ? 'paid $paidCreators of ${entries.length} · $failedCreators unpaid (${err ?? 'failed'}) — still pending'
             : 'nothing settled — ${err ?? 'settle failed'}. Your tips are still pending.';
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(backgroundColor: kCard, content: Text(msg)));
+  }
+
+  // The tipper's receipt trail, loaded from disk. See TxLogStore — the network notifies the RECIPIENT
+  // of a tip, never the sender, so this on-device log is the only place a tipper can see (and verify
+  // against the ledger) exactly what their settlements moved.
+  List<Map<String, dynamic>> _txLog = [];
+  Future<void> _refreshTxLog() async {
+    final t = await TxLogStore.get();
+    if (mounted) setState(() => _txLog = t);
+  }
+
+  // A settled-tips history sheet: one card per settlement, each split leg with its amount, a ✓/✗ for
+  // whether that Nano block actually landed, and the hash (tap to copy → paste into any explorer).
+  void _showTransactions() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kBg,
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.7, minChildSize: 0.4, maxChildSize: 0.95, expand: false,
+        builder: (_, scroll) => Padding(
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              const Icon(Icons.receipt_long, size: 20, color: kAccent),
+              const SizedBox(width: 8),
+              const Text('Transactions', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+              const Spacer(),
+              Text('${_txLog.length}', style: const TextStyle(color: kDim, fontSize: 13)),
+            ]),
+            const SizedBox(height: 4),
+            const Text('Tips you settled on-chain. Tap a block hash to copy it — paste into any Nano explorer to verify.',
+                style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+            const SizedBox(height: 12),
+            Expanded(
+              child: _txLog.isEmpty
+                  ? const Center(child: Text('No settlements yet.', style: TextStyle(color: kDim, fontSize: 13)))
+                  : ListView.separated(
+                      controller: scroll,
+                      itemCount: _txLog.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 10),
+                      itemBuilder: (_, i) => _txCard(_txLog[i]),
+                    ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _txCard(Map<String, dynamic> tx) {
+    final legs = ((tx['legs'] as List?) ?? const []).cast<Map<String, dynamic>>();
+    final ts = (tx['ts'] as num?)?.toInt() ?? 0;
+    final when = ts == 0 ? '' : DateTime.fromMillisecondsSinceEpoch(ts * 1000).toLocal().toString().substring(0, 16);
+    final paid = (tx['paid'] as num?)?.toDouble() ?? 0;
+    final total = (tx['total'] as num?)?.toDouble() ?? paid;
+    final short = paid + 1e-9 < total;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(12), border: Border.all(color: kLine)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text('@${tx['handle'] ?? 'creator'}',
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 14))),
+          Text('${paid.toStringAsFixed(3)} XNO', style: const TextStyle(color: kAccent, fontWeight: FontWeight.w800, fontSize: 14)),
+        ]),
+        if (when.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 2),
+            child: Text(when, style: const TextStyle(color: kDim, fontSize: 11))),
+        const SizedBox(height: 8),
+        ...legs.map((l) {
+          final ok = l['ok'] == true;
+          final hash = (l['hash'] as String?) ?? '';
+          final xno = (l['xno'] as num?)?.toDouble() ?? 0;
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(children: [
+              Icon(ok ? Icons.check_circle : Icons.cancel, size: 15, color: ok ? kAccent : Colors.redAccent),
+              const SizedBox(width: 6),
+              SizedBox(width: 64, child: Text('${l['role']}', style: const TextStyle(color: kDim, fontSize: 12))),
+              Text('${xno.toStringAsFixed(3)}', style: const TextStyle(color: kText, fontSize: 12.5)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ok && hash.isNotEmpty
+                    ? GestureDetector(
+                        onTap: () {
+                          Clipboard.setData(ClipboardData(text: hash));
+                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                              backgroundColor: kCard, duration: Duration(milliseconds: 1200),
+                              content: Text('block hash copied')));
+                        },
+                        child: Text('${hash.substring(0, 12)}… ⧉',
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: kAccent, fontSize: 11, fontFamily: 'monospace')))
+                    : Text(ok ? '' : '${l['error'] ?? 'failed'}',
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.redAccent, fontSize: 11)),
+              ),
+            ]),
+          );
+        }),
+        if (short) Padding(padding: const EdgeInsets.only(top: 2),
+            child: Text('creator paid; a split leg did not land — retry available next settle',
+                style: TextStyle(color: Colors.orangeAccent.shade100, fontSize: 11))),
+      ]),
+    );
   }
 
   // The settle menu: opened deliberately from the header tips icon, not always on screen. Lists the
@@ -2131,6 +2333,11 @@ class _FeedScreenState extends State<FeedScreen> {
                 const SizedBox(width: 8),
                 const Text('Tips to settle', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
                 const Spacer(),
+                IconButton(
+                  onPressed: () { Navigator.pop(ctx); _showTransactions(); },
+                  icon: const Icon(Icons.receipt_long, size: 20, color: kDim),
+                  tooltip: 'Transactions',
+                ),
                 IconButton(
                   onPressed: () { Navigator.pop(ctx); _showAutoSettle(); },
                   icon: Icon(Icons.tune, size: 20, color: _autoSettle ? kAccent : kDim),
@@ -4728,8 +4935,9 @@ class _FeedScreenState extends State<FeedScreen> {
                 ),
             ]),
           ),
-          // pending tips → the settle menu (only shown when something is waiting, or a policy is on)
-          if (_pending.isNotEmpty || _autoSettle)
+          // pending tips → the settle menu. Shown when something is waiting, a policy is on, OR there
+          // is settled history — so the Transactions receipt trail stays reachable after the tally clears.
+          if (_pending.isNotEmpty || _autoSettle || _txLog.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(right: 2),
               child: Stack(clipBehavior: Clip.none, children: [
