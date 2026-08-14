@@ -55,6 +55,14 @@ android {
             signingConfig = signingConfigs.getByName(if (hasReleaseKey) "release" else "debug")
         }
     }
+
+    // Compress native libraries in the APK (extractNativeLibs=true) so the download matches the prior
+    // releases (~21 MB) instead of ballooning to ~55 MB with uncompressed .so — a smaller self-update.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 kotlin {
