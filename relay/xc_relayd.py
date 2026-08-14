@@ -98,6 +98,11 @@ RESHARERS_MAX   = int(os.environ.get('XC_RESHARERS_MAX', '1000'))    # resharers
 KNOWN_MAX       = int(os.environ.get('XC_KNOWN_MAX', '10000'))       # distinct relay URLs gossiped
 FIELD_MAX       = int(os.environ.get('XC_FIELD_MAX', '8192'))        # bytes per free-text record field
 RELEASE_PUBS_MAX = int(os.environ.get('XC_RELEASE_PUBS_MAX', '8'))   # distinct release publishers stored
+# An APK is ~27 MB and a release is PINNED (never evicted). Keeping the last 24 records' BYTES pinned
+# meant a ~650 MB floor on a 1 GB disk that grows with every ship — the real scaling limit, not users.
+# So pin the bytes for only the newest N releases per publisher; older RECORDS (metadata/signatures)
+# are still kept and served, their bytes fetched from IPFS/peers on demand. 0 disables the trimming.
+RELEASE_PIN_KEEP = int(os.environ.get('XC_RELEASE_PIN_KEEP', '3'))   # newest releases whose bytes stay pinned
 
 def _cap_dict(d, maxn):
     # Distinct-key backstop: evict oldest-inserted keys until within maxn. Python dicts are
@@ -197,6 +202,11 @@ def blob_score(m):                   # the universal value: tips earned minus th
 _DB = os.path.join(os.path.dirname(os.path.abspath(STORE)) or '.', 'blobs.db')
 _db = sqlite3.connect(_DB, check_same_thread=False)
 _db.execute('PRAGMA journal_mode=WAL')
+# A relay is a CACHE, not an archive. In WAL mode synchronous=NORMAL is CORRUPTION-SAFE (the db can't
+# be damaged by a crash); the only cost of a power-loss is possibly losing the last committed blob
+# write — harmless here, since blobs are content-addressed (re-fetchable from peers) and the head/JSON
+# state lives in a SEPARATE file. In return we drop an fsync off every put/evict. Worth it at scale.
+_db.execute('PRAGMA synchronous=NORMAL')
 _db.execute('CREATE TABLE IF NOT EXISTS blob (cid TEXT PRIMARY KEY, b64 TEXT NOT NULL, '
             'size INTEGER, last REAL, tips REAL)')
 _db.commit()
@@ -272,6 +282,26 @@ def blob_load_meta():                # startup: rebuild the small RAM index from
         for cid, size, last, tips in _db.execute('SELECT cid,size,last,tips FROM blob'):
             blob_meta[cid] = {'size': size, 'last': last, 'tips': tips or 0.0, 'reports': 0.0}
 
+# In WAL mode every put/evict appends frames to blobs.db-wal; SQLite only folds them back into the
+# main db on a checkpoint. Under steady write traffic the auto-checkpoint (default 1000 pages) can
+# lag, letting the -wal file grow into the tens of MB — bloating the disk footprint and slowing
+# restart recovery. A periodic TRUNCATE checkpoint folds the log back in and shrinks -wal to zero.
+# It runs under _blob_lock (the single serialiser for this connection) so it can't race a writer,
+# and every failure is swallowed: a checkpoint is best-effort housekeeping, never worth a crash.
+WAL_CHECKPOINT_S = float(os.environ.get('XC_WAL_CHECKPOINT_S', '300'))   # 0/negative disables the routine
+
+def _wal_checkpoint():
+    while True:
+        time.sleep(WAL_CHECKPOINT_S)
+        try:
+            with _blob_lock:
+                _db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        except Exception:
+            pass                         # busy/locked/etc — just try again next tick
+
+if WAL_CHECKPOINT_S > 0:
+    threading.Thread(target=_wal_checkpoint, daemon=True).start()
+
 def ensure_release_blob(cid):
     # A signed release (an app update) is CRITICAL INFRA — every relay must hold it, independent of tips
     # or the value-ranked sync budget. So: PIN it (never evict), and if we don't already have the bytes,
@@ -293,13 +323,45 @@ def ensure_release_blob(cid):
         except Exception:
             pass
 
+def _release_pin_cids():
+    # the cids whose BYTES we keep pinned: the newest RELEASE_PIN_KEEP records per publisher (the list is
+    # append-ordered, newest last). KEEP<=0 pins nothing extra (records/signatures are unaffected either way).
+    keep = set()
+    if RELEASE_PIN_KEEP <= 0:
+        return keep
+    for _pub, lst in releases.items():
+        if isinstance(lst, list):
+            for rec in lst[-RELEASE_PIN_KEEP:]:
+                c = (rec or {}).get('cid')
+                if c:
+                    keep.add(c)
+    return keep
+
+def reconcile_release_pins():
+    # Enforce the newest-N pin window: UNPIN any older release cid so its bytes become evictable under
+    # disk pressure (the record stays; the bytes are re-fetchable from IPFS/peers). Never touches a
+    # PAID pin (pins_paid) — a user who paid to keep a cid owns that pin regardless of release status.
+    keep = _release_pin_cids()
+    paid = set(pins_paid.values())
+    for _pub, lst in list(releases.items()):
+        if not isinstance(lst, list):
+            continue
+        for rec in lst:
+            c = (rec or {}).get('cid')
+            if c and c not in keep and c not in paid and pinned.get(c):
+                pinned.pop(c, None)          # release pin lifted; falls back to normal cache eviction
+    return keep
+
 def sync_release_blobs():
-    # on startup (and after gossip), make sure we hold every known release's bytes — catches a relay that
-    # was down when a release was published.
+    # on startup (and after gossip), make sure we hold the newest releases' bytes — catches a relay that
+    # was down when a release was published — while lifting stale pins on releases past the keep window.
     time.sleep(1.0)
+    keep = reconcile_release_pins()
+    mark_dirty()                                       # persist any pins we just lifted (pinned is in the store)
     for _pub, recs in list(releases.items()):
         for rec in recs:
-            ensure_release_blob(rec.get('cid'))
+            if (rec or {}).get('cid') in keep:
+                ensure_release_blob(rec.get('cid'))
 
 def _release_canon(m):
     return '%s|%s|%s|%s|%s|%s' % (m.get('publisher', ''), m.get('version', ''), m.get('cid', ''),
@@ -330,7 +392,8 @@ def accept_release(m):
     lst.append(m)
     releases[pub_acc] = lst[-24:]
     _cap_dict(releases, RELEASE_PUBS_MAX)
-    if m.get('cid'):
+    keep = reconcile_release_pins()                    # this release just became newest -> older one may drop out
+    if m.get('cid') and m['cid'] in keep:              # only pin+pull bytes if it's inside the keep window
         threading.Thread(target=ensure_release_blob, args=(m['cid'],), daemon=True).start()
     mark_dirty()
     return True
