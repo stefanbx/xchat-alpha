@@ -38,6 +38,10 @@ if mode == 'pub':
         json.dump({'ok': False, 'error': 'bad signature'}, open('/tmp/xc_profile_result.json', 'w')); sys.exit()
     rec = {'account': acc, 'display': display, 'bio': bio, 'avatar': avatar, 'banner': banner,
            'ts': ts, 'sig': sig, 'pub': pub}
+    # forward the (unsigned) profile TYPE so channels are identifiable in the directory. It's not in the
+    # signed canon, so it's advisory only — worst case a profile mislabels itself; fine for a listing.
+    if src.get('type'):
+        rec['type'] = src.get('type')
     pushed = 0
     for r in RELAYS:
         try:

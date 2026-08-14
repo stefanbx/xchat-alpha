@@ -561,6 +561,22 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/follows'):
             acc = qs(self.path).get('account', '')
             self._send(200, json.dumps({'account': acc, 'record': follows.get(acc)}))
+        elif self.path.startswith('/channels'):
+            # directory of channel profiles (type == 'channel'), each with a follower count and an
+            # "online readers" count = followers whose signed head was refreshed within the presence
+            # window (the same 45s heartbeat that drives the green dot). All local to the relay.
+            now = time.time()
+            out = []
+            for acc, rec in list(profiles.items()):
+                if not isinstance(rec, dict) or rec.get('type') != 'channel':
+                    continue
+                flws = [f for f, r in follows.items()
+                        if isinstance(r, dict) and acc in (r.get('follows') or [])]
+                online = sum(1 for f in flws
+                             if now - float((heads.get(f) or {}).get('ts', 0) or 0) <= 150)
+                out.append({'account': acc, 'display': rec.get('display', ''), 'bio': rec.get('bio', ''),
+                            'avatar': rec.get('avatar', ''), 'followers': len(flws), 'online': online})
+            self._send(200, json.dumps({'channels': out}))
         elif self.path.startswith('/profile'):
             acc = qs(self.path).get('account', '')
             self._send(200, json.dumps({'account': acc, 'record': profiles.get(acc)}))

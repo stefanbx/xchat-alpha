@@ -288,6 +288,29 @@ def api_presence():
     online = [a for a, ts in latest.items() if now - ts <= _PRESENCE_WINDOW]
     return json.dumps({'ok': True, 'online': online, 'window': int(_PRESENCE_WINDOW)})
 
+def api_channels():
+    # Directory of channels across relays: union by account, taking the max online/follower counts a
+    # relay reports (relays converge but may lag). Public read; the relay computes the per-channel
+    # follower + online-reader tallies from its own profiles/follows/heads.
+    merged = {}
+    for r in xc.discover_relays():
+        try:
+            for c in json.loads(urllib.request.urlopen(r + '/channels', timeout=4).read()).get('channels', []):
+                a = c.get('account')
+                if not a:
+                    continue
+                m = merged.get(a)
+                if m is None:
+                    merged[a] = dict(c)
+                else:
+                    m['online'] = max(m.get('online', 0), c.get('online', 0))
+                    m['followers'] = max(m.get('followers', 0), c.get('followers', 0))
+                    if not m.get('display'): m['display'] = c.get('display', '')
+                    if not m.get('avatar'): m['avatar'] = c.get('avatar', '')
+        except Exception:
+            pass
+    return json.dumps({'ok': True, 'channels': list(merged.values())})
+
 RELAYDIR_TTL = float(os.environ.get('XC_RELAYDIR_TTL', '180'))
 _relaydir_ts = [0.0]
 _relaydir_lock = threading.Lock()
@@ -490,6 +513,7 @@ def route(path, query, body):
         with ipc_lock('release'):
             put('/tmp/xc_rel_cid.txt', b('cid')); put('/tmp/xc_rel_sha.txt', b('sha256')); spawn('xc_release.py','fetch'); return read('/tmp/xc_release_result.json','{}')
 
+    if path.startswith('/api/channels'):     return api_channels()           # channel directory + online readers
     if path.startswith('/api/presence'):     return api_presence()           # accounts online now (fresh heads)
     if path.startswith('/api/head'):         return api_head(q('account'))   # app re-signs it to republish (seedless)
     if path.startswith('/api/gossip'):
