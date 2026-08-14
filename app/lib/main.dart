@@ -83,7 +83,7 @@ Future<bool> resolveEndpoint() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.3.2'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.3.3'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -1672,6 +1672,16 @@ String _compact(int n) {
   final m = n / 1000000; return '${m < 10 ? m.toStringAsFixed(1) : m.round()}M';
 }
 
+// Format an XNO tip amount compactly — a small tip keeps its significant decimals (0.001 stays
+// "0.001", not rounded to "0.00"); a whole number drops the decimals. Used for tip amounts everywhere
+// so sub-0.01 tips are shown (and, via _xnoToRaw, sent) at full precision.
+String fmtXno(double v) {
+  if (v >= 1) return v == v.roundToDouble() ? v.toStringAsFixed(0) : v.toStringAsFixed(2);
+  var s = v.toStringAsFixed(6);
+  if (s.contains('.')) s = s.replaceFirst(RegExp(r'0+$'), '').replaceFirst(RegExp(r'\.$'), '');
+  return s.isEmpty ? '0' : s;
+}
+
 String timeAgo(int ts) {
   if (ts == 0) return '';
   final s = DateTime.now().millisecondsSinceEpoch ~/ 1000 - ts;
@@ -2257,7 +2267,7 @@ class _FeedScreenState extends State<FeedScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         duration: const Duration(milliseconds: 1200),
         backgroundColor: kCard,
-        content: Text('◈ +${amt.toStringAsFixed(2)} XNO tallied off-chain — no network, no block')));
+        content: Text('◈ +${fmtXno(amt)} XNO tallied off-chain — no network, no block')));
     _maybeAutoSettle(p.account, p.handle);
   }
 
@@ -2278,7 +2288,7 @@ class _FeedScreenState extends State<FeedScreen> {
     }
     _settling.add(account);
     try {
-    final r = await Api.settle(account, amt.toStringAsFixed(2),
+    final r = await Api.settle(account, amt.toStringAsFixed(6),
         split: _settings.relaySplit, rsplit: _settings.reposterSplit,
         reposter: _reposterOf[account] ?? '', media: _mediaOf[account] ?? '');
     if (r != null && r['ok'] == true) {
@@ -2290,7 +2300,7 @@ class _FeedScreenState extends State<FeedScreen> {
         'total': amt, 'paid': r['paid_xno'], 'legs': (r['legs'] as List?) ?? const [],
       });
       if (account != _account && _settings.notifyTip) {
-        Api.notifyPush(account, _handle, 'tip', 'settled ${amt.toStringAsFixed(2)} XNO to you on-chain');
+        Api.notifyPush(account, _handle, 'tip', 'settled ${fmtXno(amt)} XNO to you on-chain');
       }
       setState(() {
         _autoSpent += amt;
@@ -2311,7 +2321,7 @@ class _FeedScreenState extends State<FeedScreen> {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           backgroundColor: kCard,
           content: Text(
-              '⚡ auto-settled ${amt.toStringAsFixed(2)} XNO → @$handle · 1 block (policy ≥${_autoThreshold.toStringAsFixed(2)})')));
+              '⚡ auto-settled ${fmtXno(amt)} XNO → @$handle · 1 block (policy ≥${fmtXno(_autoThreshold)})')));
     } else if (r != null && mounted) {
       // a failed auto-settle must not fail silently — the tally stays pending and the user is told why
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -2396,7 +2406,7 @@ class _FeedScreenState extends State<FeedScreen> {
     String? err;
     for (final e in entries) {
       final handle = _handleOf[e.key] ?? 'creator';
-      final r = await Api.settle(e.key, e.value.toStringAsFixed(2),
+      final r = await Api.settle(e.key, e.value.toStringAsFixed(6),
           split: _settings.relaySplit, rsplit: _settings.reposterSplit,
           reposter: _reposterOf[e.key] ?? '', media: _mediaOf[e.key] ?? '');
       final legs = (r?['legs'] as List?)?.cast<Map<String, dynamic>>() ?? const <Map<String, dynamic>>[];
@@ -2413,7 +2423,7 @@ class _FeedScreenState extends State<FeedScreen> {
           'total': e.value, 'paid': r['paid_xno'], 'legs': legs,
         });
         if (e.key != _account && _settings.notifyTip) {
-          Api.notifyPush(e.key, _handle, 'tip', 'settled ${e.value.toStringAsFixed(2)} XNO to you on-chain');
+          Api.notifyPush(e.key, _handle, 'tip', 'settled ${fmtXno(e.value)} XNO to you on-chain');
         }
         // Subtract ONLY what we settled — a tip tallied to this creator DURING the awaited settle must
         // survive (removing the whole entry would drop it). Drain fully → clear the entry + its locks.
@@ -2792,7 +2802,7 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
 
-  String _rawOf(double xno) => '${(xno * 100).round()}${'0' * 28}'; // XNO(2dp) -> raw string
+  String _rawOf(double xno) => Api._xnoToRaw(xno.toStringAsFixed(6)).toString(); // XNO(6dp) -> raw string (supports sub-0.01 tips)
 
   void _bumpEngage(String pid, String field, num delta) {
     final e = _eng(pid);
@@ -3462,7 +3472,7 @@ class _FeedScreenState extends State<FeedScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         duration: const Duration(milliseconds: 1200),
         backgroundColor: kCard,
-        content: Text('◈ +${amt.toStringAsFixed(2)} XNO tallied to @$handle (comment) — off-chain')));
+        content: Text('◈ +${fmtXno(amt)} XNO tallied to @$handle (comment) — off-chain')));
     _maybeAutoSettle(acct, handle);
   }
 
@@ -4425,8 +4435,8 @@ class _FeedScreenState extends State<FeedScreen> {
               section('Default tip'),
               const Text('The amount added each time you tap Tip.', style: TextStyle(color: kDim, fontSize: 12)),
               const SizedBox(height: 8),
-              Wrap(spacing: 8, children: [0.01, 0.05, 0.10, 0.25, 1.0].map((o) =>
-                chip('${o.toStringAsFixed(2)} XNO', (o - _settings.defaultTip).abs() < 1e-9,
+              Wrap(spacing: 8, children: [0.001, 0.005, 0.01, 0.05, 0.10, 0.25, 1.0].map((o) =>
+                chip('${fmtXno(o)} XNO', (o - _settings.defaultTip).abs() < 1e-9,
                     () => _settings.defaultTip = o)).toList()),
 
               section('Tip split'),
