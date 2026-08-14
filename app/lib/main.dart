@@ -14,6 +14,8 @@ import 'package:video_compress/video_compress.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:http/http.dart' as http;
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:app_badge_plus/app_badge_plus.dart';
 import 'package:battery_plus/battery_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -315,6 +317,40 @@ class EngageStore {
   static Future<void> saveReposted(Set<String> s) => _save('xchat_reposted', s);
   static Future<Set<String>> viewed() => _get('xchat_viewed');
   static Future<void> saveViewed(Set<String> s) => _save('xchat_viewed', s);
+}
+
+// Android system notifications (likes / comments / tips / DMs) + the unread-DM count on the app icon.
+// This app has no push server (notifications are POLLED from the relays), so alerts fire when the app
+// polls — foreground, or a periodic tick — not via FCM when fully killed.
+class Notifs {
+  static final FlutterLocalNotificationsPlugin _p = FlutterLocalNotificationsPlugin();
+  static bool _ready = false;
+  static Future<void> init() async {
+    if (_ready) return;
+    const init = InitializationSettings(android: AndroidInitializationSettings('@mipmap/ic_launcher'));
+    await _p.initialize(init);
+    // Android 13+ needs a runtime grant for POST_NOTIFICATIONS.
+    await _p.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
+    _ready = true;
+  }
+  static Future<void> show(int id, String title, String body) async {
+    await init();
+    const details = NotificationDetails(
+        android: AndroidNotificationDetails('xchat_activity', 'Activity',
+            channelDescription: 'Likes, comments, tips and messages on your posts',
+            importance: Importance.high, priority: Priority.high, icon: '@mipmap/ic_launcher'));
+    await _p.show(id, title, body, details);
+  }
+  static Future<void> setBadge(int count) async {
+    try {
+      if (count > 0) {
+        await AppBadgePlus.updateBadge(count);
+      } else {
+        await AppBadgePlus.updateBadge(0);   // clear
+      }
+    } catch (_) {}   // launcher may not support numeric badges
+  }
 }
 
 // remembers the update version the user dismissed, so the auto-check banner nags once per version, not
@@ -1969,6 +2005,7 @@ class _FeedScreenState extends State<FeedScreen> {
   @override
   void initState() {
     super.initState();
+    Notifs.init();   // set up Android notifications + ask for the POST_NOTIFICATIONS grant (Android 13+)
     _bootWallet();
     _load();
     _initDevice();
@@ -2031,6 +2068,7 @@ class _FeedScreenState extends State<FeedScreen> {
     // so we can also DROP posts whose head expired / was removed — the incremental slice can't show that.
     final reconcile = (++_pollTick % 5 == 0);
     _refreshDmBadge();   // keep the mail-icon unread count live between full loads
+    if (_pollTick % 2 == 0) _refreshNotifs();   // ~every 24s: pull notifs + raise Android alerts for new ones
     if (_pollTick % 10 == 0) {   // ~every 2 min: pick up a newly-activated announcement without a relaunch
       Api.announcement().then((a) { if (mounted && a != _announcement) setState(() => _announcement = a); });
     }
@@ -3177,6 +3215,7 @@ class _FeedScreenState extends State<FeedScreen> {
         if (lastIn > _dmSeenTs) unread++;
       }
       if (mounted) setState(() => _dmUnread = unread);
+      Notifs.setBadge(unread);   // unread-DM count on the launcher icon
     } catch (_) {}
   }
 
@@ -4368,9 +4407,9 @@ class _FeedScreenState extends State<FeedScreen> {
               section('Notifications'),
               const Text('Tell the creator when their post gets engagement.', style: TextStyle(color: kDim, fontSize: 12)),
               const SizedBox(height: 6),
-              toggle('Likes', 'notify the creator on a like', _settings.notifyLike, (v) => _settings.notifyLike = v),
-              toggle('Comments', 'notify the creator on a comment', _settings.notifyComment, (v) => _settings.notifyComment = v),
-              toggle('Tips', 'notify the creator on a tip', _settings.notifyTip, (v) => _settings.notifyTip = v),
+              toggle('Likes', 'Android alert when someone likes your post', _settings.notifyLike, (v) => _settings.notifyLike = v),
+              toggle('Comments', 'Android alert when someone comments', _settings.notifyComment, (v) => _settings.notifyComment = v),
+              toggle('Tips', 'Android alert when someone tips you', _settings.notifyTip, (v) => _settings.notifyTip = v),
 
               section('Privacy'),
               ListTile(
@@ -5009,15 +5048,44 @@ class _FeedScreenState extends State<FeedScreen> {
   // feed renders so the launch fires 3 requests instead of 5 (lighter burst on the node, faster first frame).
   Future<void> _loadSecondary() async {
     try {
-      final r = await Future.wait([Api.notify(), Api.engagement()]);
-      if (!mounted) return;
-      setState(() {
-        _notifs = r[0] as List<Map<String, dynamic>>;
-        _engage = r[1] as Map<String, dynamic>;
-      });
+      _engage = await Api.engagement();
+      if (mounted) setState(() {});
     } catch (_) {}
-    _refreshDmBadge();   // mail-icon unread count (fire-and-forget)
+    _refreshNotifs();    // notifications + raise Android alerts for new like/comment/tip
+    _refreshDmBadge();   // mail-icon unread count + launcher badge (fire-and-forget)
     Api.announcement().then((a) { if (mounted) setState(() => _announcement = a); });  // coordinated-event banner
+  }
+
+  // Poll relay notifications; raise an ANDROID system notification for each NEW like/comment/tip whose
+  // toggle is on. First run baselines to the newest existing so pre-install history never alerts (that
+  // was a real bug once). Also refreshes the in-app _notifs list.
+  Future<void> _refreshNotifs() async {
+    if (gWallet == null) return;
+    final list = await Api.notify();
+    if (mounted) setState(() => _notifs = list);
+    final p = await SharedPreferences.getInstance();
+    final seen = p.getInt('notif_seen_ts') ?? -1;
+    if (seen < 0) {                                    // first run → baseline, don't alert for history
+      var mx = 0;
+      for (final n in list) { final ts = (n['ts'] as num?)?.toInt() ?? 0; if (ts > mx) mx = ts; }
+      await p.setInt('notif_seen_ts', mx);
+      return;
+    }
+    var maxTs = seen;
+    for (final n in list) {
+      final ts = (n['ts'] as num?)?.toInt() ?? 0;
+      if (ts <= seen) continue;
+      if (ts > maxTs) maxTs = ts;
+      final kind = '${n['kind']}';
+      final on = kind == 'like' ? _settings.notifyLike
+          : kind == 'comment' ? _settings.notifyComment
+          : kind == 'tip' ? _settings.notifyTip
+          : false;                                     // only the 3 user-activatable types
+      if (!on) continue;
+      final title = kind == 'tip' ? '◈ New tip' : kind == 'like' ? '❤ New like' : '💬 New comment';
+      Notifs.show('${n['from']}$ts'.hashCode & 0x7fffffff, title, '${n['text']}');
+    }
+    if (maxTs > seen) await p.setInt('notif_seen_ts', maxTs);
   }
 
   // Auto-forward anything above the safety cap to the user's external savings address (which this
@@ -5170,11 +5238,8 @@ class _FeedScreenState extends State<FeedScreen> {
         centerTitle: true,
         leading: IconButton(
           onPressed: _showWallet,
-          icon: CircleAvatar(
-              radius: 15,
-              backgroundColor: avatarColor(_handle),
-              child: Text(_handle.substring(0, 1).toUpperCase(),
-                  style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 13))),
+          // your real avatar (live/animated or photo), not just the handle's initial
+          icon: AuthorAvatar(account: _account, handle: _handle, radius: 15),
         ),
         titleSpacing: 0,
         title: Row(mainAxisSize: MainAxisSize.min, children: const [
@@ -6046,8 +6111,9 @@ class _DmChatScreenState extends State<DmChatScreen> {
     if (!mounted) return;
     if (r != null && r['ok'] == true) {
       _ctl.clear();
+      if (mounted) FocusScope.of(context).unfocus();   // close the keyboard/typing view after sending
       await _load();
-      setState(() => _sending = false);
+      if (mounted) setState(() => _sending = false);
     } else {
       setState(() { _sending = false; _err = (r?['error'] ?? 'send failed').toString(); });
     }
@@ -6730,13 +6796,16 @@ class _PostCardState extends State<PostCard> {
                   overflow: (longText && !_expanded) ? TextOverflow.ellipsis : TextOverflow.clip,
                   style: const TextStyle(color: kText, fontSize: 15, height: 1.35)),
             ),
-            if (longText)
+            // "Show more" opens the conversation (full text there), exactly like tapping the post body or
+            // "Show this thread" — so there's no inline-expand action fighting the open-thread tap. Only
+            // shows in the feed; the focused post in a thread starts expanded (full text, no "Show more").
+            if (longText && !_expanded)
               GestureDetector(
-                onTap: () => setState(() => _expanded = !_expanded),
-                child: Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: Text(_expanded ? 'Show less' : 'Show more',
-                      style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
+                onTap: widget.onOpenThread,
+                child: const Padding(
+                  padding: EdgeInsets.only(top: 4),
+                  child: Text('Show more',
+                      style: TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
                 ),
               ),
             // photo / GIF attachment (Image.memory animates GIFs)

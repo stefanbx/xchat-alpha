@@ -55,6 +55,8 @@ dependencies:
   nanodart: ^2.0.0
   pinenacl: ^0.6.0
   flutter_secure_storage: ^9.2.4
+  flutter_local_notifications: ^18.0.1   # Android system notifications for likes/comments/tips/DMs
+  app_badge_plus: ^1.2.2                  # unread-DM count on the launcher icon (AGP-8 safe)
 
 dev_dependencies:
   flutter_test:
