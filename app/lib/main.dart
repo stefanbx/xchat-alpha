@@ -1083,6 +1083,16 @@ class Api {
     } catch (_) {}
   }
 
+  // accounts online right now (heads refreshed within the presence window). A public read; no seed.
+  static Future<Set<String>> presence() async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/presence')).timeout(const Duration(seconds: 8));
+      return (((jsonDecode(r.body))['online'] as List?) ?? const []).map((e) => '$e').toSet();
+    } catch (_) {
+      return const <String>{};
+    }
+  }
+
   static Future<void> like(String pid, int delta) => _engagePost('like', pid, delta);
   // A reshare earns a slice of every tip to the post, so it is SIGNED on-device (canon
   // reshare|account|post_id|ts). The relay verifies it before crediting the resharer — an unsigned
@@ -1678,6 +1688,22 @@ class ProfileCache extends ChangeNotifier {
 }
 
 // an avatar that shows the account's uploaded image once its profile resolves, else a letter tile
+// Who is online right now, from /api/presence (a head refreshed in the last ~2.5 min ≈ an open app,
+// since the app republishes its head every 45s). A ChangeNotifier so every AuthorAvatar toggles its
+// green dot reactively when the set refreshes. No identity tracking beyond the head each account
+// already publishes publicly.
+class PresenceCache extends ChangeNotifier {
+  PresenceCache._();
+  static final PresenceCache I = PresenceCache._();
+  Set<String> _online = {};
+  bool isOnline(String account) => account.isNotEmpty && _online.contains(account);
+  void update(Set<String> online) {
+    if (online.length == _online.length && online.containsAll(_online)) return; // no change → no rebuild
+    _online = online;
+    notifyListeners();
+  }
+}
+
 class AuthorAvatar extends StatelessWidget {
   final String account, handle;
   final double radius;
@@ -1685,24 +1711,39 @@ class AuthorAvatar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: ProfileCache.I,
+      animation: Listenable.merge([ProfileCache.I, PresenceCache.I]),
       builder: (_, __) {
         ProfileCache.I.ensure(account);
         final cid = ProfileCache.I.avatarCid(account);
-        if (cid != null) {
-          return ClipOval(
-            child: SizedBox(
-              width: radius * 2, height: radius * 2,
-              child: MediaImage(cid: cid, fit: BoxFit.cover),
+        final Widget avatar = cid != null
+            ? ClipOval(
+                child: SizedBox(
+                  width: radius * 2, height: radius * 2,
+                  child: MediaImage(cid: cid, fit: BoxFit.cover),
+                ),
+              )
+            : CircleAvatar(
+                radius: radius,
+                backgroundColor: avatarColor(handle),
+                child: Text(handle.isEmpty ? '?' : handle.substring(0, 1).toUpperCase(),
+                    style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: radius * 0.62)),
+              );
+        if (!PresenceCache.I.isOnline(account)) return avatar;
+        final d = (radius * 0.55).clamp(8.0, 14.0);        // dot scales with the avatar
+        return Stack(clipBehavior: Clip.none, children: [
+          avatar,
+          Positioned(
+            right: -1, bottom: -1,
+            child: Container(
+              width: d, height: d,
+              decoration: BoxDecoration(
+                color: const Color(0xFF3BD671),            // "online" green
+                shape: BoxShape.circle,
+                border: Border.all(color: kBg, width: 2),  // ring so it reads on any avatar/photo
+              ),
             ),
-          );
-        }
-        return CircleAvatar(
-          radius: radius,
-          backgroundColor: avatarColor(handle),
-          child: Text(handle.isEmpty ? '?' : handle.substring(0, 1).toUpperCase(),
-              style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: radius * 0.62)),
-        );
+          ),
+        ]);
       },
     );
   }
@@ -1839,7 +1880,7 @@ class _FeedScreenState extends State<FeedScreen> {
   int _supporters = 0;
   final Battery _battery = Battery();
   StreamSubscription? _batSub, _connSub;
-  Timer? _republishTimer, _gossipTimer, _feedTimer, _updateTimer;
+  Timer? _republishTimer, _gossipTimer, _feedTimer, _updateTimer, _presenceTimer;
   int _relayed = 0; // signed heads this phone has propagated (backfilled) this session
   bool get _supporterActive => _supporterOn && _charging && _wifi;
 
@@ -1869,6 +1910,9 @@ class _FeedScreenState extends State<FeedScreen> {
     _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) => Api.republish());
     // quietly poll the feed so posts from OTHER devices appear on their own (no manual refresh)
     _feedTimer = Timer.periodic(const Duration(seconds: 12), (_) => _refreshFeedQuiet());
+    // who's online — refresh the green dots a bit faster than the 45s head heartbeat so they feel live
+    _refreshPresence();
+    _presenceTimer = Timer.periodic(const Duration(seconds: 30), (_) => _refreshPresence());
     // re-check for a newer release periodically, not only at launch — so a long-lived session still
     // surfaces the update banner (the launch check is in _bootWallet).
     _updateTimer = Timer.periodic(const Duration(hours: 4), (_) => _autoCheckUpdate());
@@ -1879,6 +1923,7 @@ class _FeedScreenState extends State<FeedScreen> {
     _batSub?.cancel();
     _connSub?.cancel();
     _republishTimer?.cancel();
+    _presenceTimer?.cancel();
     _gossipTimer?.cancel();
     _feedTimer?.cancel();
     _updateTimer?.cancel();
@@ -2256,6 +2301,11 @@ class _FeedScreenState extends State<FeedScreen> {
     final st = await Api.accountState(_account);
     final bc = (st?['block_count'] as num?)?.toInt();
     if (bc != null && mounted) setState(() => _onchainBlocks = bc);
+  }
+
+  // pull the set of online accounts into PresenceCache; AuthorAvatars repaint their green dots.
+  Future<void> _refreshPresence() async {
+    PresenceCache.I.update(await Api.presence());
   }
 
   // A settled-tips history sheet: one card per settlement, each split leg with its amount, a ✓/✗ for

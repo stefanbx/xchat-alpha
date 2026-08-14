@@ -269,6 +269,25 @@ def api_head(acct):
         return json.dumps({'ok': True, 'head': None})
     return json.dumps({'ok': True, 'head': {'seq': best['seq'], 'cid': best['cid'], 'handle': best.get('handle', '')}})
 
+_PRESENCE_WINDOW = float(os.environ.get('XC_PRESENCE_WINDOW', '150'))   # seconds a head stays "online"
+def api_presence():
+    # Accounts online right now = those whose signed head was refreshed within the presence window.
+    # The app republishes its head every ~45s while open (see Api.republish), and the relay stamps each
+    # head's receive time as `ts`, so a fresh head ≈ an open app. A public read across relays (max ts
+    # per account), no seed, no per-account tracking beyond the head every account already publishes.
+    now = time.time()
+    latest = {}
+    for r in xc.discover_relays():
+        try:
+            for h in json.loads(urllib.request.urlopen(r + '/heads', timeout=3).read()).get('heads', []):
+                a = h.get('author'); ts = float(h.get('ts', 0) or 0)
+                if a and ts > 0:
+                    latest[a] = max(latest.get(a, 0.0), ts)
+        except Exception:
+            pass
+    online = [a for a, ts in latest.items() if now - ts <= _PRESENCE_WINDOW]
+    return json.dumps({'ok': True, 'online': online, 'window': int(_PRESENCE_WINDOW)})
+
 RELAYDIR_TTL = float(os.environ.get('XC_RELAYDIR_TTL', '180'))
 _relaydir_ts = [0.0]
 _relaydir_lock = threading.Lock()
@@ -471,6 +490,7 @@ def route(path, query, body):
         with ipc_lock('release'):
             put('/tmp/xc_rel_cid.txt', b('cid')); put('/tmp/xc_rel_sha.txt', b('sha256')); spawn('xc_release.py','fetch'); return read('/tmp/xc_release_result.json','{}')
 
+    if path.startswith('/api/presence'):     return api_presence()           # accounts online now (fresh heads)
     if path.startswith('/api/head'):         return api_head(q('account'))   # app re-signs it to republish (seedless)
     if path.startswith('/api/gossip'):
         with ipc_lock('gossip'):

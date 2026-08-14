@@ -625,6 +625,10 @@ class H(BaseHTTPRequestHandler):
                 maxexp = now + HEAD_TTL + HEAD_SKEW
                 if float(h.get('expires', 0)) > maxexp:
                     h['expires'] = int(maxexp)
+                # Server-stamp the receive time as a PRESENCE heartbeat. The app republishes its head
+                # every ~45s while open, so a head whose ts is a couple minutes old ≈ that user is online.
+                # Not part of the signed preimage (account|seq|cid|expires), so this can't break the sig.
+                h['ts'] = int(now)
                 with _heads_lock:
                     cur = heads.get(h['author'])
                     if cur is None and len(heads) >= MAX_HEADS:
