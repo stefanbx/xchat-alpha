@@ -300,6 +300,23 @@ class TxLogStore {
   }
 }
 
+// Per-device engagement memory: which posts THIS device has liked / reposted / counted as viewed.
+// Persisted so a view or like is registered ONCE per device, ever — not re-sent on every app launch.
+// Without this, _liked/_viewed lived only in RAM: each restart re-counted an impression for every post
+// scrolled past and let the user re-like, so the public counters ballooned (3 users → dozens of "views").
+class EngageStore {
+  static Future<Set<String>> _get(String k) async =>
+      ((await SharedPreferences.getInstance()).getStringList(k) ?? const <String>[]).toSet();
+  static Future<void> _save(String k, Set<String> s) async =>
+      (await SharedPreferences.getInstance()).setStringList(k, s.toList());
+  static Future<Set<String>> liked() => _get('xchat_liked');
+  static Future<void> saveLiked(Set<String> s) => _save('xchat_liked', s);
+  static Future<Set<String>> reposted() => _get('xchat_reposted');
+  static Future<void> saveReposted(Set<String> s) => _save('xchat_reposted', s);
+  static Future<Set<String>> viewed() => _get('xchat_viewed');
+  static Future<void> saveViewed(Set<String> s) => _save('xchat_viewed', s);
+}
+
 // remembers the update version the user dismissed, so the auto-check banner nags once per version, not
 // every launch. ("" = nothing dismissed.)
 class UpdateDismiss {
@@ -1839,6 +1856,10 @@ class _FeedScreenState extends State<FeedScreen> {
     MuteStore.get().then((m) { if (mounted) setState(() => _muted = m); });
     BlockStore.get().then((b) { if (mounted) setState(() => _blocked = b); });
     BookmarkStore.get().then((b) { if (mounted) setState(() => _bookmarks = b); });
+    // per-device engagement memory — so a view/like is counted once per device, not re-sent each launch
+    EngageStore.liked().then((s) { if (mounted) setState(() => _liked.addAll(s)); });
+    EngageStore.reposted().then((s) { if (mounted) setState(() => _reposted.addAll(s)); });
+    EngageStore.viewed().then((s) { if (mounted) _viewed.addAll(s); });
     _refreshTxLog();
     SharedPreferences.getInstance().then((sp) {
       if (mounted) setState(() => _dmSeenTs = sp.getInt('dm_seen_ts') ?? 0);
@@ -2553,6 +2574,7 @@ class _FeedScreenState extends State<FeedScreen> {
       _bumpEngage(p.id, 'likes', liked ? -1 : 1);
     });
     Api.like(p.id, liked ? -1 : 1);
+    EngageStore.saveLiked(_liked); // persist so this device's like counts once (no re-like each session)
     if (!liked && p.account != _account && _settings.notifyLike) {
       Api.notifyPush(p.account, _handle, 'like',
           'liked: ${p.text.length > 40 ? '${p.text.substring(0, 40)}…' : p.text}');
@@ -2566,6 +2588,7 @@ class _FeedScreenState extends State<FeedScreen> {
       _bumpEngage(p.id, 'reposts', rp ? -1 : 1);
     });
     Api.repost(p.id, rp ? -1 : 1, _account); // record WHO reshared (reward attribution)
+    EngageStore.saveReposted(_reposted); // persist so this device's repost counts once
     if (!rp && p.account != _account) {
       Api.notifyPush(p.account, _handle, 'repost', 'reposted your post');
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
@@ -2576,7 +2599,7 @@ class _FeedScreenState extends State<FeedScreen> {
 
   // count one impression per post/comment per session (fire-and-forget; shows on next refresh)
   void _countView(String id) {
-    if (id.isNotEmpty && _viewed.add(id)) Api.view(id);
+    if (id.isNotEmpty && _viewed.add(id)) { Api.view(id); EngageStore.saveViewed(_viewed); }
   }
 
   // build a fully-wired post card (reused by the profile screen's Posts/Media tabs)
@@ -3507,11 +3530,16 @@ class _FeedScreenState extends State<FeedScreen> {
     final acc = _wallet?.account;
     if (acc == null) return;
     final remote = (await Api.followsGet(acc)).toSet();
-    if (remote.isEmpty) return;
     final union = {...local, ...remote};
-    if (union.length != local.length) {
-      await FollowStore.save(union);
-      if (mounted) setState(() => _follows = union);
+    _follows = union;
+    if (mounted) setState(() {});
+    await FollowStore.save(union);
+    // HEAL the portable graph: if the relay's published copy is missing anything we hold locally — the
+    // v2 signing migration dropped old-format follow records, or an earlier publish never landed — then
+    // re-sign & republish the union so Following works and the graph survives a reinstall / other device.
+    // (Previously this bailed on an empty remote and never pushed local up, so follows stayed local-only.)
+    if (union.isNotEmpty && union.length != remote.length) {
+      await _publishFollows();
     }
   }
 
