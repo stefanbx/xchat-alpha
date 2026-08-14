@@ -15,7 +15,7 @@ WORK = os.environ.get('XC_WORK', 'http://127.0.0.1:7500')      # optional local/
 # CPU via nanopy — slow (~1 min on a shared vCPU) but it CANNOT be down, so a tip still settles even if
 # every external work service is unreachable. Public read RPCs mostly reject free work_generate, which is
 # why PoW uses this dedicated list instead of the shared read cycle.
-_DEFAULT_WORK = 'https://nanoslo.0x.no/proxy,https://rainstorm.city/api'
+_DEFAULT_WORK = 'https://rpcproxy.bnano.info/proxy,https://nanoslo.0x.no/proxy,https://rainstorm.city/api'
 WORK_RPCS = [u.strip().rstrip('/') for u in
              (os.environ.get('XC_WORK_RPC', '') + ',' + _DEFAULT_WORK).split(',') if u.strip()]
 LOCAL_WORK = os.environ.get('XC_WORK_LOCAL', '1') != '0'       # on-box CPU as the never-down last resort
