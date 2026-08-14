@@ -2596,10 +2596,9 @@ class _FeedScreenState extends State<FeedScreen> {
         onReport: () => _reportPost(post),
         onComment: () => _openComments(post),
         onReply: () => _compose(replyToPost: post),                 // X-style reply → new post w/ reply_to
-        // count replies from the live list AND the buffered "new posts" — otherwise a reply that arrives
-        // via the quiet poll (held in _newPosts until the pill is tapped) wouldn't bump the count.
-        replyCount: _posts.where((x) => x.replyTo == post.id).length
-            + _newPosts.where((x) => x.replyTo == post.id).length,
+        // count the WHOLE thread below this post (transitive), incl. buffered new posts — a reply chain
+        // shows its true size, not just direct children (which read as "1" on a multi-deep thread).
+        replyCount: _threadReplyCount(post.id),
         replyingToHandle: post.replyTo == null ? '' : (_postById(post.replyTo)?.handle ?? ''),
         onQuote: () => _quotePost(post),
         onOpenThread: () => _openThread(post),
@@ -2623,6 +2622,27 @@ class _FeedScreenState extends State<FeedScreen> {
 
   bool _inThread(Post p) =>
       (p.replyTo != null && p.replyTo!.isNotEmpty) || _posts.any((x) => x.replyTo == p.id);
+
+  // Count EVERY reply in the thread below a post (transitive), not just direct children. Replies chain
+  // (A <- B <- C), so a direct-only count shows 1 on a 3-deep thread — which reads as "several comments
+  // but it says 1". Walks children across the loaded feed + the buffered new posts. Guards against a
+  // cycle with `seen`. O(n) over loaded posts; the feed is small, and it's only called per visible card.
+  int _threadReplyCount(String rootId) {
+    final kids = <String, List<String>>{};
+    for (final p in [..._posts, ..._newPosts]) {
+      final parent = p.replyTo;
+      if (parent != null && parent.isNotEmpty) (kids[parent] ??= []).add(p.id);
+    }
+    final seen = <String>{};
+    final stack = <String>[rootId];
+    var n = 0;
+    while (stack.isNotEmpty) {
+      for (final child in (kids[stack.removeLast()] ?? const [])) {
+        if (seen.add(child)) { n++; stack.add(child); }
+      }
+    }
+    return n;
+  }
 
   Post _threadRoot(Post p) {
     var cur = p;
