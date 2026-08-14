@@ -1991,6 +1991,13 @@ class _FeedScreenState extends State<FeedScreen> {
   List<Map<String, dynamic>> _notifs = []; // push payloads (mentions/replies)
   int _dmUnread = 0;   // conversations with an incoming DM newer than _dmSeenTs (drives the mail badge)
   int _dmSeenTs = 0;   // unix-s of the last time DMs were opened; persisted so the badge survives restarts
+  int _notifSeenTs = 0;  // unix-s the notifications bell was last opened; older notifs don't count as unread
+  // unread = notifications newer than the last bell-open, minus muted/blocked (matches what _showNotifs lists)
+  int get _notifUnread {
+    final hidden = {..._muted, ..._blocked}.map(_handleFor).toSet();
+    return _notifs.where((n) =>
+        !hidden.contains('${n['from']}') && ((n['ts'] as int?) ?? 0) > _notifSeenTs).length;
+  }
   String? _announcement;  // publisher-signed coordinated-event banner text; null in normal operation
   String _account = '';
   // supporter mode: contribute (relay/pin) ONLY when charging + on Wi-Fi
@@ -2022,7 +2029,10 @@ class _FeedScreenState extends State<FeedScreen> {
     EngageStore.viewed().then((s) { if (mounted) _viewed.addAll(s); });
     _refreshTxLog();
     SharedPreferences.getInstance().then((sp) {
-      if (mounted) setState(() => _dmSeenTs = sp.getInt('dm_seen_ts') ?? 0);
+      if (mounted) setState(() {
+        _dmSeenTs = sp.getInt('dm_seen_ts') ?? 0;
+        _notifSeenTs = sp.getInt('notif_seen_ts') ?? 0;
+      });
     });
     _loadChannels();
     // keep our own head alive on the relays (republish < TTL); also backfills new relays
@@ -3791,6 +3801,12 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   void _showNotifs() {
+    // Opening the bell marks everything shown so far as SEEN: the unread badge resets to 0 and only
+    // notifications that arrive AFTER now count again (mirrors the DM seen-watermark). Persisted so it
+    // survives restarts.
+    final nowTs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    setState(() => _notifSeenTs = nowTs);
+    SharedPreferences.getInstance().then((sp) => sp.setInt('notif_seen_ts', nowTs));
     // drop notifications from accounts you've muted or blocked
     final hiddenHandles = {..._muted, ..._blocked}.map(_handleFor).toSet();
     final notifs = _notifs.where((n) => !hiddenHandles.contains('${n['from']}')).toList();
@@ -5280,14 +5296,14 @@ class _FeedScreenState extends State<FeedScreen> {
             onPressed: _showNotifs,
             icon: Stack(clipBehavior: Clip.none, children: [
               const Icon(Icons.notifications_none, size: 21, color: kText),
-              if (_notifs.isNotEmpty)
+              if (_notifUnread > 0)
                 Positioned(
                   right: -3, top: -3,
                   child: Container(
                     padding: const EdgeInsets.all(3),
                     decoration: const BoxDecoration(color: Color(0xFFEF6C9B), shape: BoxShape.circle),
                     constraints: const BoxConstraints(minWidth: 15, minHeight: 15),
-                    child: Text('${_notifs.length}',
+                    child: Text('$_notifUnread',
                         textAlign: TextAlign.center,
                         style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w800)),
                   ),
