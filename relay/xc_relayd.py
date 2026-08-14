@@ -848,6 +848,24 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({'ok': True, 'views': e['views']}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
+        elif self.path.startswith('/admin/reset_engage'):
+            # DESTRUCTIVE, PUBLISHER-ONLY: wipe every post's engagement (likes/views/reposts/tips_raw)
+            # for a clean slate. Gated exactly like a release/announcement — a FRESH, publisher-signed
+            # request — so no relay operator or user can zero the network's metrics. Nothing else is
+            # touched (heads, follows, comments, blobs, pins all remain). canon: sig_canon('admin_reset', ts).
+            try:
+                m = json.loads(raw)
+                ts, pub, sig = int(m.get('ts', 0)), m.get('pub', ''), m.get('sig', '')
+                if (xc is None or xc.pub_to_addr(pub) != PUBLISHER_ACCT
+                        or abs(time.time() - ts) > 300
+                        or not xc.verify_msg(pub, xc.sig_canon('admin_reset', ts), sig)):
+                    self._send(403, json.dumps({'ok': False, 'error': 'not authorized'})); return
+                n = len(engage)
+                engage.clear()
+                save()                                        # persist the cleared state atomically
+                self._send(200, json.dumps({'ok': True, 'cleared': n}))
+            except Exception as ex:
+                self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         else:
             self._send(404, '{"error":"not found"}')
 
