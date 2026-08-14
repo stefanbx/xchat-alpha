@@ -1083,6 +1083,17 @@ class Api {
     } catch (_) {}
   }
 
+  // channel directory: [{account, display, bio, avatar, followers, online}]. A public read; no seed.
+  static Future<List<Map<String, dynamic>>> channels() async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/channels')).timeout(const Duration(seconds: 12));
+      return (((jsonDecode(r.body))['channels'] as List?) ?? const [])
+          .map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
   // accounts online right now (heads refreshed within the presence window). A public read; no seed.
   static Future<Set<String>> presence() async {
     try {
@@ -1913,6 +1924,7 @@ class _FeedScreenState extends State<FeedScreen> {
     // who's online — refresh the green dots a bit faster than the 45s head heartbeat so they feel live
     _refreshPresence();
     _presenceTimer = Timer.periodic(const Duration(seconds: 30), (_) => _refreshPresence());
+    _refreshChannelAccounts(); // learn which accounts are channels (to keep them out of the feed)
     // re-check for a newer release periodically, not only at launch — so a long-lived session still
     // surfaces the update banner (the launch check is in _bootWallet).
     _updateTimer = Timer.periodic(const Duration(hours: 4), (_) => _autoCheckUpdate());
@@ -2308,6 +2320,14 @@ class _FeedScreenState extends State<FeedScreen> {
     PresenceCache.I.update(await Api.presence());
   }
 
+  // network-wide channel accounts — excluded from the Home/For-You feed so channels live only in the
+  // Channels tab (their posts/articles are read there), not mixed into the personal timeline.
+  Set<String> _channelAccounts = {};
+  Future<void> _refreshChannelAccounts() async {
+    final chs = await Api.channels();
+    if (mounted) setState(() => _channelAccounts = chs.map((c) => '${c['account']}').toSet());
+  }
+
   // A settled-tips history sheet: one card per settlement, each split leg with its amount, a ✓/✗ for
   // whether that Nano block actually landed, and the hash (tap to copy → paste into any explorer).
   void _showTransactions() {
@@ -2579,6 +2599,7 @@ class _FeedScreenState extends State<FeedScreen> {
             _follows.contains(p.account) &&
             !_reported.contains(p.id) &&
             !_hidden(p.account) &&
+            !_channelAccounts.contains(p.account) && // channels have their own tab
             p.replyTo == null)
         .toList();
   }
@@ -2606,7 +2627,8 @@ class _FeedScreenState extends State<FeedScreen> {
   // ranked feed across everyone (minus muted/blocked/reported), highest score first
   List<Post> _forYouPosts() {
     final list = _posts
-        .where((p) => !_reported.contains(p.id) && !_hidden(p.account) && p.replyTo == null)
+        .where((p) => !_reported.contains(p.id) && !_hidden(p.account) && p.replyTo == null &&
+            !_channelAccounts.contains(p.account)) // channels live in the Channels tab, not the feed
         .toList();
     list.sort((a, b) => _score(b).compareTo(_score(a)));
     return list;
@@ -2904,6 +2926,7 @@ class _FeedScreenState extends State<FeedScreen> {
     final p = await SharedPreferences.getInstance();
     await p.setStringList('xchat_channels', _myChannels);
   }
+
   String _channelHandle(String name) => name.trim().toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
 
   InputDecoration _chanDeco(String hint) => InputDecoration(
@@ -5200,6 +5223,7 @@ class _FeedScreenState extends State<FeedScreen> {
           type: BottomNavigationBarType.fixed,
           items: const [
             BottomNavigationBarItem(icon: Icon(Icons.home_outlined), activeIcon: Icon(Icons.home), label: 'Home'),
+            BottomNavigationBarItem(icon: Icon(Icons.dynamic_feed_outlined), activeIcon: Icon(Icons.dynamic_feed), label: 'Channels'),
             BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Discover'),
           ],
         ),
@@ -5214,7 +5238,7 @@ class _FeedScreenState extends State<FeedScreen> {
           // your unsent posts. Send-now + pull-to-refresh retry; Settings holds the server-address editor.
           : (_error != null && _outbox.isEmpty)
               ? _ErrorView(msg: _error!, onRetry: _load, onEndpoint: _showEndpoint)
-              : _tab == 1
+              : _tab == 2
                   ? DiscoverScreen(
                       posts: _posts.where((p) => !_hidden(p.account)).toList(),
                       authors: _authors(),
@@ -5232,7 +5256,9 @@ class _FeedScreenState extends State<FeedScreen> {
                       onCommentPost: _openComments,
                       onOpenProfile: _openProfile,
                       cardBuilder: _profileCard)
-                  : _homeBody(),
+                  : _tab == 1
+                      ? ChannelsScreen(onOpenChannel: _openProfile)
+                      : _homeBody(),
     );
   }
 
@@ -6194,6 +6220,88 @@ class _ProfileScreenState extends State<ProfileScreen> {
         ),
       ),
     );
+  }
+}
+
+// CHANNELS tab: a directory of publication identities. Each row shows the channel, its online-reader
+// count (followers with a live head — same heartbeat as the green dot) and total readers. Tapping opens
+// the channel's profile, where its posts + articles live (they're kept out of the personal feed).
+class ChannelsScreen extends StatefulWidget {
+  final void Function(String account, String handle) onOpenChannel;
+  const ChannelsScreen({super.key, required this.onOpenChannel});
+  @override
+  State<ChannelsScreen> createState() => _ChannelsScreenState();
+}
+
+class _ChannelsScreenState extends State<ChannelsScreen> {
+  List<Map<String, dynamic>> _chs = [];
+  bool _loading = true;
+  @override
+  void initState() { super.initState(); _load(); }
+  Future<void> _load() async {
+    final c = await Api.channels();
+    c.sort((a, b) {                                            // most readers first, then most online
+      final fa = (a['followers'] as num?)?.toInt() ?? 0, fb = (b['followers'] as num?)?.toInt() ?? 0;
+      if (fa != fb) return fb - fa;
+      return ((b['online'] as num?)?.toInt() ?? 0) - ((a['online'] as num?)?.toInt() ?? 0);
+    });
+    if (mounted) setState(() { _chs = c; _loading = false; });
+  }
+  @override
+  Widget build(BuildContext context) {
+    return Column(children: [
+      Container(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+        alignment: Alignment.centerLeft,
+        decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: kLine))),
+        child: const Text('Channels', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 20)),
+      ),
+      Expanded(
+        child: RefreshIndicator(
+          color: kAccent, backgroundColor: kCard, onRefresh: _load,
+          child: _loading
+              ? const Center(child: CircularProgressIndicator(color: kAccent))
+              : _chs.isEmpty
+                  ? ListView(children: const [
+                      Padding(padding: EdgeInsets.fromLTRB(28, 70, 28, 0), child: Text(
+                          'No channels yet.\n\nChannels are publications you can follow — their posts and articles show here, not in your feed.',
+                          textAlign: TextAlign.center, style: TextStyle(color: kDim, fontSize: 13.5, height: 1.6)))])
+                  : ListView.separated(
+                      itemCount: _chs.length,
+                      separatorBuilder: (_, __) => const Divider(color: kLine, height: 1),
+                      itemBuilder: (_, i) {
+                        final c = _chs[i];
+                        final acc = '${c['account']}';
+                        final name = '${c['display'] ?? ''}';
+                        final bio = '${c['bio'] ?? ''}';
+                        final online = (c['online'] as num?)?.toInt() ?? 0;
+                        final readers = (c['followers'] as num?)?.toInt() ?? 0;
+                        return ListTile(
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                          onTap: () => widget.onOpenChannel(acc, name.isEmpty ? 'channel' : name),
+                          leading: AuthorAvatar(account: acc, handle: name.isEmpty ? '?' : name, radius: 24),
+                          title: Text(name.isEmpty ? 'channel' : name,
+                              style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 15)),
+                          subtitle: bio.isEmpty ? null : Text(bio, maxLines: 2, overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: kDim, fontSize: 12.5)),
+                          trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                            Row(mainAxisSize: MainAxisSize.min, children: [
+                              Container(width: 7, height: 7, decoration: BoxDecoration(
+                                  color: online > 0 ? const Color(0xFF3BD671) : kDim, shape: BoxShape.circle)),
+                              const SizedBox(width: 5),
+                              Text('$online online', style: TextStyle(
+                                  color: online > 0 ? const Color(0xFF3BD671) : kDim, fontSize: 12, fontWeight: FontWeight.w700)),
+                            ]),
+                            const SizedBox(height: 3),
+                            Text('$readers reader${readers == 1 ? '' : 's'}',
+                                style: const TextStyle(color: kDim, fontSize: 11)),
+                          ]),
+                        );
+                      },
+                    ),
+        ),
+      ),
+    ]);
   }
 }
 
