@@ -2227,6 +2227,7 @@ class _FeedScreenState extends State<FeedScreen> {
       }
     }
     await _refreshTxLog();
+    await _refreshTxCount(); // your on-chain tx count just grew — update the header
     await _load(); // refresh the footprint meter
     if (!mounted) return;
     final msg = failedCreators == 0
@@ -2246,6 +2247,15 @@ class _FeedScreenState extends State<FeedScreen> {
   Future<void> _refreshTxLog() async {
     final t = await TxLogStore.get();
     if (mounted) setState(() => _txLog = t);
+  }
+
+  // The header's "Nano txns" = the number of on-chain blocks on YOUR account chain (every settle / send /
+  // receive you've made). Read from the ledger via account_state.block_count; grows as you settle tips.
+  Future<void> _refreshTxCount() async {
+    if (_account.isEmpty) return;
+    final st = await Api.accountState(_account);
+    final bc = (st?['block_count'] as num?)?.toInt();
+    if (bc != null && mounted) setState(() => _onchainBlocks = bc);
   }
 
   // A settled-tips history sheet: one card per settlement, each split leg with its amount, a ✓/✗ for
@@ -2510,13 +2520,13 @@ class _FeedScreenState extends State<FeedScreen> {
 
   // Home shows the people you follow (+ your own posts); everyone if you follow no one yet
   List<Post> _homePosts() {
-    // STRICT Following: only accounts you follow (+ your own). Follow nobody → empty, and the feed shows
-    // a discover prompt instead of falling back to everyone. Roots only (replyTo == null) — replies are
-    // rendered NESTED under their parent via _threadGroup, not as separate top-level entries.
+    // STRICT Following: ONLY the accounts you follow — not your own posts (those live on your profile
+    // and in For You). Follow nobody → empty, and the feed shows a discover prompt instead of falling
+    // back to everyone. Roots only (replyTo == null) — replies render NESTED under their parent.
     if (_follows.isEmpty) return const [];
     return _posts
         .where((p) =>
-            (_follows.contains(p.account) || p.account == _account) &&
+            _follows.contains(p.account) &&
             !_reported.contains(p.id) &&
             !_hidden(p.account) &&
             p.replyTo == null)
@@ -4789,7 +4799,8 @@ class _FeedScreenState extends State<FeedScreen> {
         // cache is still warming). Only replace when the fetch has posts, or we truly had none.
         if (fd.posts.isNotEmpty || _posts.isEmpty) _posts = fd.posts;
         _newPosts.clear();                    // a full refresh already includes everything
-        _onchainBlocks = fd.onchainBlocks;
+        // (fd.onchainBlocks is always 0 — the feed is off-chain. The header's "Nano txns" count comes
+        //  from the user's own on-chain block count instead; see _refreshTxCount.)
         if (fd.posts.isNotEmpty) {
           _relaysUp = fd.relaysUp;
           _relaysTotal = fd.relaysTotal;
@@ -4802,6 +4813,7 @@ class _FeedScreenState extends State<FeedScreen> {
       });
       _syncSupporter(); // reflect current supporter state now that the account is known
       _initProfile();   // pull our own profile (name/avatar) into the cache
+      _refreshTxCount(); // header "Nano txns" = your on-chain block count (now the account is known)
       _maybeSweep();    // keep only the safety-cap float here; forward the rest to savings
       _loadSecondary(); // notifications + engagement counts, AFTER first paint (off the launch burst)
     } catch (e) {
@@ -5109,7 +5121,7 @@ class _FeedScreenState extends State<FeedScreen> {
                   child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                     Flexible(
                       child: Text(
-                          '⛓ ${_onchainBlocks} Nano block${_onchainBlocks == 1 ? '' : 's'}  ·  ${_posts.length} posts off-chain  ·  📡 ${_relaysUp}/${_relaysTotal} relays',
+                          '⛓ ${_onchainBlocks} Nano txn${_onchainBlocks == 1 ? '' : 's'}  ·  ${_posts.length} posts off-chain  ·  📡 ${_relaysUp}/${_relaysTotal} relays',
                           textAlign: TextAlign.center,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(

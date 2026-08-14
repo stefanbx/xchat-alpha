@@ -185,9 +185,13 @@ def api_account_state(acct):
     except Exception as e:
         return json.dumps({'ok': False, 'error': f'ledger unreachable: {e}'})
     if 'error' in ai:                                        # unopened account: the app will send an OPEN block
-        return json.dumps({'opened': False, 'frontier': '0' * 64, 'balance': '0', 'representative': acct})
+        return json.dumps({'opened': False, 'frontier': '0' * 64, 'balance': '0',
+                           'representative': acct, 'block_count': 0})
     return json.dumps({'opened': True, 'frontier': ai['frontier'], 'balance': ai['balance'],
-                       'representative': ai.get('representative', acct)})
+                       'representative': ai.get('representative', acct),
+                       # total blocks on this account's chain = every on-chain transaction it has made
+                       # (opens/receives/sends/changes). The app shows this as the user's "Nano txns".
+                       'block_count': int(ai.get('block_count', 0) or 0)})
 
 def api_receivables(acct):
     try:
