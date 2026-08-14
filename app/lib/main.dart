@@ -1726,19 +1726,21 @@ class AuthorAvatar extends StatelessWidget {
       builder: (_, __) {
         ProfileCache.I.ensure(account);
         final cid = ProfileCache.I.avatarCid(account);
-        final Widget avatar = cid != null
-            ? ClipOval(
-                child: SizedBox(
-                  width: radius * 2, height: radius * 2,
-                  child: MediaImage(cid: cid, fit: BoxFit.cover),
-                ),
-              )
-            : CircleAvatar(
-                radius: radius,
-                backgroundColor: avatarColor(handle),
-                child: Text(handle.isEmpty ? '?' : handle.substring(0, 1).toUpperCase(),
-                    style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: radius * 0.62)),
-              );
+        final Widget avatar = (cid != null && cid.startsWith('live:'))
+            ? LiveAvatar(style: cid.substring(5), radius: radius)   // animated, code-drawn avatar
+            : cid != null
+                ? ClipOval(
+                    child: SizedBox(
+                      width: radius * 2, height: radius * 2,
+                      child: MediaImage(cid: cid, fit: BoxFit.cover),
+                    ),
+                  )
+                : CircleAvatar(
+                    radius: radius,
+                    backgroundColor: avatarColor(handle),
+                    child: Text(handle.isEmpty ? '?' : handle.substring(0, 1).toUpperCase(),
+                        style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: radius * 0.62)),
+                  );
         if (!PresenceCache.I.isOnline(account)) return avatar;
         final d = (radius * 0.55).clamp(8.0, 14.0);        // dot scales with the avatar
         return Stack(clipBehavior: Clip.none, children: [
@@ -1758,6 +1760,73 @@ class AuthorAvatar extends StatelessWidget {
       },
     );
   }
+}
+
+// A LIVE (animated, code-drawn) avatar — no image upload. Stored in the profile as the sentinel
+// "live:<style>" in the avatar field; AuthorAvatar renders this instead of a MediaImage. Older app
+// versions that don't know the sentinel fall back to the initial-letter avatar (graceful).
+class LiveAvatar extends StatefulWidget {
+  final String style;   // currently 'orbit'
+  final double radius;
+  const LiveAvatar({super.key, required this.style, this.radius = 22});
+  @override
+  State<LiveAvatar> createState() => _LiveAvatarState();
+}
+
+class _LiveAvatarState extends State<LiveAvatar> with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, duration: const Duration(seconds: 5))..repeat();
+  }
+  @override
+  void dispose() { _c.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) {
+    final d = widget.radius * 2;
+    return SizedBox(
+      width: d, height: d,
+      child: AnimatedBuilder(
+        animation: _c,
+        builder: (_, __) => CustomPaint(painter: _OrbitPainter(_c.value)),
+      ),
+    );
+  }
+}
+
+// "Orbit": a dark disc with three coloured dots (XNO teal / blue / green) orbiting the Ӿ mark.
+class _OrbitPainter extends CustomPainter {
+  final double t; // 0..1 animation phase
+  _OrbitPainter(this.t);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final r = size.width / 2;
+    canvas.drawCircle(c, r, Paint()..color = const Color(0xFF0B1A22));          // disc
+    canvas.drawCircle(c, r - 1, Paint()                                          // faint rim
+      ..style = PaintingStyle.stroke..strokeWidth = 1
+      ..color = const Color(0xFF14E0C8).withValues(alpha: 0.22));
+    final orbitR = r * 0.74, dotR = (r * 0.14).clamp(1.5, 6.0);
+    const colors = [Color(0xFF14E0C8), Color(0xFF3B82F6), Color(0xFF3BD671)];
+    for (int i = 0; i < 3; i++) {
+      final ang = 2 * math.pi * (t + i / 3);
+      final p = c + Offset(math.cos(ang), math.sin(ang)) * orbitR;
+      canvas.drawCircle(p, dotR, Paint()
+        ..color = colors[i]
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 0.8));
+    }
+    final xr = r * 0.42;                                                          // centre Ӿ mark
+    final pen = Paint()
+      ..color = Colors.white
+      ..strokeWidth = math.max(1.5, r * 0.12)
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(c + Offset(-xr * 0.62, -xr), c + Offset(xr * 0.62, xr), pen);
+    canvas.drawLine(c + Offset(xr * 0.62, -xr), c + Offset(-xr * 0.62, xr), pen);
+    canvas.drawLine(c + Offset(-xr * 0.5, 0), c + Offset(xr * 0.5, 0), pen);      // the Ӿ bar
+  }
+  @override
+  bool shouldRepaint(_OrbitPainter old) => old.t != t;
 }
 
 // a subtle dark scrim + camera glyph, laid over an image thumbnail to say "tap to change"
@@ -3193,15 +3262,17 @@ class _FeedScreenState extends State<FeedScreen> {
                   child: Container(
                     padding: const EdgeInsets.all(3),
                     decoration: const BoxDecoration(color: kBg, shape: BoxShape.circle),
-                    child: avatar.isNotEmpty
-                        ? Stack(children: [
-                            ClipOval(child: SizedBox(width: 62, height: 62, child: MediaImage(cid: avatar, fit: BoxFit.cover))),
-                            const Positioned.fill(child: ClipOval(child: _CamScrim())),
-                          ])
-                        : CircleAvatar(radius: 31, backgroundColor: kCard,
-                            child: uploadingA
-                                ? const CircularProgressIndicator(strokeWidth: 2, color: kAccent)
-                                : const Icon(Icons.add_a_photo_outlined, color: kDim, size: 20)),
+                    child: avatar.startsWith('live:')
+                        ? LiveAvatar(style: avatar.substring(5), radius: 31)
+                        : avatar.isNotEmpty
+                            ? Stack(children: [
+                                ClipOval(child: SizedBox(width: 62, height: 62, child: MediaImage(cid: avatar, fit: BoxFit.cover))),
+                                const Positioned.fill(child: ClipOval(child: _CamScrim())),
+                              ])
+                            : CircleAvatar(radius: 31, backgroundColor: kCard,
+                                child: uploadingA
+                                    ? const CircularProgressIndicator(strokeWidth: 2, color: kAccent)
+                                    : const Icon(Icons.add_a_photo_outlined, color: kDim, size: 20)),
                   ),
                 ),
               ),
@@ -3218,6 +3289,29 @@ class _FeedScreenState extends State<FeedScreen> {
                 minLines: 2, maxLines: 4, maxLength: 160,
                 decoration: _fieldDeco('Bio'),
               ),
+              const SizedBox(height: 6),
+              // LIVE avatar picker — an animated, code-drawn avatar (no upload). Tap to set/unset.
+              Row(children: [
+                const Text('Live avatar', style: TextStyle(color: kDim, fontSize: 12.5)),
+                const SizedBox(width: 12),
+                GestureDetector(
+                  onTap: () => setSheet(() => avatar = avatar == 'live:orbit' ? '' : 'live:orbit'),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                        color: avatar == 'live:orbit' ? kAccent.withValues(alpha: 0.15) : kCard,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(color: avatar == 'live:orbit' ? kAccent : kLine)),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      const LiveAvatar(style: 'orbit', radius: 11),
+                      const SizedBox(width: 7),
+                      Text('Orbit',
+                          style: TextStyle(color: avatar == 'live:orbit' ? kAccent : kText,
+                              fontWeight: FontWeight.w700, fontSize: 13)),
+                    ]),
+                  ),
+                ),
+              ]),
               const SizedBox(height: 8),
               SizedBox(width: double.infinity, child: FilledButton(
                 onPressed: saving ? null : () async {
@@ -6126,11 +6220,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         Container(
                           padding: const EdgeInsets.all(3),
                           decoration: const BoxDecoration(color: kBg, shape: BoxShape.circle),
-                          child: avatar.isNotEmpty
-                              ? ClipOval(child: SizedBox(width: 72, height: 72, child: MediaImage(cid: avatar, fit: BoxFit.cover)))
-                              : CircleAvatar(radius: 36, backgroundColor: avatarColor(widget.handle),
-                                  child: Text(widget.handle.substring(0, 1).toUpperCase(),
-                                      style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 26))),
+                          child: avatar.startsWith('live:')
+                              ? LiveAvatar(style: avatar.substring(5), radius: 36)
+                              : avatar.isNotEmpty
+                                  ? ClipOval(child: SizedBox(width: 72, height: 72, child: MediaImage(cid: avatar, fit: BoxFit.cover)))
+                                  : CircleAvatar(radius: 36, backgroundColor: avatarColor(widget.handle),
+                                      child: Text(widget.handle.substring(0, 1).toUpperCase(),
+                                          style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 26))),
                         ),
                         const Spacer(),
                         if (widget.isMe)
