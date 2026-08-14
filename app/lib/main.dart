@@ -1928,6 +1928,8 @@ class _FeedScreenState extends State<FeedScreen> {
   int _onchainBlocks = 0;
   int _relaysUp = 0, _relaysTotal = 0;
   final Map<String, double> _pending = {}; // author account -> tallied XNO (off-chain)
+  final Set<String> _settling = {};        // creators with a settle in flight — blocks re-entrant settles
+  bool _settleBusy = false;                 // guards the manual batch settle against a double-tap
   final Map<String, String> _handleOf = {}; // account -> handle, for the settle bar
   // reshare/media attribution LOCKED at tip time (per creator) — a later reshare can't claim it
   final Map<String, String> _reposterOf = {}; // author account -> resharer account to reward
@@ -2212,6 +2214,10 @@ class _FeedScreenState extends State<FeedScreen> {
   // fire an on-chain settlement automatically ONLY within the user-consented policy
   Future<void> _maybeAutoSettle(String account, String handle) async {
     if (!_autoSettle) return;
+    // RE-ENTRANCY GUARD: settle is a multi-second network+PoW round trip fired from every tip tap. Two
+    // overlapping settles for one creator would sign on the same (not-yet-advanced) frontier — one forks
+    // — and the second's success would clear a tally the first hadn't yet accounted for. One at a time.
+    if (_settling.contains(account) || _settleBusy) return;
     final amt = _pending[account] ?? 0;
     if (amt + 1e-9 < _autoThreshold) return; // below the per-creator threshold — keep tallying
     if (_autoSpent + amt > _autoCap + 1e-9) {
@@ -2220,6 +2226,8 @@ class _FeedScreenState extends State<FeedScreen> {
           content: Text('auto-settle cap reached — settle the rest manually')));
       return;
     }
+    _settling.add(account);
+    try {
     final r = await Api.settle(account, amt.toStringAsFixed(2),
         split: _settings.relaySplit, rsplit: _settings.reposterSplit,
         reposter: _reposterOf[account] ?? '', media: _mediaOf[account] ?? '');
@@ -2236,9 +2244,16 @@ class _FeedScreenState extends State<FeedScreen> {
       }
       setState(() {
         _autoSpent += amt;
-        _pending.remove(account);
-        _reposterOf.remove(account);
-        _mediaOf.remove(account);
+        // Subtract ONLY what we settled — anything tallied for this creator DURING the await must stay
+        // pending (removing the whole entry would silently drop those later tips). Drain fully → clear.
+        final rem = (_pending[account] ?? 0) - amt;
+        if (rem > 1e-9) {
+          _pending[account] = rem;
+        } else {
+          _pending.remove(account);
+          _reposterOf.remove(account);
+          _mediaOf.remove(account);
+        }
       });
       await _refreshTxLog();
       await _load();
@@ -2252,6 +2267,9 @@ class _FeedScreenState extends State<FeedScreen> {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           backgroundColor: kCard,
           content: Text('auto-settle held: ${r['error'] ?? 'failed'} — still pending')));
+    }
+    } finally {
+      _settling.remove(account);
     }
   }
 
@@ -2320,6 +2338,9 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   Future<void> _settle() async {
+    if (_settleBusy) return;   // a batch settle is already running — a double-tap must not start a second
+    _settleBusy = true;
+    try {
     final entries = _pending.entries.toList();
     int paidCreators = 0, blocks = 0, failedCreators = 0, legShorts = 0;
     String? err;
@@ -2344,8 +2365,16 @@ class _FeedScreenState extends State<FeedScreen> {
         if (e.key != _account && _settings.notifyTip) {
           Api.notifyPush(e.key, _handle, 'tip', 'settled ${e.value.toStringAsFixed(2)} XNO to you on-chain');
         }
-        // clear ONLY what actually paid the creator — an unpaid tally must stay pending, not vanish
-        setState(() { _pending.remove(e.key); _reposterOf.remove(e.key); _mediaOf.remove(e.key); });
+        // Subtract ONLY what we settled — a tip tallied to this creator DURING the awaited settle must
+        // survive (removing the whole entry would drop it). Drain fully → clear the entry + its locks.
+        setState(() {
+          final rem = (_pending[e.key] ?? 0) - e.value;
+          if (rem > 1e-9) {
+            _pending[e.key] = rem;
+          } else {
+            _pending.remove(e.key); _reposterOf.remove(e.key); _mediaOf.remove(e.key);
+          }
+        });
       } else {
         failedCreators++;
         err ??= r?['error']?.toString() ??
@@ -2364,6 +2393,9 @@ class _FeedScreenState extends State<FeedScreen> {
             ? 'paid $paidCreators of ${entries.length} · $failedCreators unpaid (${err ?? 'failed'}) — still pending'
             : 'nothing settled — ${err ?? 'settle failed'}. Your tips are still pending.';
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(backgroundColor: kCard, content: Text(msg)));
+    } finally {
+      _settleBusy = false;
+    }
   }
 
   // The tipper's receipt trail, loaded from disk. See TxLogStore — the network notifies the RECIPIENT
@@ -5019,11 +5051,15 @@ class _FeedScreenState extends State<FeedScreen> {
     final addr = _settings.sweepAddr.trim();
     if (!addr.startsWith('nano_') || addr.length < 60 || addr == _account) return;
     final xno = (double.tryParse(_balance) ?? 0) / 1e30;
-    final excess = xno - kWalletCapXno;
+    // NEVER sweep XNO pledged to un-settled tips — subtract the reservation from the sweepable excess,
+    // and pass it to send() as a second guard. Without this, the sweep could forward tip funds to savings
+    // and leave every pending tip permanently unsettleable ("insufficient balance").
+    final reserved = _pendingTotal();
+    final excess = xno - kWalletCapXno - reserved;
     if (excess <= 0.0001) return;
     _sweeping = true;
     try {
-      final r = await Api.send(addr, excess.toStringAsFixed(6));
+      final r = await Api.send(addr, excess.toStringAsFixed(6), reservedXno: reserved);
       if (r != null && r['ok'] == true) {
         await _load();
         if (mounted) {

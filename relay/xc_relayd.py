@@ -110,6 +110,42 @@ def engage_for(pid):
     _cap_dict(engage, ENGAGE_MAX)                # bound distinct post_ids (was unbounded → OOM)
     return e
 
+_channels_cache = {'t': 0.0, 'json': '{"channels":[]}'}
+def channels_directory():
+    # Channel directory JSON, cached ~10s. ONE pass over `follows` builds per-account follower + online
+    # counts (online = a follower whose head is fresh within 150s), instead of rescanning `follows` for
+    # every channel (the old code was O(channels × follows × list) on the request thread → CPU-DoS). Each
+    # channel profile's signature is VERIFIED here (the relay stores profiles unsigned; verifying at read
+    # stops the directory listing a spoofed channel for an account the poster does not control). `type`
+    # itself is unsigned/advisory, but you can only claim it on a profile you can actually sign.
+    now = time.time()
+    if now - _channels_cache['t'] < 10:
+        return _channels_cache['json']
+    follower_ct, online_ct = {}, {}
+    for f, r in list(follows.items()):
+        if not isinstance(r, dict):
+            continue
+        fresh = now - float((heads.get(f) or {}).get('ts', 0) or 0) <= 150
+        for a in (r.get('follows') or []):
+            follower_ct[a] = follower_ct.get(a, 0) + 1
+            if fresh:
+                online_ct[a] = online_ct.get(a, 0) + 1
+    out = []
+    for acc, rec in list(profiles.items()):
+        if not isinstance(rec, dict) or rec.get('type') != 'channel':
+            continue
+        if xc is not None:
+            msg = xc.sig_canon('profile', acc, rec.get('ts', 0), rec.get('display', ''),
+                               rec.get('bio', ''), rec.get('avatar', ''), rec.get('banner', ''))
+            if not (xc.pub_to_addr(rec.get('pub', '')) == acc
+                    and xc.verify_msg(rec.get('pub', ''), msg, rec.get('sig', ''))):
+                continue                                        # unsigned/spoofed → not listed
+        out.append({'account': acc, 'display': rec.get('display', ''), 'bio': rec.get('bio', ''),
+                    'avatar': rec.get('avatar', ''),
+                    'followers': follower_ct.get(acc, 0), 'online': online_ct.get(acc, 0)})
+    _channels_cache['t'], _channels_cache['json'] = now, json.dumps({'channels': out})
+    return _channels_cache['json']
+
 _heads_lock = threading.Lock()                                # guards heads across prune + /push
 _dm_seen = set()                                              # (from, ts) O(1) dedup for the mailbox
 
@@ -562,21 +598,7 @@ class H(BaseHTTPRequestHandler):
             acc = qs(self.path).get('account', '')
             self._send(200, json.dumps({'account': acc, 'record': follows.get(acc)}))
         elif self.path.startswith('/channels'):
-            # directory of channel profiles (type == 'channel'), each with a follower count and an
-            # "online readers" count = followers whose signed head was refreshed within the presence
-            # window (the same 45s heartbeat that drives the green dot). All local to the relay.
-            now = time.time()
-            out = []
-            for acc, rec in list(profiles.items()):
-                if not isinstance(rec, dict) or rec.get('type') != 'channel':
-                    continue
-                flws = [f for f, r in follows.items()
-                        if isinstance(r, dict) and acc in (r.get('follows') or [])]
-                online = sum(1 for f in flws
-                             if now - float((heads.get(f) or {}).get('ts', 0) or 0) <= 150)
-                out.append({'account': acc, 'display': rec.get('display', ''), 'bio': rec.get('bio', ''),
-                            'avatar': rec.get('avatar', ''), 'followers': len(flws), 'online': online})
-            self._send(200, json.dumps({'channels': out}))
+            self._send(200, channels_directory())
         elif self.path.startswith('/profile'):
             acc = qs(self.path).get('account', '')
             self._send(200, json.dumps({'account': acc, 'record': profiles.get(acc)}))
@@ -801,8 +823,13 @@ class H(BaseHTTPRequestHandler):
                 if xc is None or xc.pub_to_addr(pub) != acc \
                         or not xc.verify_msg(pub, 'report|%s|%s|%s' % (acc, pid, ts), sig):
                     self._send(400, json.dumps({'ok': False, 'error': 'bad report signature'})); return
+                # Bound distinct reported posts BEFORE inserting — the old `setdefault` then `pid in reports`
+                # check always saw the just-inserted key, so the cap never fired and a signed-report flood
+                # of fresh post_ids grew `reports` without limit (OOM a running relay).
+                if pid not in reports and len(reports) >= REPORT_POSTS:
+                    self._send(200, json.dumps({'ok': True, 'accepted': False, 'reason': 'report cap'})); return
                 recs = reports.setdefault(pid, {})
-                fresh = acc not in recs and (pid in reports or len(reports) <= REPORT_POSTS) and len(recs) < REPORT_PER_POST
+                fresh = acc not in recs and len(recs) < REPORT_PER_POST
                 if fresh:
                     rep = xc.account_rep(acc)                   # Sybil-resistant weight (0 for a throwaway)
                     recs[acc] = {'ts': ts, 'sig': sig, 'pub': pub, 'cid': m.get('cid', ''), 'rep': rep}
