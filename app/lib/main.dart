@@ -2786,7 +2786,7 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   // build a fully-wired post card (reused by the profile screen's Posts/Media tabs)
-  Widget _profileCard(Post post) {
+  Widget _profileCard(Post post, {bool expanded = false}) {
     _countView(post.id); // this card is being rendered → an impression
     final mod = _mod(post.id);
     if (mod.hide) {
@@ -2794,6 +2794,7 @@ class _FeedScreenState extends State<FeedScreen> {
     }
     return PostCard(
         post: post,
+        expanded: expanded,
         softFlag: mod,
         pending: _pending[post.account] ?? 0,
         engage: _eng(post.id),
@@ -2877,22 +2878,6 @@ class _FeedScreenState extends State<FeedScreen> {
     return out;
   }
 
-  // A feed entry = a root post plus its replies nested beneath it (comment-section style). A left rule
-  // + indent marks the replies as belonging to the post above. Replies reuse the same card (so tip /
-  // like / reply / moderation all work identically); moderation/hidden handling stays per-post.
-  Widget _threadGroup(Post root) {
-    final replies = _threadReplies(root.id);
-    if (replies.isEmpty) return _profileCard(root);
-    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      _profileCard(root),
-      ...replies.map((r) => Container(
-            padding: const EdgeInsets.only(left: 22),
-            decoration: const BoxDecoration(
-                border: Border(left: BorderSide(color: kLine, width: 2))),
-            child: _profileCard(r),
-          )),
-    ]);
-  }
 
   Post _threadRoot(Post p) {
     var cur = p;
@@ -2906,19 +2891,10 @@ class _FeedScreenState extends State<FeedScreen> {
     return cur;
   }
 
-  // root + its descendants, oldest-first (the reading order of a thread)
-  List<Post> _threadChain(Post root) {
-    final chain = <Post>[root];
-    bool added = true;
-    while (added) {
-      added = false;
-      final lastId = chain.last.id;
-      for (final p in _posts) {
-        if (p.replyTo == lastId && !chain.contains(p)) { chain.add(p); added = true; }
-      }
-    }
-    return chain;
-  }
+  // root + ALL its descendants in reading order. Uses the same transitive DFS walk as the feed count
+  // (_threadReplies), so a BRANCHED thread — two replies to the same post, a reply to a reply — shows
+  // every message. (The old walk only extended from the last-added node, dropping sibling branches.)
+  List<Post> _threadChain(Post root) => [root, ..._threadReplies(root.id)];
 
   void _openThread(Post p) {
     if (p.kind == 'article') { _openArticle(p); return; }   // long-form → full-screen reader
@@ -2931,7 +2907,8 @@ class _FeedScreenState extends State<FeedScreen> {
       body: ListView.separated(
         itemCount: chain.length,
         separatorBuilder: (_, __) => Container(color: kLine, height: 1),
-        itemBuilder: (_, i) => _profileCard(chain[i]),
+        // the focused (root) post shows its full text; replies keep the compact "Show more" behaviour
+        itemBuilder: (_, i) => _profileCard(chain[i], expanded: i == 0),
       ),
     )));
   }
@@ -5628,8 +5605,8 @@ class _FeedScreenState extends State<FeedScreen> {
                 }
                 // stable identity per post so a feed refresh matches elements by post, not by slot —
                 // without this the list recycles cards across posts and their media gets mismatched.
-                // _threadGroup renders the root plus its replies nested beneath it (comment-section style).
-                return KeyedSubtree(key: ValueKey(posts[j].id), child: _threadGroup(posts[j]));
+                // clean single card per post; tap it to open the full conversation (X-style thread view).
+                return KeyedSubtree(key: ValueKey(posts[j].id), child: _profileCard(posts[j]));
               },
             ),
           ),
@@ -6614,6 +6591,7 @@ class PostCard extends StatefulWidget {
   final bool inThread; // part of an author thread → show a thread affordance
   final int replyCount;       // number of reply-posts to this post (X-style reply counter on the bubble)
   final String replyingToHandle; // if this post is itself a reply, the handle it replies to ('' if none/unknown)
+  final bool expanded;        // start with full post text shown (the focused post at the top of a thread)
   final String repostedBy; // handle of the resharer who spread this to you (X-style header)
   const PostCard(
       {super.key,
@@ -6645,6 +6623,7 @@ class PostCard extends StatefulWidget {
       this.onReply,
       this.replyCount = 0,
       this.replyingToHandle = '',
+      this.expanded = false,
       this.repostedBy = ''});
   static void _noop() {}
   @override
@@ -6652,7 +6631,7 @@ class PostCard extends StatefulWidget {
 }
 
 class _PostCardState extends State<PostCard> {
-  bool _expanded = false;
+  late bool _expanded = widget.expanded;   // start expanded (full text) for the focused post in a thread
   @override
   Widget build(BuildContext context) {
     final p = widget.post;
@@ -6742,10 +6721,15 @@ class _PostCardState extends State<PostCard> {
                 child: Text(p.title!,
                     style: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 16, height: 1.3)),
               ),
-            Text(p.text,
-                maxLines: (longText && !_expanded) ? 6 : null,
-                overflow: (longText && !_expanded) ? TextOverflow.ellipsis : TextOverflow.clip,
-                style: const TextStyle(color: kText, fontSize: 15, height: 1.35)),
+            // tap the post body → open the full conversation (the entire post + all replies), X-style
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: widget.onOpenThread,
+              child: Text(p.text,
+                  maxLines: (longText && !_expanded) ? 6 : null,
+                  overflow: (longText && !_expanded) ? TextOverflow.ellipsis : TextOverflow.clip,
+                  style: const TextStyle(color: kText, fontSize: 15, height: 1.35)),
+            ),
             if (longText)
               GestureDetector(
                 onTap: () => setState(() => _expanded = !_expanded),
