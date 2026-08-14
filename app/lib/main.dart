@@ -3015,6 +3015,31 @@ class _FeedScreenState extends State<FeedScreen> {
             _readerActionRow(p),
           ]),
         ),
+        // Comments below the article. Channels post ARTICLES, and the reader used to show only the body —
+        // so a channel post's replies were invisible ("channels don't show the comments"). Render the
+        // conversation here, the same reply-posts a normal post shows in its thread view.
+        Container(height: 8, color: kBg),
+        Container(height: 1, color: kLine),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(18, 14, 18, 4),
+          child: Row(children: [
+            Icon(Icons.mode_comment_outlined, color: kAccent, size: 18),
+            SizedBox(width: 8),
+            Text('Comments', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 16)),
+          ]),
+        ),
+        Builder(builder: (_) {
+          final replies = _threadReplies(p.id);
+          if (replies.isEmpty) {
+            return const Padding(
+              padding: EdgeInsets.fromLTRB(18, 18, 18, 30),
+              child: Text('No comments yet — tap the reply icon above to be the first.',
+                  style: TextStyle(color: kDim, fontSize: 13.5)));
+          }
+          return Column(children: [
+            for (final r in replies) ...[Container(color: kLine, height: 1), _profileCard(r)],
+          ]);
+        }),
       ]),
     )));
   }
