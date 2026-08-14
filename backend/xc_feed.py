@@ -12,24 +12,59 @@ xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
 RELAYS = xc.discover_relays()          # find the relay set from a bootstrap — no hardcoding
 WORKERS = int(os.environ.get('XC_FEED_WORKERS', '16'))   # parallel fan-out for relay + content fetches
 
-def get_content(cid):                  # content by CID: IPFS origin, else a relay CACHE (survives origin loss)
+# Content is CONTENT-ADDRESSED (a CID *is* the hash of its bytes), so once we hold a CID's bytes they are
+# valid forever. But xc_feed runs as a FRESH process every FEED_TTL, so it used to re-`ipfs cat` every
+# post's content on every spawn — and each `ipfs cat` is a ~60 ms fork+exec of the Go binary, so a feed
+# of N posts burned N×60 ms of pure process spawn every few seconds, almost all of it redundant. A disk
+# cache keyed by CID makes that a ONE-TIME cost per CID: steady state (no new posts) does zero cats.
+CONTENT_CACHE = os.environ.get('XC_CONTENT_CACHE', '/tmp/xc_content_cache')
+CONTENT_TTL   = float(os.environ.get('XC_CONTENT_TTL', str(24 * 3600)))   # disk-bound only; content never changes
+
+def _cache_path(cid):
+    os.makedirs(CONTENT_CACHE, exist_ok=True)
+    return os.path.join(CONTENT_CACHE, urllib.parse.quote(cid, safe=''))   # CID -> collision-free filename
+
+def get_content(cid):                  # content by CID: disk cache, then IPFS origin, then a relay CACHE
+    try:
+        return open(_cache_path(cid), 'rb').read()     # cache hit: these bytes were CID-validated before writing
+    except Exception:
+        pass
+    data = None
     try:
         # ipfs runs --offline here, so a missing block fails FAST (no DHT); a low timeout just caps the
         # rare slow local read. The old 8s cap × serial-per-post was the feed's cold-start bottleneck.
-        return subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': xc.IPFS_PATH}, timeout=3)
+        data = subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': xc.IPFS_PATH}, timeout=3)
     except Exception:
-        pass
-    for r in RELAYS:
+        for r in RELAYS:
+            try:
+                d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + urllib.parse.quote(cid, safe=''), timeout=4).read())
+                if d.get('b64'):
+                    b = base64.b64decode(d['b64'])
+                    if xc.content_matches_cid(cid, b):     # a rogue relay can't swap content for a signed CID
+                        data = b; break
+                    # bytes don't hash to the CID — this relay is lying/corrupt; try the next one
+            except Exception:
+                pass
+    if data is not None:
         try:
-            d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + urllib.parse.quote(cid, safe=''), timeout=4).read())
-            if d.get('b64'):
-                b = base64.b64decode(d['b64'])
-                if xc.content_matches_cid(cid, b):     # a rogue relay can't swap content for a signed CID
-                    return b
-                # bytes don't hash to the CID — this relay is lying/corrupt; try the next one
+            cp = _cache_path(cid); tmp = cp + '.tmp'     # atomic write; bytes are CID-valid (self-verified above)
+            open(tmp, 'wb').write(data); os.replace(tmp, cp)
         except Exception:
             pass
-    return None
+    return data
+
+def _prune_content_cache():            # disk hygiene only — an expired entry is still valid, just unused
+    try:
+        cut = time.time() - CONTENT_TTL
+        for f in os.listdir(CONTENT_CACHE):
+            p = os.path.join(CONTENT_CACHE, f)
+            try:
+                if os.path.getmtime(p) < cut:
+                    os.remove(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def verify(pub, msg, sig):
     try:
@@ -93,3 +128,4 @@ posts.sort(key=lambda p: p.get('ts', 0), reverse=True)
 json.dump({"feed": "XChat", "posts": posts, "relays_up": up, "relays_total": len(RELAYS),
            "authors": len(best)}, open('/tmp/xc_feed_agg.json.tmp', 'w'))
 os.replace('/tmp/xc_feed_agg.json.tmp', '/tmp/xc_feed_agg.json')
+_prune_content_cache()                 # bound the CID cache after the feed is written (off the hot path)
