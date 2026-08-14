@@ -2620,7 +2620,7 @@ class _FeedScreenState extends State<FeedScreen> {
               ]),
               Text(
                   _autoSettle
-                      ? 'Tips tally off-chain. Auto-settle is on (≥${_autoThreshold.toStringAsFixed(2)} XNO each). Settle the rest now, or leave them to accrue.'
+                      ? 'Tips tally off-chain. Auto-settle is on (≥${fmtXno(_autoThreshold)} XNO each). Settle the rest now, or leave them to accrue.'
                       : 'Tips tally off-chain — nothing has moved yet. Settling sends one direct Nano block to each creator.',
                   style: const TextStyle(color: kDim, fontSize: 12, height: 1.4)),
               const SizedBox(height: 14),
@@ -2636,7 +2636,7 @@ class _FeedScreenState extends State<FeedScreen> {
                         Expanded(child: Text('@${_handleOf[e.key] ?? 'creator'}',
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(color: kText, fontSize: 14, fontWeight: FontWeight.w600))),
-                        Text('${e.value.toStringAsFixed(2)} XNO',
+                        Text('${fmtXno(e.value)} XNO',
                             style: const TextStyle(color: kAccent, fontWeight: FontWeight.w700, fontSize: 14)),
                       ]),
                     )),
@@ -2645,7 +2645,7 @@ class _FeedScreenState extends State<FeedScreen> {
                   Text('${entries.length} creator${entries.length == 1 ? '' : 's'}',
                       style: const TextStyle(color: kDim, fontSize: 12)),
                   const Spacer(),
-                  Text('${total.toStringAsFixed(2)} XNO total',
+                  Text('${fmtXno(total)} XNO total',
                       style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 15)),
                 ]),
                 const SizedBox(height: 14),
