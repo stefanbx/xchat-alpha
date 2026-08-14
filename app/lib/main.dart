@@ -2652,22 +2652,22 @@ class _FeedScreenState extends State<FeedScreen> {
                 SizedBox(
                   width: double.infinity,
                   child: FilledButton(
-                    onPressed: settling
-                        ? null
-                        : () async {
-                            setSheet(() => settling = true);
-                            await _settle();               // shows the result snackbar on the main scaffold
-                            if (ctx.mounted) Navigator.pop(ctx);
+                    onPressed: () {
+                            // Nautilus-style: acknowledge instantly and settle on-chain in the BACKGROUND,
+                            // so the user isn't held on a spinner through the multi-second PoW + broadcast.
+                            // _settle() (guarded by _settleBusy) posts the final result when the blocks land.
+                            Navigator.pop(ctx);
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                                backgroundColor: kCard,
+                                content: Text('◈ Tip sent — settling ${fmtXno(total)} XNO on-chain in the background…')));
+                            _settle();
                           },
                     style: FilledButton.styleFrom(
                         backgroundColor: kAccent, foregroundColor: Colors.black,
                         padding: const EdgeInsets.symmetric(vertical: 14),
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24))),
-                    child: settling
-                        ? const SizedBox(height: 20, width: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
-                        : Text('Settle ${total.toStringAsFixed(2)} XNO',
-                            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+                    child: Text('Settle ${fmtXno(total)} XNO',
+                        style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
                   ),
                 ),
                 const SizedBox(height: 8),
