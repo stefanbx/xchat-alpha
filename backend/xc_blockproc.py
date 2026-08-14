@@ -3,7 +3,7 @@
 # arrives fully signed from the phone (built + signed on-device with nanodart), so this helper NEVER
 # touches a seed — it only computes proof-of-work and relays the block to the ledger. Reads
 # /tmp/xc_block_in.json = {"block": {type,account,previous,representative,balance,link,signature}, "subtype": ...}.
-import json, os, time, urllib.request
+import json, os, sys, time, subprocess, fcntl, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib.util
 spec = importlib.util.spec_from_file_location("xc_common", os.path.join(os.path.dirname(__file__), "xc_common.py"))
@@ -54,18 +54,49 @@ def _work_local(root):
     return '%016x' % xc._ext.work_generate(bytes.fromhex(root), _LOCAL_DIFF, os.urandom(128))
 
 
-def work_for(root):
-    # Delegated PoW, in order: (1) a dedicated/local work server if running (e.g. xc_workd); (2) the
-    # work-capable RPCs DIRECTLY, fastest-first (dPoW from XC_WORK_RPC first, then the free ones); (3) the
-    # general RPC cycle; (4) on-box CPU — slow but never down. PoW is never money-sensitive here: a wrong/
-    # absent work just makes `process` reject the block (no funds move), so aggressive fallback is safe.
+# --- work PRECACHE: after a settle we compute the account's NEXT frontier's work in the BACKGROUND, so
+# the next block (the common single-leg tip) finds it ready and settles instantly. A cached entry is
+# ALWAYS re-verified locally (work_validate — a microsecond C check) before use, so a stale/invalid entry
+# (e.g. after a difficulty epoch) can never make us broadcast bad PoW; it's just recomputed. ---
+_CACHE = os.environ.get('XC_WORK_CACHE', '/tmp/xc_work_cache.json')
+
+
+def _cache_load():
+    try:
+        return json.load(open(_CACHE))
+    except Exception:
+        return {}
+
+
+def _cache_valid(root):
+    w = _cache_load().get(root)
+    if not w:
+        return None
+    try:
+        return w if xc._ext.work_validate(int(w, 16), bytes.fromhex(root), _LOCAL_DIFF) else None
+    except Exception:
+        return None
+
+
+def _cache_put(root, work):
+    try:
+        d = _cache_load(); d[root] = work
+        if len(d) > 500:                              # bound: keep the newest 500 (dict preserves order)
+            for k in list(d)[:len(d) - 500]:
+                d.pop(k, None)
+        tmp = _CACHE + '.tmp'; json.dump(d, open(tmp, 'w')); os.replace(tmp, _CACHE)
+    except Exception:
+        pass
+
+
+def _compute_work_rpc(root):
+    # external work only (I/O-bound, cheap): local work server, then the work RPCs RACED (first valid wins,
+    # so one moody endpoint can't stall a leg; XC_WORK_RPC dPoW is in the race and wins when set), then the
+    # general RPC cycle. Returns None if every external source failed.
     try:
         return json.loads(urllib.request.urlopen(WORK + '/work?hash=' + root, timeout=6).read())['work']
     except Exception:
         pass
-    # RACE the work RPCs concurrently and take the FIRST valid result, so one moody endpoint (nanoslo
-    # swings 0.9-5.5s) can't stall a tip leg — we always get the fastest responder. dPoW (XC_WORK_RPC) is
-    # in this list too, so when set it simply wins the race.
     if WORK_RPCS:
         ex = ThreadPoolExecutor(max_workers=min(4, len(WORK_RPCS)))
         futs = [ex.submit(_work_via, url, root, 15) for url in WORK_RPCS]
@@ -80,7 +111,7 @@ def work_for(root):
                     break
         except Exception:
             pass
-        ex.shutdown(wait=False)                         # abandon the losers; the process exits shortly anyway
+        ex.shutdown(wait=False)                        # abandon the losers; the process exits shortly anyway
         if winner:
             return winner
     try:
@@ -89,9 +120,49 @@ def work_for(root):
             return w
     except Exception:
         pass
-    if LOCAL_WORK:                                 # every external work source is down -> compute it here
-        return _work_local(root)
     return None
+
+
+def work_for(root):
+    # (0) a precomputed, locally-VERIFIED cache hit -> instant. Then external RPCs, then on-box CPU (never
+    # down). PoW is never money-sensitive: a wrong/absent work just makes `process` reject (no funds move).
+    hit = _cache_valid(root)
+    if hit:
+        return hit
+    w = _compute_work_rpc(root)
+    if not w and LOCAL_WORK:                           # every external source down -> compute it here (~1 min)
+        w = _work_local(root)
+    if w:
+        _cache_put(root, w)                            # idempotent: a retry of the same block is now instant
+    return w
+
+
+# PRECACHE MODE: `xc_blockproc.py precache <root>` — fetch+cache work for one root, then exit. Spawned
+# detached after a settle so the account's NEXT block is instant. A flock SINGLE-FLIGHT lock ensures only
+# ONE precache runs at a time — so even the on-box CPU fallback (used when the free RPCs are down) can
+# never stack and peg the shared vCPU. flock auto-releases on exit, so a killed precache leaves no stale lock.
+if len(sys.argv) > 2 and sys.argv[1] == 'precache':
+    _root = sys.argv[2]
+    if not _cache_valid(_root):
+        _fd = os.open('/tmp/xc_precache.lock', os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            fcntl.flock(_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # skip if another precache is already running
+            if not _cache_valid(_root):                        # re-check under the lock
+                _w = _compute_work_rpc(_root)
+                if not _w and LOCAL_WORK:                      # RPCs down -> compute locally so the next tip is still instant
+                    _w = _work_local(_root)
+                if _w and xc._ext.work_validate(int(_w, 16), bytes.fromhex(_root), _LOCAL_DIFF):
+                    _cache_put(_root, _w)
+        except BlockingIOError:
+            pass                                               # another precache holds the lock; nothing to do
+        except Exception:
+            pass
+        finally:
+            try:
+                os.close(_fd)
+            except Exception:
+                pass
+    sys.exit(0)
 
 
 res = {'ok': False, 'error': 'invalid'}
@@ -108,6 +179,14 @@ try:
     # burst-throttled retry can't double-spend — it just lands the block the first attempt couldn't.
     r = _rpc_retry({'action': 'process', 'json_block': 'true', 'subtype': subtype, 'block': block})
     res = {'ok': 'hash' in r, 'hash': r.get('hash'), 'error': r.get('error')}
+    # The new frontier IS this block's hash -> precompute its work in the BACKGROUND so the account's next
+    # block (the common single-leg tip) is instant. Detached + RPC-only, so it never blocks this response.
+    if res.get('ok') and res.get('hash'):
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), 'precache', res['hash']],
+                             start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 except Exception as e:
     res = {'ok': False, 'error': str(e)}
 json.dump(res, open('/tmp/xc_block_result.json', 'w'))
