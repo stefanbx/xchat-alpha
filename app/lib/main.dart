@@ -313,6 +313,8 @@ class EngageStore {
       (await SharedPreferences.getInstance()).setStringList(k, s.toList());
   static Future<Set<String>> liked() => _get('xchat_liked');
   static Future<void> saveLiked(Set<String> s) => _save('xchat_liked', s);
+  static Future<Set<String>> likedComments() => _get('xchat_liked_comments');   // per-device: like a comment once
+  static Future<void> saveLikedComments(Set<String> s) => _save('xchat_liked_comments', s);
   static Future<Set<String>> reposted() => _get('xchat_reposted');
   static Future<void> saveReposted(Set<String> s) => _save('xchat_reposted', s);
   static Future<Set<String>> viewed() => _get('xchat_viewed');
@@ -7429,6 +7431,7 @@ class CommentsSheet extends StatefulWidget {
 
 class _CommentsSheetState extends State<CommentsSheet> {
   final Set<String> _viewedC = {}; // comment cids counted as viewed this session
+  final Set<String> _likedC = {};  // comment cids this device has liked (persisted, so it counts once)
   List<Map<String, dynamic>> _comments = [];
   Map<String, dynamic> _eng = {};
   final Map<String, double> _localTip = {}; // comment cid -> XNO bumped this session
@@ -7440,6 +7443,7 @@ class _CommentsSheetState extends State<CommentsSheet> {
   @override
   void initState() {
     super.initState();
+    EngageStore.likedComments().then((s) { if (mounted) setState(() => _likedC.addAll(s)); });
     _load();
   }
 
@@ -7448,6 +7452,26 @@ class _CommentsSheetState extends State<CommentsSheet> {
     _ctl.dispose();
     _focus.dispose();
     super.dispose();
+  }
+
+  // Like a comment — mirrors _toggleLike for posts: optimistic count bump, record on the relay keyed by
+  // the comment's cid (Api.like is generic over any id), persist so this device counts once, notify author.
+  void _toggleLikeComment(Map<String, dynamic> c) {
+    final cid = (c['cid'] ?? '') as String;
+    if (cid.isEmpty) return;
+    final liked = _likedC.contains(cid);
+    setState(() {
+      liked ? _likedC.remove(cid) : _likedC.add(cid);
+      final e = ((_eng[cid] as Map?)?.cast<String, dynamic>()) ?? <String, dynamic>{};
+      e['likes'] = ((e['likes'] ?? 0) as num) + (liked ? -1 : 1);
+      _eng[cid] = e;
+    });
+    Api.like(cid, liked ? -1 : 1);
+    EngageStore.saveLikedComments(_likedC);
+    final acct = (c['account'] ?? '') as String;
+    if (!liked && acct.isNotEmpty && acct != widget.myAccount) {
+      Api.notifyPush(acct, widget.myHandle, 'like', 'liked your comment');
+    }
   }
 
   Future<void> _load() async {
@@ -7589,6 +7613,8 @@ class _CommentsSheetState extends State<CommentsSheet> {
     final cid = (c['cid'] ?? '') as String;
     final tips = _tipsOf(cid);
     final views = ((_eng[cid]?['views'] ?? 0) as num).toInt();
+    final likes = ((_eng[cid]?['likes'] ?? 0) as num).toInt();
+    final liked = _likedC.contains(cid);
     if (cid.isNotEmpty && _viewedC.add(cid)) Api.view(cid); // this comment was rendered → an impression
     return Container(
       color: kBg,
@@ -7630,6 +7656,21 @@ class _CommentsSheetState extends State<CommentsSheet> {
                 child: const Padding(
                   padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                   child: Text('Reply', style: TextStyle(color: kDim, fontSize: 13, fontWeight: FontWeight.w600)),
+                ),
+              ),
+              const SizedBox(width: 12),
+              InkWell(
+                onTap: () => _toggleLikeComment(c),
+                borderRadius: BorderRadius.circular(20),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  child: Row(children: [
+                    Icon(liked ? Icons.thumb_up : Icons.thumb_up_outlined, size: 14, color: liked ? kAccent : kDim),
+                    if (likes > 0) ...[
+                      const SizedBox(width: 4),
+                      Text('$likes', style: TextStyle(color: liked ? kAccent : kDim, fontSize: 12, fontWeight: FontWeight.w600)),
+                    ],
+                  ]),
                 ),
               ),
               const SizedBox(width: 12),
