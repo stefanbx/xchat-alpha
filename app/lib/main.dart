@@ -2248,6 +2248,13 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   void _tallyTip(Post p) {
+    if (p.account == _account) {
+      // Tipping your own post would settle as a send-to-yourself — it can't complete and would sit in
+      // the pending list forever. Block it up front.
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          backgroundColor: kCard, content: Text("You can't tip your own post")));
+      return;
+    }
     final amt = _settings.defaultTip;
     if (!_guardTip(amt)) return;
     setState(() {
@@ -2273,6 +2280,7 @@ class _FeedScreenState extends State<FeedScreen> {
 
   // fire an on-chain settlement automatically ONLY within the user-consented policy
   Future<void> _maybeAutoSettle(String account, String handle) async {
+    if (account == _account) { setState(() => _pending.remove(account)); return; } // self-tip: nothing to settle
     if (!_autoSettle) return;
     // RE-ENTRANCY GUARD: settle is a multi-second network+PoW round trip fired from every tip tap. Two
     // overlapping settles for one creator would sign on the same (not-yet-advanced) frontier — one forks
@@ -2401,6 +2409,7 @@ class _FeedScreenState extends State<FeedScreen> {
     if (_settleBusy) return;   // a batch settle is already running — a double-tap must not start a second
     _settleBusy = true;
     try {
+    _pending.remove(_account);   // a self-tip settles as send-to-yourself — drop it so it can't get stuck
     final entries = _pending.entries.toList();
     int paidCreators = 0, blocks = 0, failedCreators = 0, legShorts = 0;
     String? err;
@@ -2597,6 +2606,7 @@ class _FeedScreenState extends State<FeedScreen> {
       builder: (_) {
         bool settling = false;                           // persists across StatefulBuilder rebuilds
         return StatefulBuilder(builder: (ctx, setSheet) {
+          _pending.remove(_account);   // hide any self-tip: it can't settle (send-to-self), so never list it
           final entries = _pending.entries.toList();
           final total = _pending.values.fold<double>(0, (a, b) => a + b);
           return Padding(
@@ -3458,9 +3468,14 @@ class _FeedScreenState extends State<FeedScreen> {
 
   // tip a COMMENT: tally to the comment's author, stat on the comment's own id (notified at settle).
   void _tallyCommentTip(Map<String, dynamic> c) {
+    final acct = (c['account'] ?? '') as String;
+    if (acct == _account) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          backgroundColor: kCard, content: Text("You can't tip your own comment")));
+      return;
+    }
     final amt = _settings.defaultTip;
     if (!_guardTip(amt)) return;
-    final acct = (c['account'] ?? '') as String;
     final handle = (c['handle'] ?? '') as String;
     final cid = (c['cid'] ?? '') as String;
     setState(() {
