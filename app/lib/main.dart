@@ -2051,9 +2051,10 @@ class _FeedScreenState extends State<FeedScreen> {
       _bumpEngage(p.id, 'tips_xno', amt); // XNO gathered by this post
     });
     Api.tipstat(p.id, _rawOf(amt));
-    if (p.account != _account && _settings.notifyTip) {
-      Api.notifyPush(p.account, _handle, 'tip', 'tipped your post ${amt.toStringAsFixed(2)} XNO');
-    }
+    // NB: no notification here. A tip is only a PLEDGE until it settles — notifying the creator now
+    // would tell them they were paid for money that may never move (the tally can be dropped, or the
+    // settle can fail). The creator is notified at SETTLE (see _settle / _maybeAutoSettle), when a real
+    // Nano block actually lands.
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         duration: const Duration(milliseconds: 1200),
         backgroundColor: kCard,
@@ -2076,12 +2077,23 @@ class _FeedScreenState extends State<FeedScreen> {
         split: _settings.relaySplit, rsplit: _settings.reposterSplit,
         reposter: _reposterOf[account] ?? '', media: _mediaOf[account] ?? '');
     if (r != null && r['ok'] == true) {
+      // same as manual settle: money moved, so notify the creator + record the receipt (both settle
+      // paths must behave identically — otherwise an auto-settled tip would never notify or log).
+      await TxLogStore.add({
+        'ts': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        'handle': handle, 'account': account,
+        'total': amt, 'paid': r['paid_xno'], 'legs': (r['legs'] as List?) ?? const [],
+      });
+      if (account != _account && _settings.notifyTip) {
+        Api.notifyPush(account, _handle, 'tip', 'settled ${amt.toStringAsFixed(2)} XNO to you on-chain');
+      }
       setState(() {
         _autoSpent += amt;
         _pending.remove(account);
         _reposterOf.remove(account);
         _mediaOf.remove(account);
       });
+      await _refreshTxLog();
       await _load();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -3085,7 +3097,7 @@ class _FeedScreenState extends State<FeedScreen> {
     if (mounted) setState(() => _commentCount[p.id] = cs.length);
   }
 
-  // tip a COMMENT: tally to the comment's author, stat on the comment's own id, notify.
+  // tip a COMMENT: tally to the comment's author, stat on the comment's own id (notified at settle).
   void _tallyCommentTip(Map<String, dynamic> c) {
     final amt = _settings.defaultTip;
     if (!_guardTip(amt)) return;
@@ -3097,9 +3109,7 @@ class _FeedScreenState extends State<FeedScreen> {
       _handleOf[acct] = handle;
     });
     if (cid.isNotEmpty) Api.tipstat(cid, _rawOf(amt));
-    if (acct != _account && _settings.notifyTip) {
-      Api.notifyPush(acct, _handle, 'tip', 'tipped your comment ${amt.toStringAsFixed(2)} XNO');
-    }
+    // no notification here — a tip is a pledge until it settles; the creator is notified at SETTLE.
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         duration: const Duration(milliseconds: 1200),
         backgroundColor: kCard,
