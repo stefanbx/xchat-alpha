@@ -83,7 +83,7 @@ Future<bool> resolveEndpoint() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.3.1'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.3.2'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -6716,6 +6716,16 @@ class PostCard extends StatefulWidget {
 
 class _PostCardState extends State<PostCard> {
   late bool _expanded = widget.expanded;   // start expanded (full text) for the focused post in a thread
+  // Local optimistic like state so the thumb-up responds INSTANTLY on tap — even inside a pushed route
+  // (the Thread/conversation screen) that doesn't rebuild when the parent's like set changes. Without
+  // this, liking a comment/reply in the conversation gave no visible feedback and read as "not working".
+  late bool _likedNow = widget.liked;
+  @override
+  void didUpdateWidget(PostCard old) {
+    super.didUpdateWidget(old);
+    if (widget.liked != old.liked) _likedNow = widget.liked;   // reflect external/authoritative changes
+  }
+
   @override
   Widget build(BuildContext context) {
     final p = widget.post;
@@ -6852,31 +6862,21 @@ class _PostCardState extends State<PostCard> {
                 decoration: BoxDecoration(border: Border.all(color: kLine), borderRadius: BorderRadius.circular(12)),
                 child: const Text('quoted post unavailable', style: TextStyle(color: kDim, fontSize: 13)),
               ),
-            // thread affordance
-            if (widget.inThread)
-              GestureDetector(
-                onTap: widget.onOpenThread,
-                child: Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: Row(children: [
-                    const Text('🧵 ', style: TextStyle(fontSize: 13)),
-                    Text(p.replyTo != null ? 'Part of a thread' : 'Show this thread',
-                        style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
-                  ]),
-                ),
-              ),
+            // (the "Show this thread" link was removed — tapping the post already opens its conversation
+            // + comments, so the separate affordance was redundant.)
             const SizedBox(height: 8),
             _Actions(
-              likes: (e['likes'] ?? 0) as int,
               reposts: (e['reposts'] ?? 0) as int,
               replies: widget.replyCount,
               tipsXno: ((e['tips_xno'] ?? 0) as num).toDouble(),
-              liked: widget.liked,
+              liked: _likedNow,
+              // optimistic count so the number moves too: base ± the pending local toggle
+              likes: ((e['likes'] ?? 0) as int) + (_likedNow == widget.liked ? 0 : (_likedNow ? 1 : -1)),
               reposted: widget.reposted,
               pending: widget.pending,
               views: (e['views'] ?? 0) as int,
               onReply: widget.onReply,
-              onLike: widget.onLike,
+              onLike: () { setState(() => _likedNow = !_likedNow); widget.onLike(); },
               onRepost: widget.onRepost,
               onQuote: widget.onQuote,
               onTip: widget.onTip,
