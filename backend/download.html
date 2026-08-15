@@ -129,47 +129,58 @@
 
   <div class="card">
     <h2>Run a relay — one command</h2>
-    <p class="muted" style="margin:0 0 6px">A relay is what makes ӾChat hard to switch off: it keeps
-       everyone's signed posts and hands them out. The more people run one, the less any single
-       machine matters. <b style="color:var(--ink)">You don't need to be technical</b> — and you don't
-       need a server. A spare laptop is fine.</p>
+    <p class="muted" style="margin:0 0 6px">A relay is a helper for the network. It keeps a share of
+       everyone's posts and hands them out when someone asks for them. The more people run one, the
+       harder ӾChat is to switch off, because no single computer matters.
+       <b style="color:var(--ink)">You don't need to be technical</b>, and you don't need a server —
+       a spare laptop is fine. It runs quietly in the background and starts itself when you log in.</p>
     <ol class="steps" style="margin:16px 0 0">
       <li>Open <b>Terminal</b> — on a Mac press <b>⌘ Space</b>, type <i>terminal</i>, hit Enter. On
           Linux, any terminal works.</li>
-      <li>Tap the button, <b>paste</b> into the black window (<b>⌘ V</b>), press <b>Enter</b>.</li>
-      <li>That's it. It prints your relay's web address, gives you a settings page and an
-          <span class="mono">xchat</span> command, and starts itself every time you log in.</li>
+      <li>Tap the button below, <b>paste</b> into the window (<b>⌘ V</b>), press <b>Enter</b>.</li>
+      <li>Wait a minute or two. When it finishes it prints your relay's web address — that's it.</li>
     </ol>
     <div class="cmd"><span class="p">$</span><code id="cmd">curl -fsSL https://xchat-alpha-node.fly.dev/relay.sh | sh</code></div>
     <button class="cta2" id="copy" style="margin-top:12px" type="button">Copy the install command</button>
     <p class="muted" style="margin:14px 0 0;font-size:13px">
-      It installs into one folder in your home directory and opens a free Cloudflare tunnel, so it
-      works behind a home router — no ports to forward, no account to make. Nothing else on your
-      machine is touched, and it holds no key to your money: a relay stores signed bytes, it can't
-      post or spend as anyone. It does make itself a permanent <b style="color:var(--ink)">identity</b>
-      on first run, so it stays the same relay to everyone else even when your machine's address
-      changes. It stores a <b style="color:var(--ink)">share</b> of the network rather than a copy of
-      everything, and if your computer has a GPU it also computes the proof-of-work that makes
-      everyone's tips settle in seconds — which you get paid for, like pinning. Add
-      <span class="mono" style="color:var(--accent2)">--with-node</span> to also run your own node, or
-      <span class="mono" style="color:var(--accent2)">--domain your.host</span> for a fixed address.
-      Read it before you run it — <a href="https://github.com/stefanbx/xchat-alpha/blob/master/relay/install-relay.sh"
-      style="color:var(--accent);text-decoration:none">it's plain, commented shell</a>, and that URL
-      serves the same text in your browser. To remove it later:
+      <b style="color:var(--ink)">What it does to your computer.</b> Everything goes into one folder
+      (<span class="mono">~/.xchat-relay</span>). Nothing else is touched. It cannot post as you or
+      touch your money — a relay only stores messages other people already signed. It also opens a
+      free, private doorway so people can reach it from outside, which means no router settings and no
+      accounts to create. Changed your mind? Remove it completely with
       <span class="mono" style="color:var(--accent2)">sh ~/.xchat-relay/install-relay.sh --uninstall</span>.
+      If you'd like to see what the command does before you run it,
+      <a href="https://github.com/stefanbx/xchat-alpha/blob/master/relay/install-relay.sh"
+      style="color:var(--accent);text-decoration:none">it's plain, commented text you can read</a>.
     </p>
     <p class="muted" style="margin:14px 0 0;font-size:13px">
-      <b style="color:var(--ink)">Reachable isn't the same as findable.</b> Your relay serves the moment
-      it starts, but the app discovers relays by scanning the Nano ledger — and a free tunnel's address
-      changes on every restart, so it can't be published there. Until it is, only people you hand the
-      address to can reach you. Two commands fix it for good:
-      <span class="mono" style="color:var(--accent2)">--setup-worker</span> puts a permanent free
-      address in front of the changing one, and
-      <span class="mono" style="color:var(--accent2)">--setup-operator</span> creates the key that signs
-      the announcement. That key has to exist on the ledger, so it needs a dust amount of XNO once —
-      the announce itself spends 0.000000000000000000000000004. Run
+      <b style="color:var(--ink)">Want your own node as well?</b> A relay helps everyone. A node helps
+      <i>you</i>: it's the part your app talks to directly. With your own, your feed is put together by
+      your machine instead of someone else's, and your tips go through in seconds rather than waiting
+      in a queue on a public server. It's the same command with one word added — and it still brings
+      everything it needs with it, so there is nothing else for you to install.
+    </p>
+    <div class="cmd" style="margin-top:10px"><span class="p">$</span><code>curl -fsSL https://xchat-alpha-node.fly.dev/relay.sh | sh -s -- --with-node</code></div>
+    <p class="muted" style="margin:14px 0 0;font-size:13px">
+      <b style="color:var(--ink)">One more thing worth knowing.</b> Your relay works straight away, but
+      at first nobody can <i>find</i> it — you would have to send people the address yourself. That's
+      because the free doorway gets a new address every time it restarts, and an address that keeps
+      changing can't be published anywhere. Two commands fix that for good:
+    </p>
+    <ol class="steps" style="margin:10px 0 0">
+      <li><span class="mono" style="color:var(--accent2)">--setup-worker</span> gives your relay an
+          address that never changes. Free, and it sets itself up.</li>
+      <li><span class="mono" style="color:var(--accent2)">--setup-operator</span> creates the key that
+          publishes that address so the app can find you. This one needs a <b>tiny</b> amount of XNO,
+          once — far less than a penny. It tells you where to send it, and a free faucet will do.</li>
+    </ol>
+    <p class="muted" style="margin:12px 0 0;font-size:13px">Run them one after the other:</p>
+    <div class="cmd" style="margin-top:10px"><span class="p">$</span><code>sh ~/.xchat-relay/install-relay.sh --setup-worker</code></div>
+    <div class="cmd" style="margin-top:6px"><span class="p">$</span><code>sh ~/.xchat-relay/install-relay.sh --setup-operator</code></div>
+    <p class="muted" style="margin:12px 0 0;font-size:13px">
+      At any point,
       <span class="mono" style="color:var(--accent2)">sh ~/.xchat-relay/install-relay.sh --status</span>
-      any time to see whether you're announced.
+      tells you in plain words whether it's running and whether people can find you.
     </p>
   </div>
 
