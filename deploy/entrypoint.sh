@@ -6,15 +6,43 @@ mkdir -p /tmp
 #   - the relay's whole state (heads, engagement, follows, comments, DMs, blobs, releases) in one file
 #   - the IPFS repo (the content-addressed post/thread/media bytes a head points at) — without this,
 #     a head survives but its content is gone and the post renders blank.
-STORE_DIR=/data; [ -d /data ] && [ -w /data ] || STORE_DIR=/tmp
+STORE_DIR=/data
+if [ -d /data ] && [ -w /data ]; then
+    :
+else
+    # Falling back is right — the image must still run without a volume — but it must NOT be quiet.
+    # Both durable stores land in /tmp, so every restart silently discards the whole history: heads,
+    # follows, comments, DMs, blobs, releases. That is indistinguishable from "the node lost my posts",
+    # and the only prior signal was one word inside the startup line.
+    STORE_DIR=/tmp
+    echo "WARNING: /data is not a writable mount — falling back to $STORE_DIR"
+    echo "WARNING: relay state AND the IPFS repo are now EPHEMERAL; every restart loses all history"
+    echo "WARNING: check the [mounts] volume in fly.toml, and whether the volume is full"
+fi
 mkdir -p "$STORE_DIR"
 export IPFS_PATH="$STORE_DIR/ipfs"
 mkdir -p "$IPFS_PATH"
 rm -f "$IPFS_PATH/repo.lock"        # a hard restart can leave a stale lock that blocks the daemon
-ipfs init >/dev/null 2>&1 || true
+# `ipfs init || true` on its own hides the one failure that matters. A repo can exist and still be
+# unusable — blocks present, config or blocks/SHARDING missing — and init REFUSES that rather than
+# repairing it. The container then starts, serves reads, and fails every post with no signal at all.
+# Init only when there is no working repo, then say plainly whether there is one.
+ipfs repo stat >/dev/null 2>&1 || ipfs init >/dev/null 2>&1 || true
+if ! ipfs repo stat >/dev/null 2>&1; then
+    echo "WARNING: no usable IPFS repo at $IPFS_PATH — posting will fail (reads still work)"
+    echo "WARNING: if the directory is non-empty but has no config, it is half-built; inspect it"
+fi
 ipfs config --json Addresses.Gateway '"/ip4/127.0.0.1/tcp/8081"' >/dev/null 2>&1 || true
 ipfs daemon --offline >/tmp/ipfs.log 2>&1 &
 sleep 5
+# Nothing checked that the daemon actually came up; `sleep 5` then exec'ing the node meant a dead
+# daemon looked exactly like a healthy start. pgrep is absent in this image, so ask ipfs itself.
+if ipfs id >/dev/null 2>&1; then
+    echo "ipfs ready at $IPFS_PATH ($(ipfs repo stat 2>/dev/null | awk '/NumObjects/{print $2}') objects)"
+else
+    echo "WARNING: the IPFS daemon did not come up — posting will fail. Last lines of /tmp/ipfs.log:"
+    tail -5 /tmp/ipfs.log 2>/dev/null | sed 's/^/  ipfs: /'
+fi
 
 # --- relay mesh wiring (no single point of discovery) ---
 # The node's public url IS its relay (kt_server proxies every non-/api path to :7401), so the embedded
