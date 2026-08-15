@@ -1,0 +1,8 @@
+name = "xc"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "BACKEND_KV"
+id = "3ae239f37f2e410b8c0b5ea0384ece0b"
