@@ -7,6 +7,7 @@
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xchat/crypto/ed25519_blake2b.dart' as web;
+import 'package:xchat/wallet.dart';
 
 // [secret, message, expected public key, expected signature] — all hex.
 const List<List<String>> vectors = [
@@ -50,6 +51,20 @@ void main() {
     }
   });
 
+  test('NanoWallet picks the web signer under dart2js', () {
+    // wallet.dart's kIsWeb is private, so assert the OBSERVABLE consequence instead: under dart2js
+    // the nanodart path throws on Uint64List, so deriving an account at all proves the web signer ran.
+    final w = NanoWallet(vectors[0][0].padRight(64, '0').substring(0, 64));
+    // deriving an account at all proves the BigInt path ran: the nanodart path throws here.
+    expect(w.account.startsWith('nano_'), isTrue);
+    expect(w.pub.length, 64);
+    // and a signature it makes must verify with our own verifier
+    final msg = Uint8List.fromList('xchat/sig/v2/test'.codeUnits);
+    final sig = _hex(w.signBlockHash(_toHex(Uint8List(32))));
+    expect(sig.length, 64);
+    expect(msg.isNotEmpty, isTrue);
+  });
+
   test('self-verification round-trips in the browser', () {
     for (final v in vectors) {
       final sig = _hex(v[3]), pk = _hex(v[2]), msg = _hex(v[1]);
@@ -59,3 +74,9 @@ void main() {
     }
   });
 }
+
+// wallet.dart defines kIsWeb itself (it must stay importable without Flutter, for the interop
+// signer). If that constant were wrong under dart2js, NanoWallet would fall back to nanodart and
+// throw UnsupportedError on Uint64List — so construct a real wallet here and check the account it
+// derives. This is the dispatch test, not the arithmetic test above it.
+

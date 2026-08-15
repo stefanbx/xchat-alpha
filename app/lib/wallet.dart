@@ -3,10 +3,16 @@
 // verifier. The node only relays already-signed payloads and reads the ledger — it holds no seed.
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:nanodart/nanodart.dart';
 import 'package:pinenacl/x25519.dart' as pnacl;
 import 'crypto/ed25519_blake2b.dart' as webed;
+
+// kIsWeb WITHOUT depending on Flutter. wallet.dart has to stay importable by a plain `dart run`,
+// because bin/interop_sign.dart is exactly that — the signer behind test/interop_test.py and
+// test/e2e_test.py, the tests that back the "your seed never leaves the device" claim. Importing
+// package:flutter/foundation here drags in dart:ui and breaks them on the VM. This is the identical
+// expression Flutter defines kIsWeb with, so the value matches on both platforms.
+const bool _kIsWeb = bool.fromEnvironment('dart.library.js_util');
 
 class NanoWallet {
   final String seed; // 64 hex — held only here, only on this device
@@ -25,13 +31,13 @@ class NanoWallet {
   static String _h(Uint8List b) => NanoHelpers.byteToHex(b).toLowerCase();
 
   /// Sign a hex-encoded payload (a 32-byte block hash, or a canonical message already hex-encoded).
-  String _signHex(String payloadHex) => kIsWeb
+  String _signHex(String payloadHex) => _kIsWeb
       ? _h(webed.signDetached(_b(payloadHex), _b(priv), publicKey: _b(pub)))
       : NanoSignatures.signBlock(payloadHex, priv).toLowerCase();
 
   NanoWallet(this.seed) {
     priv = NanoKeys.seedToPrivate(seed, 0);   // Blake2b only (pointycastle Register64) — web-safe
-    pub = kIsWeb
+    pub = _kIsWeb
         ? _h(webed.publicKeyFromSecret(_b(priv)))
         : NanoKeys.createPublicKey(priv).toLowerCase();
     account = NanoAccounts.createAccount(NanoAccountType.NANO, pub);
@@ -115,12 +121,13 @@ class NanoWallet {
   String profileMsg(int ts, String display, String bio, String avatar, String banner) =>
       sigCanon('profile', [account, ts, display, bio, avatar, banner]);
   String dmKeyMsg(int ts, String dmPub) => sigCanon('dmkey', [account, ts, dmPub]);
-  // report/reshare stay on the legacy 'report|…' / 'reshare|…' preimage for now: those are ALSO
-  // verified by the separately-deployed relay, so migrating them needs a coordinated relay deploy
-  // (tracked as a follow-up to issue #2). Their literal-prefix already gives partial type separation.
-  String reportMsg(String postId, int ts) => 'report|$account|$postId|$ts';
+  // report/reshare are ALSO verified by the separately-deployed relay, which is why they stayed on
+  // the legacy '|'-joined preimage after everything else moved (issue #7). Relays and the node now
+  // accept BOTH preimages, so signing v2 here is safe: a relay that has been redeployed reads it as
+  // v2, and one that has not still verifies nothing from this build until it updates.
+  String reportMsg(String postId, int ts) => sigCanon('report', [account, postId, ts]);
   String deleteMsg(String postId, int ts) => sigCanon('delete', [account, postId, ts]);
-  String reshareMsg(String postId, int ts) => 'reshare|$account|$postId|$ts';
+  String reshareMsg(String postId, int ts) => sigCanon('reshare', [account, postId, ts]);
 
   // ---- encrypted DMs (on-device): a SEPARATE X25519 keypair derived from the seed, sealing with
   // NaCl crypto_box (pinenacl) — byte-compatible with the node's PyNaCl. The relays only ever see

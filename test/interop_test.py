@@ -19,16 +19,21 @@ spec = importlib.util.spec_from_file_location("xc_common", os.path.join(ROOT, "b
 xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
 
 SEED = '07' * 32
-# every canonical message, rebuilt HERE the way each node helper rebuilds it. These are copied from
-# the helpers on purpose: if a helper's canon changes and the app's does not, this fails.
+# Every canonical message, built by calling the NODE'S OWN canon functions — not by hand-copying the
+# format into this file. The previous version duplicated the strings "so a helper changing its canon
+# fails here", but duplication rots: when signing moved to the v2 domain-separated preimage this table
+# was left on the legacy '|'-joined format, so the test compared the app against a format nothing had
+# used for weeks — and it went unnoticed because `dart` is usually absent and the run aborted first.
+# Calling the real functions keeps the check that actually matters (the DART app and the PYTHON node
+# must agree byte-for-byte) and removes the copy that can silently go stale.
 CANON = {
-    'head':          lambda a: f"{a}|5|bafycid|9999999",                      # xc_post.py submit
-    'post_event':    lambda a: f"you.xno|post|hello|world|1700000000",        # xc_post.py prepare
-    'comment':       lambda a: f"p1|{a}|1700000000|nice one|",                # xc_comments.py
-    'comment_reply': lambda a: f"p1|{a}|1700000000|replying|c0",              # xc_comments.py (nested)
-    'follow':        lambda a: f"{a}|1700000000|nano_a,nano_b",               # xc_follows.py
-    'poll':          lambda a: f"poll1|{a}|0|1700000000",                     # xc_poll.py
-    'profile':       lambda a: f"{a}|1700000000|Alice|my bio||",              # xc_profile.py
+    'head':          lambda a: xc.sig_canon('head', a, 5, 'bafycid', 9999999),          # xc_post.py
+    'post_event':    lambda a: xc.sig_canon('post', 'you.xno', 'post', 'hello|world', 1700000000),
+    'comment':       lambda a: xc.sig_canon('comment', 'p1', a, 1700000000, 'nice one', ''),
+    'comment_reply': lambda a: xc.sig_canon('comment', 'p1', a, 1700000000, 'replying', 'c0'),
+    'follow':        lambda a: xc.sig_canon('follow', a, 1700000000, 'nano_a,nano_b'),
+    'poll':          lambda a: xc.sig_canon('poll', 'poll1', a, 0, 1700000000),
+    'profile':       lambda a: xc.sig_canon('profile', a, 1700000000, 'Alice', 'my bio', '', ''),
 }
 
 

@@ -477,7 +477,10 @@ def route(path, query, body):
     # under concurrency; they're just relay fan-out (fire-and-forget writes, aggregated reads).
     if path.startswith('/api/like'):         return json.dumps(xc_engage.like(b('post_id'), b('delta')))
     if path.startswith('/api/repost'):       return json.dumps(xc_engage.repost(body))   # body = app-signed reshare rec
-    if path.startswith('/api/tipstat'):      return json.dumps(xc_engage.tip(b('post_id'), b('raw')))
+    if path.startswith('/api/tipstat'):
+        # payhash/cid are optional: without them this is a display counter, with them the relay
+        # verifies the payment on-chain and credits the media's stored value.
+        return json.dumps(xc_engage.tip(b('post_id'), b('raw'), b('payhash'), b('cid')))
     if path.startswith('/api/view'):         return json.dumps(xc_engage.view(b('post_id'), b('delta')))
     if path.startswith('/api/engagement'):   return json.dumps(xc_engage.get())
     if path.startswith('/api/notify_push'):
@@ -575,6 +578,13 @@ MAX_BLOB_BODY = int(os.environ.get('XC_MAX_BLOB_BODY', str(32 * 1024 * 1024)))  
 
 
 class H(BaseHTTPRequestHandler):
+    def _write_body(self, data):
+        # HEAD is defined as GET's headers with no body — including an accurate Content-Length, which
+        # is why the send helpers still compute it. Suppressing the write here keeps HEAD and GET from
+        # ever disagreeing about status or headers, which a separate HEAD router would eventually do.
+        if not getattr(self, '_head_only', False):
+            self.wfile.write(data)
+
     def _send(self, body):
         data = body.encode() if isinstance(body, str) else body
         self.send_response(200)
@@ -582,7 +592,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        self._write_body(data)
 
     def _send_html(self, html):
         data = html.encode() if isinstance(html, str) else html
@@ -592,7 +602,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'public, max-age=300')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        self._write_body(data)
 
     def _send_text(self, text, status=200):
         data = text.encode() if isinstance(text, str) else text
@@ -602,7 +612,7 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'public, max-age=300')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        self._write_body(data)
 
     def _send_file(self, path):
         try:
@@ -621,7 +631,7 @@ class H(BaseHTTPRequestHandler):
         else:
             self.send_header('Cache-Control', 'public, max-age=604800')
         self.end_headers()
-        self.wfile.write(data)
+        self._write_body(data)
 
     def _proxy_relay(self, raw):
         # Forward a relay-owned request to the loopback relay, verbatim (method + path + query + body).
@@ -642,9 +652,9 @@ class H(BaseHTTPRequestHandler):
 
     def _handle(self, body, raw=b''):
         u = urllib.parse.urlparse(self.path)
-        if self.command == 'GET' and u.path in DOWNLOAD_PATHS:  # human landing / download page (front door)
+        if self.command in ('GET', 'HEAD') and u.path in DOWNLOAD_PATHS:  # human landing / download page (front door)
             return self._send_html(DOWNLOAD_PAGE)
-        if self.command == 'GET' and (u.path == '/chat' or u.path.startswith('/chat/')):
+        if self.command in ('GET', 'HEAD') and (u.path == '/chat' or u.path.startswith('/chat/')):
             if not WEB_APP_DIR:
                 return self._send_html('<!doctype html><meta charset=utf-8><title>ӾChat</title>'
                                        '<body style="background:#050607;color:#eef3f7;font-family:sans-serif;'
@@ -658,7 +668,7 @@ class H(BaseHTTPRequestHandler):
                 if not os.path.isfile(f):
                     return self._send_text('web build incomplete', 404)
             return self._send_file(f)
-        if self.command == 'GET' and u.path in RELAY_INSTALL_PATHS:   # one-command relay installer
+        if self.command in ('GET', 'HEAD') and u.path in RELAY_INSTALL_PATHS:   # one-command relay installer
             if not RELAY_INSTALLER:
                 return self._send_text('# installer not staged on this node; see\n'
                                        '# https://github.com/stefanbx/xchat-alpha/blob/master/relay/install-relay.sh\n', 404)
@@ -681,6 +691,15 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Max-Age', '86400')
         self.send_header('Content-Length', '0')
         self.end_headers()
+
+    def do_HEAD(self):
+        # Link checkers, crawlers and monitors use HEAD; without this BaseHTTPRequestHandler answers
+        # 501 and the front door looks broken to anything that probes it that way.
+        self._head_only = True
+        try:
+            self._handle({})
+        except Exception as e:
+            self._send(json.dumps({'error': str(e)}))
 
     def do_GET(self):
         try:
