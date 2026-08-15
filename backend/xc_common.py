@@ -145,13 +145,30 @@ def rpc_cached(o, ttl=8.0):
 IPFS_PATH = os.environ.get('IPFS_PATH', '/tmp/ipfsB')
 
 def ipfs_add(path):
-    cid = subprocess.check_output(['ipfs', 'add', '-Q', '--cid-version=1', '--raw-leaves=false', path],
-                                  env={**os.environ, 'IPFS_PATH': IPFS_PATH}).decode().strip()
-    try:                                                   # best-effort mirror to a second repo (dev only)
-        subprocess.check_output(['ipfs', 'add', '-Q', '--cid-version=1', '--raw-leaves=false', path],
-                                env={**os.environ, 'IPFS_PATH': os.path.expanduser('~/.ipfs')})
-    except Exception:
-        pass
+    # Try each repo in turn: the FIRST that works defines the CID, the rest are best-effort mirrors
+    # (dev machines commonly have two). The primary used to be unguarded, so a half-initialised
+    # IPFS_PATH was fatal even with a perfectly good ~/.ipfs beside it — and the caller saw a raw
+    # CalledProcessError surface from the middle of a post. Content addressing means it does not
+    # matter which repo produced the CID: the same bytes and options give the same value.
+    args = ['ipfs', 'add', '-Q', '--cid-version=1', '--raw-leaves=false', path]
+    repos = [IPFS_PATH]
+    home = os.path.expanduser('~/.ipfs')
+    if home not in repos:
+        repos.append(home)
+    cid, last = None, None
+    for repo in repos:
+        try:
+            # stderr is swallowed on purpose: a missing secondary repo printed "no IPFS repo found in
+            # ..." on every call, noise that showed up in unrelated output. The raise below carries it.
+            out = subprocess.check_output(args, env={**os.environ, 'IPFS_PATH': repo},
+                                          stderr=subprocess.DEVNULL).decode().strip()
+        except Exception as e:
+            last = e
+            continue
+        if cid is None:
+            cid = out
+    if cid is None:
+        raise RuntimeError('no usable IPFS repo (tried %s); last error: %s' % (', '.join(repos), last))
     return cid
 
 def content_matches_cid(cid, data):

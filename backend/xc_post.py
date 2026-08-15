@@ -12,10 +12,27 @@
 #              the head signature binds the CID, the node cannot alter the content it just assembled
 #              without invalidating a signature it cannot produce.
 # Usage: xc_post.py prepare | xc_post.py submit
-import json, subprocess, os, sys, time, base64, urllib.request
+import json, subprocess, os, sys, time, base64, traceback, urllib.request
 import importlib.util
 spec = importlib.util.spec_from_file_location("xc_common", os.path.join(os.path.dirname(__file__), "xc_common.py"))
 xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
+
+RESULT = '/tmp/xc_post_result.json'
+
+
+def _crash_result(exc_type, exc, tb):
+    # Every exit path here reports through RESULT, so an UNCAUGHT exception has to as well. It didn't:
+    # a helper that died mid-way (a broken IPFS repo, say) left no file at all, the caller read a bare
+    # {}, and "the node crashed" was indistinguishable from "nothing happened" — the failure surfaced
+    # as a silent no-op far from its cause. Report it as an error and still print the traceback.
+    try:
+        json.dump({'ok': False, 'error': '%s: %s' % (exc_type.__name__, exc)}, open(RESULT, 'w'))
+    except Exception:
+        pass
+    traceback.print_exception(exc_type, exc, tb)
+
+
+sys.excepthook = _crash_result
 
 RELAYS = xc.discover_relays()
 mode = sys.argv[1] if len(sys.argv) > 1 else 'legacy'
