@@ -430,10 +430,30 @@ def api_announcement():
         pass
     return '{"active": false}'
 
+_work_mode_cache = [0.0, 'rpc']
+def _work_mode():
+    # Announce this node's proof-of-work speed so a client can prefer a FAST node for tip settlement. A
+    # node with a local work server (xc_workd — often GPU) answers /status and does PoW in ~a second;
+    # without one it falls back to public work RPCs (slower, flakier). Probed cheaply and cached ~30s so
+    # /api/status stays instant.
+    now = time.time()
+    if now - _work_mode_cache[0] < 30:
+        return _work_mode_cache[1]
+    mode = 'rpc'
+    w = os.environ.get('XC_WORK', '')
+    if w:
+        try:
+            urllib.request.urlopen(w.rstrip('/') + '/status', timeout=1).read()
+            mode = 'local'                                     # fast: an on-box (often GPU) work server
+        except Exception:
+            mode = 'rpc'
+    _work_mode_cache[0] = now; _work_mode_cache[1] = mode
+    return mode
+
 def api_status():
     try:
         bc = xc.rpc_cached({'action': 'block_count'}, ttl=10)  # chain height for display; 10s stale is invisible
-        return json.dumps({'online': True, 'height': bc.get('count', '0')})
+        return json.dumps({'online': True, 'height': bc.get('count', '0'), 'work': _work_mode()})
     except Exception:
         return '{"online":false}'
 

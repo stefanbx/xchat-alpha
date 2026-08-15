@@ -739,7 +739,13 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
                             context=self._context)
 
 
-urllib.request.install_opener(urllib.request.build_opener(_PinnedHTTPHandler, _PinnedHTTPSHandler))
+_opener = urllib.request.build_opener(_PinnedHTTPHandler, _PinnedHTTPSHandler)
+# Send a real User-Agent on EVERY urlopen that doesn't set its own. A Cloudflare-fronted relay/node
+# (e.g. a workers.dev front) 403s the default `Python-urllib/x.y` UA at the edge — which made such a node
+# read as "unreachable" in every relay fetch (feed heads, blobs, channels, the health probe) even though
+# it was up. addheaders only fills in when the caller hasn't already set User-Agent.
+_opener.addheaders = [('User-Agent', 'xchat-node/0.1')]
+urllib.request.install_opener(_opener)
 
 
 def safe_urlopen(url, data=None, timeout=20, headers=None):
