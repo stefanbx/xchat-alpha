@@ -54,6 +54,7 @@ dmkeys = {}                          # account -> signed X25519 DM public key re
 dms = []                             # list of encrypted direct messages (ciphertext only; relay can't read)
 pollvotes = {}                       # poll_id -> {account: signed vote record} (one vote per account)
 reports = {}                         # post_id -> {account: signed report} (community moderation signal)
+tips_paid = {}                       # tip payhash -> cid, so one on-chain payment credits value once
 known = {SELF}                       # relays this relay knows about (flat URL set — the legacy wire format)
 # A relay's IDENTITY is its own keypair, not its URL. A relay behind a Cloudflare quick tunnel gets a
 # brand-new hostname on every restart, and a URL-keyed peer set treats each one as a new relay: the
@@ -251,7 +252,7 @@ def blob_get(cid):                   # serve content from disk
 def blob_has(cid):
     return cid in blob_meta
 
-def blob_put(cid, b64, tips=0.0):
+def blob_put(cid, b64):
     # Reject an oversized blob BEFORE it is written. Two bugs this closes: (1) no per-blob ceiling let a
     # single huge upload fill the disk; (2) a blob larger than BLOB_CAP, stored first and evicted after,
     # sorted itself last (fresh + untipped) and so evicted EVERY other blob to get under cap while
@@ -260,7 +261,13 @@ def blob_put(cid, b64, tips=0.0):
         return False
     with _blob_lock:
         now = time.time()
-        t = max(float(tips or 0), float((blob_meta.get(cid) or {}).get('tips', 0)))   # value ratchets up
+        # VALUE IS NEVER SELF-ASSERTED. This used to take a caller-supplied `tips` and ratchet the
+        # blob's score up to it — but /blob is unauthenticated, so anyone could declare their own spam
+        # the most valuable content on the relay and make it un-evictable while real content was
+        # dropped to make room (blob_score ranks eviction AND sync priority). Value now only ever
+        # arrives through blob_credit(), backed by a confirmed on-chain payment. Re-storing bytes
+        # carries the existing value forward and cannot raise it.
+        t = float((blob_meta.get(cid) or {}).get('tips', 0))
         _db.execute('INSERT OR REPLACE INTO blob (cid,b64,size,last,tips) VALUES (?,?,?,?,?)',
                     (cid, b64, len(b64 or ''), now, t))
         blob_meta[cid] = {'size': len(b64 or ''), 'last': now, 'tips': t,
@@ -548,10 +555,47 @@ def grant_pin(cid, payhash):
     mark_dirty()                         # persisted by the autosave within ≤5s (no per-write flush)
     return exp
 
+def blob_credit(cid, payhash):
+    # The ONLY way a blob gains value. A tip is an on-chain send, so it can be verified exactly like a
+    # pay-to-pin payment: confirmed, a send, and not to the sender's own account. The amount is read
+    # from the LEDGER, never from the caller, and each payment is consumed once — so "this content is
+    # valued" becomes a claim backed by money that actually moved, instead of a number in a POST body.
+    #
+    # Residual, stated plainly: Nano is feeless, so an attacker with two accounts can still send to
+    # themselves and credit their own content for free. That is bounded and traceable rather than
+    # costless and anonymous, and the real fix is to weight credited value by the SENDER's on-chain
+    # reputation — the same Sybil-resistant signal head_score and the report weighting already use.
+    if xc is None or not cid or not payhash or payhash in tips_paid:
+        return 0.0
+    try:
+        bi = xc.rpc({'action': 'block_info', 'json_block': 'true', 'hash': payhash})
+        c = bi.get('contents', {})
+        amt = int(bi.get('amount', '0'))
+        confirmed = str(bi.get('confirmed', '')).lower() == 'true'
+        subtype = str(bi.get('subtype', '')).lower()
+        src = c.get('account', '')
+        dst = c.get('link_as_account', '')
+    except Exception:
+        return 0.0
+    if not confirmed or (subtype and subtype != 'send') or amt <= 0:
+        return 0.0
+    if not dst or dst == src:                       # a self-send buys nothing
+        return 0.0
+    tips_paid[payhash] = cid
+    with _blob_lock:
+        m = blob_meta.get(cid)
+        if m is not None:
+            m['tips'] = float(m.get('tips', 0)) + amt
+            _db.execute('UPDATE blob SET tips=? WHERE cid=?', (m['tips'], cid))
+            _db.commit()
+    mark_dirty()
+    return float(amt)
+
 # --- persistence: the WHOLE relay state survives a restart, not just heads ---
 # (in-memory before this meant comments, uploaded media, likes, poll votes vanished on restart)
 _STATE_KEYS = ('engage', 'notifs', 'supporters', 'follows', 'comments',   # blobs now live in SQLite
-               'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'reports', 'pinned', 'pins_paid')
+               'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'reports', 'pinned', 'pins_paid',
+               'tips_paid')
 
 def _prune_loaded():
     # PRUNE-ON-LOAD. The per-table caps in the write handlers only bound NEW writes; state loaded from
@@ -1157,7 +1201,7 @@ class H(BaseHTTPRequestHandler):
             # a supporter caches content here (content-addressed — cid names the bytes); byte-capped + LRU
             try:
                 m = json.loads(raw); cid = m['cid']; new = not blob_has(cid)
-                if not blob_put(cid, m['b64'], tips=m.get('tips', 0)):   # oversized/empty rejected pre-store
+                if not blob_put(cid, m['b64']):          # any 'tips' in the body is ignored — see blob_put
                     self._send(413, json.dumps({'ok': False, 'error': 'blob too large', 'max': MAX_BLOB})); return
                 self._send(200, json.dumps({'ok': True, 'stored': new, 'cache_bytes': _blob_total()}))
             except Exception as e:
@@ -1328,9 +1372,14 @@ class H(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         elif self.path.startswith('/tipstat'):
             try:
+                # Unverified: a DISPLAY counter, in the same class as likes and views — anyone can
+                # bump it and nothing consequential depends on it. With a payhash it also credits the
+                # blob's stored value, which IS consequential, so that path is verified on-chain.
                 m = json.loads(raw); e = engage_for(m['post_id'])
                 e['tips_raw'] += int(m.get('raw', 0))
-                self._send(200, json.dumps({'ok': True, 'tips_raw': e['tips_raw']}))
+                credited = blob_credit(m.get('cid', ''), m.get('payhash', ''))
+                self._send(200, json.dumps({'ok': True, 'tips_raw': e['tips_raw'],
+                                            'credited_raw': credited}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         elif self.path.startswith('/view'):

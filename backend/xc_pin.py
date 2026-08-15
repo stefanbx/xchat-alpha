@@ -102,7 +102,8 @@ for cid in ranked:
     for r in RELAYS:
         try:
             resp = json.loads(urllib.request.urlopen(urllib.request.Request(
-                r + '/blob', json.dumps({'cid': cid, 'b64': b64, 'tips': cids[cid]}).encode(),
+                r + '/blob', json.dumps({'cid': cid, 'b64': b64}).encode(),   # value is NOT declared here:
+                # the relay only credits it from a confirmed on-chain payment (blob_credit)
                 {'Content-Type': 'application/json'}), timeout=5).read())
             if resp.get('stored'):
                 backfilled += 1                          # this relay was missing it — now replicated

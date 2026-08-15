@@ -477,7 +477,10 @@ def route(path, query, body):
     # under concurrency; they're just relay fan-out (fire-and-forget writes, aggregated reads).
     if path.startswith('/api/like'):         return json.dumps(xc_engage.like(b('post_id'), b('delta')))
     if path.startswith('/api/repost'):       return json.dumps(xc_engage.repost(body))   # body = app-signed reshare rec
-    if path.startswith('/api/tipstat'):      return json.dumps(xc_engage.tip(b('post_id'), b('raw')))
+    if path.startswith('/api/tipstat'):
+        # payhash/cid are optional: without them this is a display counter, with them the relay
+        # verifies the payment on-chain and credits the media's stored value.
+        return json.dumps(xc_engage.tip(b('post_id'), b('raw'), b('payhash'), b('cid')))
     if path.startswith('/api/view'):         return json.dumps(xc_engage.view(b('post_id'), b('delta')))
     if path.startswith('/api/engagement'):   return json.dumps(xc_engage.get())
     if path.startswith('/api/notify_push'):

@@ -34,8 +34,11 @@ def repost(rec):
         post('/repost', rec)
     return {"ok": ok}
 
-def tip(post_id, raw):
-    post('/tipstat', {'post_id': post_id, 'raw': int(raw)})
+def tip(post_id, raw, payhash='', cid=''):
+    body = {'post_id': post_id, 'raw': int(raw)}
+    if payhash and cid:                    # verified credit: the relay checks the send on-chain
+        body.update({'payhash': payhash, 'cid': cid})
+    post('/tipstat', body)
     return {"ok": True}
 
 def view(post_id, delta):

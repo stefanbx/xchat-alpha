@@ -1214,11 +1214,19 @@ class Api {
     } catch (_) {}
   }
 
-  static Future<void> tipstat(String pid, String raw) async {
+  // Without payhash+cid this is a DISPLAY counter, in the same class as likes and views: anyone can
+  // bump it and nothing consequential depends on it. Sent AFTER settlement with the creator leg's
+  // block hash, the relay verifies the payment on-chain and credits the media's stored value — which
+  // decides what survives eviction, so it must be backed by money that actually moved (issue #5).
+  static Future<void> tipstat(String pid, String raw, {String payhash = '', String cid = ''}) async {
     try {
       await http.post(Uri.parse('$kBase/api/tipstat'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'post_id': pid, 'raw': raw}));
+          body: jsonEncode({
+            'post_id': pid, 'raw': raw,
+            if (payhash.isNotEmpty && cid.isNotEmpty) 'payhash': payhash,
+            if (payhash.isNotEmpty && cid.isNotEmpty) 'cid': cid,
+          }));
     } catch (_) {}
   }
 
@@ -2481,6 +2489,15 @@ class _FeedScreenState extends State<FeedScreen> {
         });
         if (e.key != _account && _settings.notifyTip) {
           Api.notifyPush(e.key, _handle, 'tip', 'settled ${fmtXno(e.value)} XNO to you on-chain');
+        }
+        // Now that the creator leg is ON-CHAIN, report the tip again WITH its block hash so the relay
+        // can verify it and credit the media's stored value. Before this, that value was a number in a
+        // POST body that anyone could inflate to make their own content un-evictable (issue #5).
+        final creatorHash = legs.firstWhere((l) => l['role'] == 'creator',
+            orElse: () => const <String, dynamic>{})['hash'] as String?;
+        final tippedCid = _mediaOf[e.key] ?? '';
+        if (creatorHash != null && creatorHash.isNotEmpty && tippedCid.isNotEmpty) {
+          Api.tipstat(tippedCid, _rawOf(e.value), payhash: creatorHash, cid: tippedCid);
         }
         // Subtract ONLY what we settled — a tip tallied to this creator DURING the awaited settle must
         // survive (removing the whole entry would drop it). Drain fully → clear the entry + its locks.
