@@ -143,7 +143,11 @@ RATE_ACCTS  = int(os.environ.get('XC_RATE_ACCTS', '100000'))  # cap on tracked I
 # so an unauthenticated flood of random keys can't grow RAM/disk without bound (the value-eviction on
 # heads/blobs already did this; these extend it to the rest of the state).
 MAX_BODY    = int(os.environ.get('XC_MAX_BODY', str(512 * 1024)))          # non-blob POST body cap
-MAX_BLOB    = int(os.environ.get('XC_MAX_BLOB', str(32 * 1024 * 1024)))    # per-blob b64 cap (APK-sized)
+MAX_BLOB    = int(os.environ.get('XC_MAX_BLOB', str(48 * 1024 * 1024)))    # per-blob cap, measured on the
+# BASE64 payload — which is ~4/3 the raw bytes, so this holds a ~36 MB APK. It must stay ahead of the
+# real APK: the release blob is how relays serve the self-update when the mirror is down, and a blob over
+# the cap is silently 413'd at pin time (the update still works via the signed mirror, but the
+# censorship-resistant fallback goes missing). 32 MB was too tight once the app passed ~24 MB raw.
 FOLLOWS_MAX     = int(os.environ.get('XC_FOLLOWS_MAX', '50000'))     # distinct accounts with a follow record
 FOLLOW_LIST_MAX = int(os.environ.get('XC_FOLLOW_LIST_MAX', '5000'))  # follows inside one record
 PROFILES_MAX    = int(os.environ.get('XC_PROFILES_MAX', '50000'))
