@@ -483,8 +483,36 @@ if [ "$WITH_NODE" = 1 ]; then
     fi
     "$RELAY_PY" -c 'import nacl' 2>/dev/null && ok "node ready (encrypted DMs enabled)" \
         || warn "node ready, but pynacl is missing — encrypted DMs will be unavailable"
-    command -v ipfs >/dev/null 2>&1 \
-        || warn "no IPFS on this machine — the node will serve posts and tips fine, but not media bytes"
+    # IPFS is NOT optional for a node. xc_post.py pins every thread to IPFS to get the CID the signed
+    # head commits to, so with no ipfs binary EVERY POST FAILS — not just media, which is what this
+    # step used to claim. That wrong warning invited operators to skip it and end up with a node that
+    # silently could not post. Install it the same way cloudflared is installed, into XC_HOME/bin, so
+    # a one-command node can actually publish.
+    IPFS_BIN="$XC_HOME/bin/ipfs"
+    if [ -x "$IPFS_BIN" ]; then
+        ok "ipfs ready ($("$IPFS_BIN" --version 2>&1 | head -1))"
+    elif command -v ipfs >/dev/null 2>&1; then
+        ok "ipfs already on this machine ($(ipfs --version 2>&1 | head -1))"
+    else
+        step "downloading ipfs (every post is content-addressed — the node pins its thread to get a CID)"
+        KUBO_V=v0.43.0
+        [ "$OS" = Darwin ] && KOS=darwin || KOS=linux
+        if fetch "https://dist.ipfs.tech/kubo/$KUBO_V/kubo_${KUBO_V}_${KOS}-${ARCH}.tar.gz" \
+                 "$XC_HOME/bin/kubo.tgz" 2>/dev/null \
+           && tar -xzf "$XC_HOME/bin/kubo.tgz" -C "$XC_HOME/bin" 2>/dev/null \
+           && mv "$XC_HOME/bin/kubo/ipfs" "$IPFS_BIN" 2>/dev/null; then
+            chmod +x "$IPFS_BIN"
+            rm -rf "$XC_HOME/bin/kubo" "$XC_HOME/bin/kubo.tgz"
+            "$IPFS_BIN" --version >/dev/null 2>&1 \
+                && ok "ipfs ready ($("$IPFS_BIN" --version 2>&1 | head -1))" \
+                || warn "ipfs downloaded but won't run — POSTING WILL FAIL until an ipfs works"
+        else
+            rm -rf "$XC_HOME/bin/kubo" "$XC_HOME/bin/kubo.tgz"
+            # kubo publishes no 32-bit arm build, so this is the expected path on an older Pi.
+            warn "no ipfs build for ${KOS}-${ARCH} — the node will start, but POSTING WILL FAIL"
+            warn "  install one yourself (https://dist.ipfs.tech/#kubo), then restart the relay"
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------- proof-of-work
@@ -551,8 +579,11 @@ export XC_NANO_RPC="${XC_NANO_RPC:-https://nanoslo.0x.no/proxy,https://rainstorm
 # launchd (and systemd --user) start this with a MINIMAL PATH — /usr/bin:/bin:/usr/sbin:/sbin — so
 # nothing installed by Homebrew is visible to the node or any helper it spawns. xc_common shells out to
 # `ipfs` by name, so under the service manager that lookup simply failed and every post died with a
-# FileNotFoundError, while the same command worked by hand in a terminal. Prepend the usual locations.
-export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+# FileNotFoundError, while the same command worked by hand in a terminal. XC_HOME/bin comes FIRST:
+# it holds the ipfs and cloudflared the installer downloaded, which is the only copy a one-command
+# install is guaranteed to have. ~/.local/bin covers Linux user installs (the installer already
+# adds it to the operator's shell rc, so run.sh had no business ignoring it).
+export PATH="$XC_HOME/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 # The node pins each thread to IPFS to get its CID. xc_common defaults IPFS_PATH to /tmp/ipfsB, which
 # macOS wipes on reboot — so the repo silently stops existing and every post falls back to the second
 # repo (or fails outright on a machine that has only the one). Point it at a persistent path instead.
