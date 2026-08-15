@@ -828,17 +828,36 @@ def relay_announce_operator(url, opkey):
     # the URL is committed LAST so the frontier link is the URL (one read resolves it).
     url = url_norm(url)
     link = url_to_link(url)                             # validate length up-front, before any send
-    addr, _ = derive(opkey)
+    addr, pub = derive(opkey)
     _receive_all(opkey)                                # open/bank any funds sent here, so a fresh acct works
-    if 'error' in rpc({'action': 'account_info', 'account': addr}):
+    ai = rpc({'action': 'account_info', 'account': addr})
+    if 'error' in ai:
         raise RuntimeError(f'operator account {addr} is not opened/funded — send it a little XNO and wait '
                            f'for the send to CONFIRM (a few seconds), then run this again')
-    for rv in rendezvous_accts():                       # check in at each rendezvous
+    # Chain every send LOCALLY: read the frontier ONCE, then build each block on the prior block's own
+    # hash instead of re-reading the frontier from a (load-balanced, possibly-lagging) public proxy.
+    # Re-reading forked the sequence — a proxy that hadn't yet ingested our last block returned a stale
+    # frontier, so the next send built a fork the network dropped. This is the same fix as the app's tip
+    # settle. Check-ins are best-effort; the URL commit is not (its failure must surface).
+    st = {'prev': ai['frontier'], 'bal': int(ai['balance'])}
+
+    def _chain_send(link_hex):
+        st['bal'] -= 1                                  # 1 raw of dust per hop
+        d = sign(opkey, st['prev'], pub, str(st['bal']), link_hex)
+        wk = work_generate(st['prev'])
+        r = rpc({'action': 'process', 'json_block': 'true', 'subtype': 'send',
+                 'block': {'type': 'state', 'account': addr, 'previous': st['prev'], 'representative': d['rep'],
+                           'balance': str(st['bal']), 'link': link_hex, 'signature': d['sig'], 'work': wk}})
+        if not (isinstance(r, dict) and r.get('hash')):
+            raise RuntimeError(f'send not accepted: {(r or {}).get("error", r)}')
+        st['prev'] = d['hash']                          # next block builds on THIS one, no frontier re-read
+
+    for rv in rendezvous_accts():                       # check in at each rendezvous (best-effort)
         try:
-            _self_send(opkey, nano_to_pub(rv))
+            _chain_send(nano_to_pub(rv))
         except Exception:
             pass
-    _self_send(opkey, link)                             # commit the URL last (frontier link = URL)
+    _chain_send(link)                                   # commit the URL LAST (frontier link = URL)
     return addr, url
 
 
