@@ -25,7 +25,7 @@ jobs:
   content-hash:
     runs-on: ubuntu-latest   # native linux/amd64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build reproduction image (pinned toolchain)
         run: docker build -t xchat-repro deploy/reproduce
