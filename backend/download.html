@@ -134,7 +134,8 @@
        machine matters. <b style="color:var(--ink)">You don't need to be technical</b> — and you don't
        need a server. A spare laptop is fine.</p>
     <ol class="steps" style="margin:16px 0 0">
-      <li>Open <b>Terminal</b> — on a Mac press <b>⌘ Space</b>, type <i>terminal</i>, hit Enter.</li>
+      <li>Open <b>Terminal</b> — on a Mac press <b>⌘ Space</b>, type <i>terminal</i>, hit Enter. On
+          Linux, any terminal works.</li>
       <li>Tap the button, <b>paste</b> into the black window (<b>⌘ V</b>), press <b>Enter</b>.</li>
       <li>That's it. It prints your relay's web address, gives you a settings page and an
           <span class="mono">xchat</span> command, and starts itself every time you log in.</li>
@@ -156,6 +157,19 @@
       style="color:var(--accent);text-decoration:none">it's plain, commented shell</a>, and that URL
       serves the same text in your browser. To remove it later:
       <span class="mono" style="color:var(--accent2)">sh ~/.xchat-relay/install-relay.sh --uninstall</span>.
+    </p>
+    <p class="muted" style="margin:14px 0 0;font-size:13px">
+      <b style="color:var(--ink)">Reachable isn't the same as findable.</b> Your relay serves the moment
+      it starts, but the app discovers relays by scanning the Nano ledger — and a free tunnel's address
+      changes on every restart, so it can't be published there. Until it is, only people you hand the
+      address to can reach you. Two commands fix it for good:
+      <span class="mono" style="color:var(--accent2)">--setup-worker</span> puts a permanent free
+      address in front of the changing one, and
+      <span class="mono" style="color:var(--accent2)">--setup-operator</span> creates the key that signs
+      the announcement. That key has to exist on the ledger, so it needs a dust amount of XNO once —
+      the announce itself spends 0.000000000000000000000000004. Run
+      <span class="mono" style="color:var(--accent2)">sh ~/.xchat-relay/install-relay.sh --status</span>
+      any time to see whether you're announced.
     </p>
   </div>
 
