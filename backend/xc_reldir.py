@@ -85,6 +85,47 @@ def announce_mainnet(urls):
     return 0
 
 
+def ensure(urls):
+    # IDEMPOTENT self-announce, meant to run on every node/relay startup. Reads the operator key from the
+    # ENV (a secret — never a CLI arg) and the URL from the arg or NODE_PUBLIC_URL / RELAY_PUBLIC_URL.
+    # Announces ONLY if this URL isn't already the operator account's readable on-chain URL, so restarts
+    # don't spam the ledger. NON-FATAL by design: no key, unfunded, or RPC down all log-and-return 0 —
+    # self-announce must never delay or block the node from serving. Fund the operator account once and
+    # set XC_RELAY_OPERATOR_SEED; the node then keeps itself discoverable with no manual step.
+    import os
+    keyhex = os.environ.get('XC_RELAY_OPERATOR_KEY', '')
+    seed = os.environ.get('XC_RELAY_OPERATOR_SEED', '')
+    if seed and not keyhex:
+        try:
+            import nanopy
+            keyhex = nanopy.deterministic_key(seed, 0)
+        except Exception as e:
+            print('self-announce: bad XC_RELAY_OPERATOR_SEED:', str(e)[:80]); return 0
+    if not keyhex:
+        print('self-announce: no XC_RELAY_OPERATOR_SEED/KEY set — skipping (ledger discovery stays manual)')
+        return 0
+    url = (urls[0] if urls else '') or os.environ.get('NODE_PUBLIC_URL', '') or os.environ.get('RELAY_PUBLIC_URL', '')
+    if not url:
+        print('self-announce: no URL (set NODE_PUBLIC_URL or pass one) — skipping'); return 0
+    # A mainnet action: if the operator hasn't pointed XC_NANO_RPC at their own mainnet node, use public
+    # mainnet proxies for reads+broadcast (PoW goes to WORK_RPCS separately).
+    if any(('127.0.0.1' in u or 'localhost' in u) for u in xc.RPCS):
+        xc.RPCS = ['https://nanoslo.0x.no/proxy', 'https://rainstorm.city/api', 'https://node.somenano.com/proxy']
+    want = xc.url_norm(url)
+    try:
+        acct = xc.derive(keyhex)[0]
+        cur = xc._relay_url(acct)                          # URL (if any) this account already announces
+        if cur and xc.url_norm(cur) == want:
+            print(f'self-announce: {want} already on-chain (operator {acct}) — nothing to do'); return 0
+    except Exception as e:
+        print('self-announce: pre-check inconclusive, will announce:', str(e)[:80])
+    try:
+        a, u = xc.relay_announce_operator(url, keyhex)
+        print(f'self-announced {u} (operator {a})'); return 0
+    except Exception as e:
+        print(f'self-announce failed (non-fatal): {str(e)[:160]}'); return 0
+
+
 def resolve():
     relays = xc.onchain_relays(ttl=0)               # force a fresh ledger scan
     print('rendezvous points :', len(xc.rendezvous_accts()), '(keyless, plural — no SPOF)')
@@ -133,8 +174,11 @@ if __name__ == '__main__':
         sys.exit(announce(sys.argv[2:]))
     if cmd == 'announce-mainnet':
         sys.exit(announce_mainnet(sys.argv[2:]))
+    if cmd == 'ensure':
+        sys.exit(ensure(sys.argv[2:]))
     if cmd == 'resolve':
         sys.exit(resolve())
     if cmd == 'engine':
         sys.exit(engine())
-    print('usage: xc_reldir.py accts|announce URL...|resolve|engine'); sys.exit(2)
+    print('usage: xc_reldir.py accts|announce URL...|announce-mainnet URL...|ensure [URL]|resolve|engine')
+    sys.exit(2)

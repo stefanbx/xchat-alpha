@@ -32,5 +32,11 @@ export XCHAT_BOOTSTRAP="$PEER_RELAY"           # xc_common._bootstrap() always i
 echo "http://127.0.0.1:7401" > /tmp/xchat_bootstrap.txt   # node still talks to its co-located relay on loopback
 python3 /app/xc_relayd.py 7401 "$STORE_DIR/relay.json" "$PEER_RELAY" >/tmp/relay.log 2>&1 &
 sleep 1
+# Self-announce this node's /api URL on the XNO ledger (idempotent) so the app can rediscover it from
+# an unstoppable source if this host's DNS is ever lost. Needs a one-time-funded operator key in
+# XC_RELAY_OPERATOR_SEED (a fly secret); it no-ops when the URL is already announced, and skips cleanly
+# when no key is set. Backgrounded + non-fatal so it never delays or blocks serving.
+( sleep 25; python3 /app/xc_reldir.py ensure "$NODE_PUBLIC_URL" 2>&1 | sed 's/^/[self-announce] /' || true ) &
+
 echo "starting ӾChat node on :8790 (relay :7401 public=$NODE_PUBLIC_URL peer=$PEER_RELAY store=$STORE_DIR/relay.json ipfs=$IPFS_PATH, RPC=$XC_NANO_RPC)"
 exec python3 /app/kt_server.py 8790
