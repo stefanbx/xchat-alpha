@@ -14,6 +14,12 @@ RPCS = [u.strip().rstrip('/') for u in _RPC_ENV.split(',') if u.strip()] or ['ht
 R = RPCS[0]                                                  # back-compat: some logs read R
 _PUBLIC_FALLBACKS = ['https://rpc.nano.to', 'https://nanoslo.0x.no/proxy',
                      'https://rainstorm.city/api', 'https://node.somenano.com/proxy']
+# PoW gets its OWN endpoint list. Public infra splits the two jobs: the node proxies serve ledger
+# reads + block broadcast but REFUSE work_generate, while rpc.nano.to does work_generate but not the
+# reads. Routing work through the shared rpc() fallthrough is slow and flaky (it eats a timeout on
+# every read-only proxy before reaching a work provider), so PoW is requested directly here.
+WORK_RPCS = [u.strip().rstrip('/') for u in
+             os.environ.get('XC_WORK_RPC', 'https://rpc.nano.to').split(',') if u.strip()]
 GEN = '34F0A37AAD20F4A260F0A5B3CB3D7FB50673212263E58A380BC10474BB039CE4'
 GPUB = 'b0311ea55708d6a53c75cdbf88300259c6d018522fe3d4d0a242e431f9e8b6d0'
 NANO_ALPH = "13456789abcdefghijkmnopqrstuwxyz"
@@ -83,6 +89,23 @@ def rpc(o):
         _rpc_good[0] = i
         return r
     raise last if last is not None else RuntimeError('no Nano RPC endpoint reachable')
+
+def work_generate(root):
+    # Delegated PoW over `root` (the frontier hash, or the account pubkey for an open). Tries the
+    # dedicated WORK_RPCS first (mainnet-difficulty), then falls back to the ledger RPCs in case the
+    # operator runs their own full node that can also do work. Raises if nothing produced work.
+    last = None
+    for ep in list(WORK_RPCS) + [None]:
+        try:
+            r = _post_json(ep, {'action': 'work_generate', 'hash': root}, timeout=30) if ep \
+                else rpc({'action': 'work_generate', 'hash': root})
+            if isinstance(r, dict) and r.get('work'):
+                return r['work']
+            last = r
+        except Exception as e:
+            last = e
+    raise RuntimeError(f'no work endpoint produced PoW for {root[:12]}… (last: {str(last)[:120]})')
+
 
 _rpc_cache = {}
 _RPC_CACHE_MAX = 5000
@@ -519,7 +542,7 @@ def _open_key(key, amt):  # fund+open an arbitrary-key account on the dev net if
 def _self_send(key, link_hex):  # append a send on the account's own chain with an arbitrary 32-byte link
     addr, pub = derive(key)
     ai = rpc({'action': 'account_info', 'account': addr}); prev = ai['frontier']; nb = str(int(ai['balance']) - 1)
-    d = sign(key, prev, pub, nb, link_hex); wk = rpc({'action': 'work_generate', 'hash': prev})['work']
+    d = sign(key, prev, pub, nb, link_hex); wk = work_generate(prev)
     rpc({'action': 'process', 'json_block': 'true', 'subtype': 'send',
          'block': {'type': 'state', 'account': d['account'], 'previous': prev, 'representative': d['rep'],
                    'balance': nb, 'link': link_hex, 'signature': d['sig'], 'work': wk}})
@@ -546,7 +569,7 @@ def _receive_all(key):  # MAINNET: bank every confirmed pending send so a freshl
             continue
         nb = bal + amt
         root = prev if set(prev) != {'0'} else pub          # work over the frontier, or the pubkey for an open
-        wk = rpc({'action': 'work_generate', 'hash': root})['work']
+        wk = work_generate(root)
         d = sign(key, prev, pub, str(nb), h)                # link = the funding send's hash; representative = self
         r = rpc({'action': 'process', 'json_block': 'true', 'subtype': 'receive' if opened else 'open',
                  'block': {'type': 'state', 'account': addr, 'previous': prev, 'representative': d['rep'],

@@ -70,6 +70,13 @@ def announce_mainnet(urls):
     urls = [u for u in urls if u.strip()]
     if not urls:
         print('usage: xc_reldir.py announce-mainnet URL [URL ...]'); return 2
+    # This is a MAINNET action, but xc_common defaults XC_NANO_RPC to a local DEV node — which is a
+    # different ledger and can't see the operator's real funds. Unless the operator explicitly pointed
+    # XC_NANO_RPC at their own mainnet node, use public mainnet proxies for ledger reads + broadcast
+    # (PoW goes to WORK_RPCS separately, since the proxies refuse work_generate).
+    if any(('127.0.0.1' in u or 'localhost' in u) for u in xc.RPCS):
+        xc.RPCS = ['https://nanoslo.0x.no/proxy', 'https://rainstorm.city/api', 'https://node.somenano.com/proxy']
+        print('mainnet RPCs:', ', '.join(xc.RPCS), '| PoW:', ', '.join(xc.WORK_RPCS))
     for u in urls:
         acct, url = xc.relay_announce_operator(u, keyhex)
         print(f'announced {url}\n  operator account {acct}')
