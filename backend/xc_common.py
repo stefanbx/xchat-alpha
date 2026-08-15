@@ -524,6 +524,38 @@ def _self_send(key, link_hex):  # append a send on the account's own chain with 
          'block': {'type': 'state', 'account': d['account'], 'previous': prev, 'representative': d['rep'],
                    'balance': nb, 'link': link_hex, 'signature': d['sig'], 'work': wk}})
 
+
+def _receive_all(key):  # MAINNET: bank every confirmed pending send so a freshly-funded account can spend.
+    # Sending XNO to a brand-new account only leaves it RECEIVABLE — the account itself has to sign an
+    # open (then receive) block with its OWN key before it holds a spendable balance. (`_open_key` above
+    # only works on a dev net, via the genesis faucet.) announce-mainnet needs its operator account
+    # opened, so do it here rather than erroring "not opened/funded" the moment after you fund it.
+    addr, pub = derive(key)
+    ai = rpc({'action': 'account_info', 'account': addr})
+    opened = 'error' not in ai
+    prev = ai['frontier'] if opened else '0' * 64
+    bal = int(ai['balance']) if opened else 0
+    blocks = rpc({'action': 'receivable', 'account': addr, 'count': '50',
+                  'source': 'true', 'include_only_confirmed': 'true'}).get('blocks') or {}
+    if not isinstance(blocks, dict):                       # some RPCs answer a bare hash list
+        blocks = {h: {} for h in (blocks or [])}
+    for h, info in blocks.items():
+        amt = int(info['amount']) if isinstance(info, dict) and info.get('amount') else \
+            int(rpc({'action': 'block_info', 'json_block': 'true', 'hash': h}).get('amount', '0'))
+        if amt <= 0:
+            continue
+        nb = bal + amt
+        root = prev if set(prev) != {'0'} else pub          # work over the frontier, or the pubkey for an open
+        wk = rpc({'action': 'work_generate', 'hash': root})['work']
+        d = sign(key, prev, pub, str(nb), h)                # link = the funding send's hash; representative = self
+        r = rpc({'action': 'process', 'json_block': 'true', 'subtype': 'receive' if opened else 'open',
+                 'block': {'type': 'state', 'account': addr, 'previous': prev, 'representative': d['rep'],
+                           'balance': str(nb), 'link': h, 'signature': d['sig'], 'work': wk}})
+        if 'hash' not in r:                                 # a ledger error (fork/gap) — stop, don't loop
+            break
+        prev = d['hash']; bal = nb; opened = True
+    return bal
+
 def url_norm(url):  # canonical relay URL: no scheme, no trailing slash (the scheme is re-added on read)
     return url.strip().rstrip('/').split('://', 1)[-1]
 
@@ -757,8 +789,10 @@ def relay_announce_operator(url, opkey):
     url = url_norm(url)
     link = url_to_link(url)                             # validate length up-front, before any send
     addr, _ = derive(opkey)
+    _receive_all(opkey)                                # open/bank any funds sent here, so a fresh acct works
     if 'error' in rpc({'action': 'account_info', 'account': addr}):
-        raise RuntimeError(f'operator account {addr} is not opened/funded — send it a little XNO first')
+        raise RuntimeError(f'operator account {addr} is not opened/funded — send it a little XNO and wait '
+                           f'for the send to CONFIRM (a few seconds), then run this again')
     for rv in rendezvous_accts():                       # check in at each rendezvous
         try:
             _self_send(opkey, nano_to_pub(rv))
