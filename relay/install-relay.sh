@@ -592,6 +592,34 @@ start_node() {
     NODE_PID=$!
     cd "$XC_HOME"
 }
+# The node pins every thread to IPFS to get its CID, so with no repo at IPFS_PATH each post fails —
+# and the operator only finds out from a post that silently does nothing. Create one on first run.
+#
+# NEVER destructive. If the path exists, is non-empty, but has no config, it is a HALF-BUILT repo
+# (this happens: a repo whose blocks/ survived without its config or SHARDING marker) — `ipfs init`
+# refuses it anyway, and forcing the issue would mean deleting blocks somebody may still want. Say
+# what is wrong and carry on; serving must not depend on this.
+ensure_ipfs() {
+    if ! command -v ipfs >/dev/null 2>&1; then
+        log "ipfs not installed — the node serves fine, but posting (which pins to IPFS) will fail"
+        return 0
+    fi
+    if ipfs repo stat >/dev/null 2>&1; then                       # already a working repo
+        return 0
+    fi
+    if [ -d "$IPFS_PATH" ] && [ -n "$(ls -A "$IPFS_PATH" 2>/dev/null)" ] && [ ! -f "$IPFS_PATH/config" ]; then
+        log "IPFS repo at $IPFS_PATH looks half-built (no config) — leaving it untouched;"
+        log "  inspect it, then run:  IPFS_PATH=$IPFS_PATH ipfs init"
+        return 0
+    fi
+    if ipfs init >/dev/null 2>&1; then
+        log "initialised an IPFS repo at $IPFS_PATH"
+    else
+        log "could not initialise an IPFS repo at $IPFS_PATH — posting will fail until one exists"
+    fi
+}
+ensure_ipfs
+
 ADMIN_PID=''
 WORKD_PID=''
 NODE_PID=''
