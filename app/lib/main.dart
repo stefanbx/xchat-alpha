@@ -25,6 +25,7 @@ import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:crypto/crypto.dart' show sha256;
 import 'wallet.dart';
+import 'ledger_discovery.dart';
 
 // The engine/relay endpoint. Default: the Android emulator reaches the host loopback at
 // 10.0.2.2. Runtime-configurable (Settings → Connection) so the app can point at a hosted
@@ -86,7 +87,39 @@ Future<bool> resolveEndpoint() async {
       return true;
     }
   }
-  return false;
+  // Every known endpoint is dead. Self-heal from the XNO ledger — the censorship-resistant bootstrap:
+  // no hardcoded server can strand the app if a live one is still announced on-chain.
+  return healEndpointsFromLedger();
+}
+
+// Re-derive a live endpoint straight from the Nano ledger and fold it into the persisted failover list.
+// `switchBase` = true when the current endpoint is dead (lead with the freshly-found live one and adopt
+// it now); false for a background top-up (just enrich the fallback list, never move off a healthy node).
+Future<bool> healEndpointsFromLedger({bool switchBase = true}) async {
+  try {
+    final urls = await LedgerDiscovery.discoverUrls();
+    final healthy = <String>[];
+    for (final u in urls) {
+      if (await _endpointHealthy(u)) healthy.add(u); // only keep URLs that actually serve /api
+    }
+    if (healthy.isEmpty) return false;
+    final seen = <String>{};
+    final merged = <String>[];
+    final ordered = switchBase ? [...healthy, ...kEndpoints] : [...kEndpoints, ...healthy];
+    for (final e in ordered) {
+      if (seen.add(e)) merged.add(e);
+    }
+    kEndpoints = merged;
+    final sp = await SharedPreferences.getInstance();
+    await sp.setStringList('xchat_endpoints', kEndpoints);
+    if (switchBase) {
+      kBase = kEndpoints.first;
+      await sp.setString('xchat_endpoint', kBase);
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 // On-device signer, built from the local seed. Every write the app publishes (follows, comments,
@@ -94,7 +127,7 @@ Future<bool> resolveEndpoint() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.3.5'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.3.6'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -5197,6 +5230,10 @@ class _FeedScreenState extends State<FeedScreen> {
       _engage = await Api.engagement();
       if (mounted) setState(() {});
     } catch (_) {}
+    // Seed a censorship-resistant fallback from the ledger while the current endpoint is healthy, so a
+    // later takedown of the default node can't strand this install. Only when we have no backup yet
+    // (stops after one is cached) — keeps the launch burst light and public RPCs unhammered.
+    if (kEndpoints.length <= 1) unawaited(healEndpointsFromLedger(switchBase: false));
     _refreshNotifs();    // notifications + raise Android alerts for new like/comment/tip
     _refreshDmBadge();   // mail-icon unread count + launcher badge (fire-and-forget)
     Api.announcement().then((a) { if (mounted) setState(() => _announcement = a); });  // coordinated-event banner

@@ -169,6 +169,12 @@ ANNOUNCE_SKEW   = int(os.environ.get('XC_ANNOUNCE_SKEW', '3600'))    # reject an
 # announcing to all of them is O(N²) chatter across the network. Rotate through instead.
 PROBE_BATCH     = int(os.environ.get('XC_RELAY_PROBE_BATCH', '64'))  # relays re-checked per cycle
 ANNOUNCE_FANOUT = int(os.environ.get('XC_ANNOUNCE_FANOUT', '24'))    # peers we re-announce to per cycle
+# OPEN FEDERATION (operator toggle, default ON): accept relay announcements from ANY relay, so a new
+# third-party relay/node that checks in becomes discoverable through this one. Turning it OFF locks the
+# peer set to the configured bootstraps — this relay stops learning strangers (it still serves content
+# and keeps the peers it already has). The app's ledger discovery is unaffected either way; this only
+# governs the HTTP gossip layer.
+OPEN_ANNOUNCE   = os.environ.get('XC_OPEN_ANNOUNCE', '1') != '0'
 FIELD_MAX       = int(os.environ.get('XC_FIELD_MAX', '8192'))        # bytes per free-text record field
 RELEASE_PUBS_MAX = int(os.environ.get('XC_RELEASE_PUBS_MAX', '8'))   # distinct release publishers stored
 # An APK is ~27 MB and a release is PINNED (never evicted). Keeping the last 24 records' BYTES pinned
@@ -874,6 +880,10 @@ def learn_peer(m):
     u = (m.get('url') or '').strip()
     if not u or u == SELF or len(u) > FIELD_MAX:
         return False
+    # Closed federation: don't learn a relay we don't already know (nor one we aren't bootstrapped to).
+    # Known peers still get updates (e.g. a signed address change) so we never strand an existing peer.
+    if not OPEN_ANNOUNCE and u not in known and u not in BOOTSTRAPS and m.get('account') not in peers_by_acct:
+        return False
     acct, pub, sig = m.get('account', ''), m.get('pub', ''), m.get('sig', '')
     try:
         ts = int(m.get('ts', 0) or 0)
@@ -1065,7 +1075,8 @@ class H(BaseHTTPRequestHandler):
             # 'relays' stays the flat url list every deployed relay and the node already parse;
             # 'peers' carries the signed identity records, ignored by anything that doesn't know them.
             self._send(200, json.dumps({'relay': PORT, 'relays': sorted(known),
-                                        'account': ID_ACCT, 'peers': signed_peers()}))
+                                        'account': ID_ACCT, 'peers': signed_peers(),
+                                        'open_announce': OPEN_ANNOUNCE}))
         elif self.path.startswith('/notify'):
             h = qs(self.path).get('handle', '')
             self._send(200, json.dumps({'relay': PORT, 'notifs': notifs.get(h, [])}))

@@ -114,6 +114,7 @@ def state():
             'blob_cap_mb': cfg.get('blob_cap_mb', ''),
             'bootstrap': cfg.get('bootstrap', ''),
             'keep_awake': cfg.get('keep_awake', True),
+            'open_announce': cfg.get('open_announce', True),
         },
         'earnings': earnings(acct),
     }
@@ -141,6 +142,7 @@ def validate(body):
             raise ValueError('bootstrap peers must be http(s) URLs — got: ' + u)
     cfg['bootstrap'] = ' '.join(bs)
     cfg['keep_awake'] = bool(body.get('keep_awake', True))
+    cfg['open_announce'] = bool(body.get('open_announce', True))
     return cfg
 
 
@@ -217,6 +219,11 @@ label.check input{width:auto;margin:2px 0 0}
   <input id=boot class=mono placeholder="https://xchat-alpha-node.fly.dev https://xchat-relay-1.fly.dev">
   <p class=hint>Space separated. These are just the first peers it says hello to; it finds the rest
      by gossip.</p>
+  <label class=check><input type=checkbox id=openann>
+    <span>Accept announcements from other relays (open federation)</span></label>
+  <p class=hint>On: any new relay that checks in becomes discoverable through yours — this is what keeps
+     the network open and hard to shut down. Off: your relay only talks to the bootstrap peers above and
+     ignores strangers.</p>
   <button id=save>Save and restart the relay</button>
   <div class=msg id=msg></div>
 </div>
@@ -258,6 +265,7 @@ async function load() {
     $('cap').value = s.settings.blob_cap_mb || '';
     $('boot').value = s.settings.bootstrap || '';
     $('awake').checked = s.settings.keep_awake !== false;
+    $('openann').checked = s.settings.open_announce !== false;
   }
 }
 
@@ -267,7 +275,8 @@ $('save').onclick = async () => {
   try {
     const r = await fetch('/api/settings', {method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({relay_acct: $('acct').value.trim(), blob_cap_mb: $('cap').value.trim(),
-                            bootstrap: $('boot').value.trim(), keep_awake: $('awake').checked})});
+                            bootstrap: $('boot').value.trim(), keep_awake: $('awake').checked,
+                            open_announce: $('openann').checked})});
     const d = await r.json();
     if (!d.ok) throw new Error(d.error || 'could not save');
     m.className = 'msg ok';
