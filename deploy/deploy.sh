@@ -22,6 +22,20 @@ for a in "$@"; do
   esac
 done
 
+# The IPFS version is pinned in TWO places — relay/install-relay.sh (what a self-installed node gets)
+# and deploy/Dockerfile (what the hosted node gets). They drifted: the image ran v0.29.0 while the
+# installer pinned v0.43.0, fourteen minor versions apart, with nothing to notice. The installer is
+# the source of truth; assert the Dockerfile's default agrees, then pass it explicitly so the built
+# image uses it even if someone edits only one of the two.
+KUBO_VERSION=$(sed -n 's/.*KUBO_V=\(v[0-9.]*\).*/\1/p' relay/install-relay.sh | head -1)
+KUBO_IN_IMAGE=$(sed -n 's/^ARG KUBO_VERSION=\(v[0-9.]*\).*/\1/p' deploy/Dockerfile | head -1)
+[ -n "$KUBO_VERSION" ] || { echo "deploy: could not read KUBO_V from relay/install-relay.sh" >&2; exit 1; }
+if [ "$KUBO_VERSION" != "$KUBO_IN_IMAGE" ]; then
+  echo "deploy: kubo pin drift — installer says $KUBO_VERSION, deploy/Dockerfile says $KUBO_IN_IMAGE." >&2
+  echo "        Make them equal (the installer is the source of truth) and re-run." >&2
+  exit 1
+fi
+
 # The landing page quotes the APK's version, size and SHA-256. Derive them from the artifact before
 # staging: hand-typed, they drifted to "18 MB · v2.3.5" and a checksum that did NOT match the APK the
 # page linked — so anyone following the page's own "verify the checksum" step saw a mismatch.
@@ -68,4 +82,4 @@ echo "staged $(ls deploy/app | wc -l | tr -d ' ') files into deploy/app"
 
 if [ "$STAGE_ONLY" = 1 ]; then exit 0; fi
 
-cd deploy && fly deploy --config fly.toml --dockerfile Dockerfile
+cd deploy && fly deploy --config fly.toml --dockerfile Dockerfile --build-arg "KUBO_VERSION=$KUBO_VERSION"

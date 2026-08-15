@@ -1,6 +1,10 @@
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN curl -sL https://dist.ipfs.tech/kubo/v0.29.0/kubo_v0.29.0_linux-amd64.tar.gz | tar -xz -C /tmp \
+# Keep in step with KUBO_V in relay/install-relay.sh — deploy.sh asserts they match and passes the
+# installer's value, so a hosted node and a self-installed one never run different IPFS versions.
+# They already had: this image sat on v0.29.0 while the installer pinned v0.43.0.
+ARG KUBO_VERSION=v0.43.0
+RUN curl -sL https://dist.ipfs.tech/kubo/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz | tar -xz -C /tmp \
     && mv /tmp/kubo/ipfs /usr/local/bin/ipfs && rm -rf /tmp/kubo
 RUN pip install --no-cache-dir nanopy pynacl
 WORKDIR /app
