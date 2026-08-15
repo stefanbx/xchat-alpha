@@ -68,8 +68,22 @@ content out (a purely recency-based cleanup would keep the freshest spam and evi
 Availability is therefore **economic, not eternal**: content survives because it is worth keeping, and
 **pay-to-pin** (§6) lets anyone pay a relay to protect a specific item from eviction for a span
 proportional to the amount. Content nobody values and nobody pins is eventually dropped — the
-honest alternative to unbounded storage or a central archive. (Popular content is also *replicated*
-to more relays; the weak stays single-copy; nothing is force-kept.)
+honest alternative to unbounded storage or a central archive.
+
+**Where a copy lives is decided by a hash, not by luck.** Naively, every relay stores everything it is
+sent and evicts by the same value score — which fails in both directions at once: popular media ends
+up on *every* relay while unpopular media is evicted *everywhere simultaneously*, because each relay
+independently reaches the same verdict about the same item. The network is then wasteful and lossy at
+the same time. Instead each relay owns a permanent identity (§4), and placement is **rendezvous
+hashing**: for a given item every relay independently computes the same ranking of relays, and the top
+*R* (default 3) consider themselves responsible. No coordinator, no directory, no agreement protocol —
+just a hash — which is the only kind of placement that works in a network anyone may join or leave
+unannounced. A relay under disk pressure evicts what it is *not* responsible for first, so an
+opportunistic copy of a popular post is shed before one of the last three copies of an unpopular one.
+Measured over 12 relays and 3,000 items: every item held **exactly 3** copies, load sat within 3% of an
+even split, total storage fell **4×**, and losing a relay moved only 8% of the corpus. A repair pass
+pulls the share a relay should hold but is missing, so replication is self-healing rather than a
+one-way decay. Paid pins are exempt from all of this: a pin is a promise, and it is kept.
 
 Because authenticity comes from the signature rather than from *where* the bytes came from,
 content is host-independent by construction.
@@ -105,6 +119,30 @@ Consequences:
 **How to verify:** pick any rendezvous address from the config, open it in a public Nano block
 explorer, and you will see the relay accounts' dust check-ins; open a relay account and you will
 see the block whose contents encode that relay's URL. The app is doing exactly this read.
+
+### A relay's identity is a keypair, not its address
+
+On-chain announcement is the strongest form of discovery, but it presumes a *stable* URL: the block
+link holds 32 bytes, and committing a new one costs a real transaction. That rules out exactly the
+operator this network most wants — someone running a relay on a laptop behind NAT, reachable through a
+tunnel whose hostname changes on every restart.
+
+So a relay's identity is a keypair it generates for itself, distinct from any payout account and
+holding no funds. It signs `relay_announce` records binding *identity → current URL*, and peers key on
+the **identity**. A relay that comes back at a new address therefore **replaces** its own entry rather
+than adding a second one, and because the record is signed it can be relayed onward by any peer
+without that peer being able to alter the URL — gossip stays verifiable however many hops it travels.
+
+This closes a failure that only appears at scale. A URL-keyed peer set is append-only: every restart
+of every ephemeral relay leaves a dead hostname in every peer that heard it, those corpses are
+re-gossiped forever, and once the cap is reached a relay stops learning *real* new relays at all.
+Relays now also re-probe what they hold and forget an address after repeated failures, so churn is
+self-healing instead of cumulative. A claim alone can never evict anything — only a failed probe can —
+so a hostile relay cannot name a competitor's URL and then "move away" to knock it out of the set.
+
+The two mechanisms compose: a permanent relay announces on-chain and is discoverable with no bootstrap
+at all; an ephemeral one is learned by gossip and followed across address changes by identity. Neither
+requires anyone's permission.
 
 ## 5. Moderation — community reports feed one value score
 
@@ -160,6 +198,29 @@ amount (each payment consumed once). This makes availability a **market**: value
 persist; unpaid content evicts (§3). An author can pin their own posts to outlive their activity; a
 fan can pin content they want kept. Even without an explicit pin, eviction is value-weighted by tips,
 so popular content survives longer for free.
+
+**Proof-of-work is the third flow, and the only job safe to buy from a stranger.** Every Nano block
+needs PoW before it can be broadcast, and that — not signing, not the ledger — is what a tip actually
+waits on. A phone cannot do it (pure-Dart PoW measured at ~46 minutes per send block on a *desktop*),
+so it is delegated. Delegating it is safe for a reason that does not apply to any other expensive
+operation in this system: **a work value authorises nothing.** It signs nothing, spends nothing, and
+is verified by the consumer in a single hash. A hostile work provider can waste its own electricity
+and return garbage that is rejected; it cannot forge a block or move a coin. Compare signing, which
+can never be delegated and never leaves the phone.
+
+That asymmetry makes work an open market rather than a privileged service. A relay with a GPU
+advertises the capability alongside its account, nodes **discover** work sources by the same gossip
+walk they already use to find relays, and every answer is validated before use — so the pool of
+providers can be permissionless without anyone extending trust. A consumer races them all and takes
+the first valid answer, because a laptop GPU on a home tunnel and a paid dPoW endpoint have
+unpredictable and wildly different latencies. Providers are already paid: work-capable relays are the
+same relays earning tip splits and pinning fees.
+
+The practical difference is large. On free public work RPCs a block takes 0.9–36 seconds when they are
+up, and they are frequently rate-limited or down entirely; a datacenter CPU fallback takes about a
+minute. A consumer GPU does it in ~2 seconds (measured: 228 MH/s on an Apple M5, ~30× the CPU
+fallback). A tip may be three blocks, so this is the difference between a tip that settles while you
+look at it and one that appears to hang.
 
 Everything else — the entire social graph — never touches the ledger, so the network stays light no
 matter how busy it gets.
@@ -412,15 +473,29 @@ derived, signed, replicated, and swappable.
 ## 10. Architecture at a glance
 
 ```
-  📱 app (Flutter) — HOLDS your seed, SIGNS locally
-        │  (only signed events + read requests leave the phone)
+  📱 app (Flutter, Android) ─┐   HOLDS your seed, SIGNS locally
+  🌐 app (same code, browser)┘   (only signed events + read requests leave the client)
+        │
         ▼
    backend node (Python, pure, any OS) ──► reads the XNO ledger ──► discovers relays
-        │                                     (scan keyless rendezvous)
-        └─ forwards signed events to ──► plural relays  (cache: byte-cap + value-weighted eviction)
-                                              ▲
-       tips → creators · pay-to-pin → relays ──► Nano ledger (batched, direct, signed on-device)
+        │                                     (scan keyless rendezvous + gossip)
+        ├─ forwards signed events to ──► plural relays   (cache: byte-cap, value-weighted
+        │                                    ▲             eviction, hash-placed ~3 copies)
+        └─ asks for proof-of-work ──► any work source, answer VERIFIED before use
+                                       (local GPU · discovered relays · dPoW · own CPU)
+       tips → creators · pay-to-pin → relays · work → whoever computed it
+                                       └──► Nano ledger (batched, direct, signed on-device)
 ```
+
+**Two clients, one codebase.** The same Flutter app runs on Android and in a browser, served by any
+node at `/chat` — so a laptop can use ӾChat with no APK and no app store. The browser build signs with
+the identical scheme but a different implementation of it: the Android signer uses a TweetNaCl port
+whose field arithmetic is 64-bit, and JavaScript has no 64-bit integers, so the web build uses a
+BigInt implementation of ed25519-blake2b checked byte-for-byte against the Android one and against the
+node's independent Python verifier. **A browser is not a phone, though**, and the honest difference is
+key storage: Android keeps the seed in the OS keystore, a browser keeps it in ordinary site storage,
+readable by any script that runs on the page — so the client says so on its first screen and points
+anyone holding real value at the phone.
 
 **Your key never leaves your device.** The app signs every post, event, and tip locally; the node
 is a thin relay-and-ledger-reader that only forwards already-signed data and scans the ledger for

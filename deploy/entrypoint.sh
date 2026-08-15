@@ -25,6 +25,9 @@ sleep 5
 NODE_PUBLIC_URL="${NODE_PUBLIC_URL:-https://xchat-alpha-node.fly.dev}"
 PEER_RELAY="${PEER_RELAY:-https://xchat-relay-1.fly.dev}"
 export RELAY_PUBLIC_URL="$NODE_PUBLIC_URL"     # the embedded relay's reachable identity (proxied to :7401)
+# Payout account for the embedded relay. XC_DEV=1 preserves the historical DEMO account (key derivable
+# from the repo by anyone — not a wallet). Set RELAY_ACCT=nano_... and drop this to be paid for real.
+export XC_DEV=1
 export XCHAT_BOOTSTRAP="$PEER_RELAY"           # xc_common._bootstrap() always includes the peer relay
 echo "http://127.0.0.1:7401" > /tmp/xchat_bootstrap.txt   # node still talks to its co-located relay on loopback
 python3 /app/xc_relayd.py 7401 "$STORE_DIR/relay.json" "$PEER_RELAY" >/tmp/relay.log 2>&1 &

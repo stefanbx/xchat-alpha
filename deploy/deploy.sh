@@ -15,6 +15,16 @@ rm -rf deploy/app && mkdir -p deploy/app
 cp backend/*.py deploy/app/
 cp backend/*.html deploy/app/ 2>/dev/null || true   # download/landing page served by the node front door
 cp relay/xc_relayd.py deploy/app/
+cp relay/install-relay.sh deploy/app/          # served at <node>/relay.sh — the landing page's one-liner
+cp relay/xc_admin.py deploy/app/               # the relay operator's settings page (loopback only)
+# The Flutter web build, served at <node>/chat. It's a build artifact (not in git), so build it first:
+#   cd app && flutter build web --release --base-href /chat/
+if [ -d app/build/web ]; then
+  rm -rf deploy/app/web && cp -R app/build/web deploy/app/web
+  echo "staged web app ($(du -sh deploy/app/web | cut -f1))"
+else
+  echo "NOTE: app/build/web missing — deploying without the browser app (/chat will say so)"
+fi
 echo "staged $(ls deploy/app | wc -l | tr -d ' ') files into deploy/app"
 
 [ "${1:-}" = "--stage-only" ] && exit 0

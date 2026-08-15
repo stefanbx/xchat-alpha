@@ -18,3 +18,7 @@ relay/*.json
 # staged for the container image by deploy/deploy.sh
 deploy/app/
 deploy/relay/app/
+
+# compiled GPU work generator — built by the installer (or: cc -O3 relay/work/nano_work_cl.c
+# -o relay/work/nano_work_cl -framework OpenCL). The SOURCE is tracked; the binary is not.
+relay/work/nano_work_cl

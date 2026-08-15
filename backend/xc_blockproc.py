@@ -3,12 +3,16 @@
 # arrives fully signed from the phone (built + signed on-device with nanodart), so this helper NEVER
 # touches a seed — it only computes proof-of-work and relays the block to the ledger. Reads
 # /tmp/xc_block_in.json = {"block": {type,account,previous,representative,balance,link,signature}, "subtype": ...}.
-import json, os, sys, time, subprocess, fcntl, urllib.request
+import json, os, sys, time, subprocess, fcntl, threading, urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib.util
 spec = importlib.util.spec_from_file_location("xc_common", os.path.join(os.path.dirname(__file__), "xc_common.py"))
 xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
 WORK = os.environ.get('XC_WORK', 'http://127.0.0.1:7500')      # optional local/dedicated work server
+# A GPU solve is ~2s median but the search is exponential, so the tail runs past any short deadline.
+# The old 6s cut off perfectly good solves and fell through to public RPCs that are frequently down —
+# throwing away the fastest source at exactly the moment it was about to answer.
+WORK_TIMEOUT = float(os.environ.get('XC_WORK_TIMEOUT', '30'))
 # LAYERED PoW so tips are FAST but NEVER BROKEN. In order: (1) XC_WORK_RPC — a dedicated/paid dPoW you
 # point at for INSTANT work (empty by default); (2) free public work RPCs as automatic fallback (measured
 # on the node: nanoslo ~0.9s, rainstorm ~5.7s; somenano/rpc.nano.to 403 so they're excluded); (3) on-box
@@ -20,6 +24,75 @@ WORK_RPCS = [u.strip().rstrip('/') for u in
              (os.environ.get('XC_WORK_RPC', '') + ',' + _DEFAULT_WORK).split(',') if u.strip()]
 LOCAL_WORK = os.environ.get('XC_WORK_LOCAL', '1') != '0'       # on-box CPU as the never-down last resort
 _LOCAL_DIFF = int(os.environ.get('XC_WORK_LOCAL_DIFFICULTY', 'fffffff800000000'), 16)   # mainnet send threshold
+
+# DISCOVERED work sources. The lists above have to be configured by whoever runs the node; this one
+# finds work the same way the app finds everything else — by walking the relay gossip. Relays that can
+# compute PoW advertise 'work' on /relayacct, and any of them may be raced.
+#
+# Trust: none required, which is the whole reason this can be open. Work authorises nothing, and every
+# answer is validated locally before use, so a hostile relay achieves nothing but wasting its own
+# electricity. Contrast with signing, which never leaves the phone.
+#
+# Privacy: a work request carries the block ROOT (a previous-block hash, or an account public key for a
+# first block) — public ledger data, but it does reveal that this account is about to publish. Set
+# XC_WORK_DISCOVER=0 on a node where that matters.
+WORK_DISCOVER = os.environ.get('XC_WORK_DISCOVER', '1') != '0'
+_WORK_PEERS_CACHE = os.environ.get('XC_WORK_PEERS_CACHE', '/tmp/xc_work_peers.json')
+_WORK_PEERS_TTL = float(os.environ.get('XC_WORK_PEERS_TTL', '600'))
+
+
+def _work_relays():
+    # Cached, because discovery is a multi-hop gossip walk and a tip fires several blocks back to back.
+    #
+    # A STALE cache is served immediately and refreshed in the background. Blocking on rediscovery would
+    # put a multi-hop walk on the critical path of a tip every time the TTL lapsed — several seconds
+    # added to the very operation this code exists to speed up, and paid by whichever unlucky user
+    # tipped first. A list a few minutes out of date costs nothing: a relay that has gone away just
+    # loses the race, and one that is new is picked up on the next refresh.
+    if not WORK_DISCOVER:
+        return []
+    cached = None
+    try:
+        c = json.load(open(_WORK_PEERS_CACHE))
+        cached = c.get('relays', [])
+        if time.time() - c.get('t', 0) < _WORK_PEERS_TTL:
+            return cached
+    except Exception:
+        pass
+    if cached is not None:
+        threading.Thread(target=_refresh_work_relays, daemon=True).start()
+        return cached
+    return _refresh_work_relays()          # nothing cached at all: this one call has to wait
+
+
+def _refresh_work_relays():
+    found = []
+    try:
+        def _probe(r):
+            try:
+                d = json.loads(urllib.request.urlopen(r.rstrip('/') + '/relayacct', timeout=3).read())
+                return r.rstrip('/') if d.get('work') else None
+            except Exception:
+                return None
+        relays = [r for r in xc.discover_relays() if r.startswith('http')]
+        if relays:
+            with ThreadPoolExecutor(max_workers=min(8, len(relays))) as ex:
+                found = [r for r in ex.map(_probe, relays) if r]
+    except Exception:
+        found = []
+    try:
+        json.dump({'t': time.time(), 'relays': found}, open(_WORK_PEERS_CACHE, 'w'))
+    except Exception:
+        pass
+    return found
+
+
+def _work_via_relay(url, root, timeout):
+    d = json.loads(urllib.request.urlopen(f'{url}/work?hash={root}', timeout=timeout).read())
+    w = d.get('work')
+    if not w:
+        raise ValueError(str(d.get('error') or 'no work'))
+    return w
 
 
 def _rpc_retry(o, tries=4):
@@ -36,6 +109,14 @@ def _rpc_retry(o, tries=4):
             last = e
             time.sleep(0.8 * (i + 1))
     raise last
+
+
+def _work_ok(work, root):
+    # One C-level hash. Cheap enough to run on anything we didn't compute ourselves.
+    try:
+        return bool(xc._ext.work_validate(int(work, 16), bytes.fromhex(root), _LOCAL_DIFF))
+    except Exception:
+        return False
 
 
 def _work_via(url, root, timeout):
@@ -93,21 +174,38 @@ def _compute_work_rpc(root):
     # external work only (I/O-bound, cheap): local work server, then the work RPCs RACED (first valid wins,
     # so one moody endpoint can't stall a leg; XC_WORK_RPC dPoW is in the race and wins when set), then the
     # general RPC cycle. Returns None if every external source failed.
+    # EVERY external answer is validated before it is returned. Work arrives here from a local port,
+    # a raced pool of public endpoints and a general RPC cycle — none of which we control, and all of
+    # which have been observed returning work that does NOT meet the mainnet send threshold: a dev
+    # work server answering in milliseconds, and public RPCs generating at the far easier RECEIVE
+    # difficulty. Unvalidated, that work goes into a block that the network then rejects, so a tip
+    # fails with nothing in the logs anywhere near the real cause. Validation is a single C-level hash,
+    # and turns each of those into a clean fall-through to the next source.
     try:
-        return json.loads(urllib.request.urlopen(WORK + '/work?hash=' + root, timeout=6).read())['work']
+        w = json.loads(urllib.request.urlopen(WORK + '/work?hash=' + root, timeout=WORK_TIMEOUT).read())['work']
+        if w and _work_ok(w, root):
+            return w
     except Exception:
         pass
-    if WORK_RPCS:
-        ex = ThreadPoolExecutor(max_workers=min(4, len(WORK_RPCS)))
+    # Race the configured work RPCs together with any DISCOVERED work-capable relays. They go in the
+    # same race on purpose: a laptop GPU on a home tunnel and a public dPoW endpoint have wildly
+    # different and unpredictable latencies, so rather than ranking them, ask everyone and take the
+    # first answer that validates.
+    peers = _work_relays()
+    if WORK_RPCS or peers:
+        pool = len(WORK_RPCS) + len(peers)
+        ex = ThreadPoolExecutor(max_workers=min(8, max(1, pool)))
         futs = [ex.submit(_work_via, url, root, 15) for url in WORK_RPCS]
+        futs += [ex.submit(_work_via_relay, url, root, 20) for url in peers]
         winner = None
         try:
             for f in as_completed(futs, timeout=16):
                 try:
-                    winner = f.result()
+                    cand = f.result()
                 except Exception:
-                    winner = None
-                if winner:
+                    cand = None
+                if cand and _work_ok(cand, root):       # a fast answer at the wrong difficulty is not a win
+                    winner = cand
                     break
         except Exception:
             pass
@@ -116,7 +214,7 @@ def _compute_work_rpc(root):
             return winner
     try:
         w = _rpc_retry({'action': 'work_generate', 'hash': root}).get('work')
-        if w:
+        if w and _work_ok(w, root):
             return w
     except Exception:
         pass

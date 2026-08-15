@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "xchat-node",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["backend/kt_server.py", "8791"],
+      "port": 8791,
+      "url": "http://localhost:8791"
+    }
+  ]
+}

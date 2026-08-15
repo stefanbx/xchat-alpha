@@ -89,6 +89,41 @@ node + a relay + IPFS into one image (`fly deploy`). The reference hosted node r
 
 A relay is pure Python and stores only signed bytes.
 
+**The one-command way** (macOS/Linux) — for anyone who'd rather not think about any of the below:
+
+```bash
+curl -fsSL https://xchat-alpha-node.fly.dev/relay.sh | sh
+```
+
+[`relay/install-relay.sh`](relay/install-relay.sh) installs into `~/.xchat-relay`, opens a free
+Cloudflare quick tunnel so a laptop behind NAT still gets a reachable `https://` URL, and registers
+the relay to start at login (launchd / systemd `--user`). The relay binds to loopback only — the
+tunnel is the sole way in. `--status` shows the URL, `--uninstall` removes everything. The same URL
+serves the script as plain text, so read it first.
+
+A quick tunnel's hostname changes on every restart, so **a relay's identity is its own keypair, not
+its URL**. Each relay generates one on first run (kept beside its state file, holds no funds) and
+signs `relay_announce` records binding *account → current url*. Peers key on the account, so a relay
+that comes back at a new address **replaces** its old entry instead of leaving a dead one behind, and
+because the record is signed it can be gossiped on by any peer without that peer being able to alter
+the URL. Relays also re-probe what they know and forget a URL after `XC_RELAY_FAIL_MAX` consecutive
+failures — so address churn is self-healing rather than cumulative. Relays that predate this still
+interoperate: `/relays` keeps its flat url list and unsigned announces are accepted as before.
+
+**Want a permanent address instead?** Point a hostname at the machine and pass it:
+
+```bash
+sh ~/.xchat-relay/install-relay.sh --domain relay.example.com
+sh ~/.xchat-relay/install-relay.sh --domain relay.example.com --tunnel-token <cloudflare-token>
+```
+
+The first assumes you route that name to `127.0.0.1:7401` yourself (reverse proxy, existing tunnel);
+the second runs a Cloudflare *named* tunnel, whose hostname is permanent. With a stable name of 32
+characters or fewer you can also announce it on-chain (below) and be discovered with no bootstrap at
+all — the installer prints the exact command but never handles your seed.
+
+**By hand**, if you want the pieces where you can see them:
+
 ```bash
 cd relay
 python3 xc_relayd.py 7401 relay-state.json      # binds 0.0.0.0:7401

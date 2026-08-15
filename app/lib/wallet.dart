@@ -3,8 +3,10 @@
 // verifier. The node only relays already-signed payloads and reads the ledger — it holds no seed.
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:nanodart/nanodart.dart';
 import 'package:pinenacl/x25519.dart' as pnacl;
+import 'crypto/ed25519_blake2b.dart' as webed;
 
 class NanoWallet {
   final String seed; // 64 hex — held only here, only on this device
@@ -12,9 +14,26 @@ class NanoWallet {
   late final String pub;      // 32-byte public key, hex
   late final String account;  // nano_ address
 
+  // The curve arithmetic — and ONLY the curve arithmetic — differs by platform. nanodart signs
+  // through a TweetNaCl port built on Uint64List, which dart2js cannot compile 64-bit ints for, so in
+  // a browser every derivation and signature throws. Web therefore goes through the BigInt
+  // implementation in crypto/ed25519_blake2b.dart, which is checked byte-for-byte against nanodart
+  // (test/ed25519_blake2b_test.dart) and against the node's Python verifier (test/crosscheck_nanopy.sh).
+  // Android is deliberately left on nanodart: it is what every existing install has always signed
+  // with, and this change must not be able to touch it.
+  static Uint8List _b(String hex) => NanoHelpers.hexToBytes(hex);
+  static String _h(Uint8List b) => NanoHelpers.byteToHex(b).toLowerCase();
+
+  /// Sign a hex-encoded payload (a 32-byte block hash, or a canonical message already hex-encoded).
+  String _signHex(String payloadHex) => kIsWeb
+      ? _h(webed.signDetached(_b(payloadHex), _b(priv), publicKey: _b(pub)))
+      : NanoSignatures.signBlock(payloadHex, priv).toLowerCase();
+
   NanoWallet(this.seed) {
-    priv = NanoKeys.seedToPrivate(seed, 0);
-    pub = NanoKeys.createPublicKey(priv).toLowerCase();
+    priv = NanoKeys.seedToPrivate(seed, 0);   // Blake2b only (pointycastle Register64) — web-safe
+    pub = kIsWeb
+        ? _h(webed.publicKeyFromSecret(_b(priv)))
+        : NanoKeys.createPublicKey(priv).toLowerCase();
     account = NanoAccounts.createAccount(NanoAccountType.NANO, pub);
   }
 
@@ -23,12 +42,10 @@ class NanoWallet {
 
   /// Sign an arbitrary canonical message (head, comment, follow, poll, profile, dm-key).
   /// Returns {sig, pub} — matches the server-side signer byte-for-byte.
-  Map<String, String> signMsg(String msg) =>
-      {'sig': NanoSignatures.signBlock(_hex(msg), priv).toLowerCase(), 'pub': pub};
+  Map<String, String> signMsg(String msg) => {'sig': _signHex(_hex(msg)), 'pub': pub};
 
   /// Sign a 32-byte Nano state-block hash (tips / send / representative change).
-  String signBlockHash(String hash32Hex) =>
-      NanoSignatures.signBlock(hash32Hex, priv).toLowerCase();
+  String signBlockHash(String hash32Hex) => _signHex(hash32Hex);
 
   /// The 32-byte public key (hex) of any nano_ address — a send's `link`, and it validates the shape.
   String pubOf(String addr) => NanoAccounts.extractPublicKey(addr).toLowerCase();

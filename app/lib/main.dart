@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
@@ -46,6 +47,16 @@ Future<void> _loadEndpoints() async {
     kDefaultBase,
   ]) {
     if (e.isNotEmpty && seen.add(e)) list.add(e);
+  }
+  // On the web, prefer the origin that served the page — same-origin means no CORS preflight, and a
+  // laptop pointed at its own node should talk to its own node. A RELAY-only host has no /api at all,
+  // so adopt the origin only if it actually answers; otherwise fall through to the remembered list.
+  if (kIsWeb) {
+    final origin = Uri.base.origin;
+    if (origin.startsWith('http') && await _endpointHealthy(origin)) {
+      list.remove(origin);
+      list.insert(0, origin);
+    }
   }
   kEndpoints = list;
   kBase = kEndpoints.first;                            // trust the cached last-good endpoint; no probe here
@@ -150,10 +161,16 @@ class WalletStore {
   static const _secure = FlutterSecureStorage(
       aOptions: AndroidOptions(encryptedSharedPreferences: true));
 
+  // A BROWSER HAS NO KEYSTORE. flutter_secure_storage's web backend is IndexedDB with the wrapping
+  // key stored right next to the data, so routing web through it would buy nothing and imply hardware
+  // protection that does not exist — and it throws outright where crypto.subtle is unavailable. Use
+  // the ordinary store on web and say so in the UI (see the warning on the onboarding screen), so the
+  // weaker guarantee is a thing the user is told, not a thing the code quietly pretends away.
   static Future<String?> get() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (kIsWeb) return prefs.getString(_k);
     final s = await _secure.read(key: _k);
     if (s != null && s.isNotEmpty) return s;
-    final prefs = await SharedPreferences.getInstance();
     final legacy = prefs.getString(_k);
     if (legacy == null || legacy.isEmpty) return null;
     await _secure.write(key: _k, value: legacy);
@@ -161,10 +178,16 @@ class WalletStore {
     return legacy;
   }
 
-  static Future<void> save(String s) async => _secure.write(key: _k, value: s);
+  static Future<void> save(String s) async {
+    if (kIsWeb) {
+      await (await SharedPreferences.getInstance()).setString(_k, s);
+      return;
+    }
+    await _secure.write(key: _k, value: s);
+  }
 
   static Future<void> clear() async {
-    await _secure.delete(key: _k);
+    if (!kIsWeb) await _secure.delete(key: _k);
     await (await SharedPreferences.getInstance()).remove(_k);
   }
 }
@@ -507,6 +530,31 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         }),
         const SizedBox(height: 12),
         _bigBtn('I already have a seed', kCard, kText, () => setState(() => _step = 'restore')),
+        // Say the quiet part out loud. On Android the seed sits in the Keystore; in a browser it sits
+        // in ordinary site storage, readable by anything that can run script on this page — including
+        // whoever is hosting it. Someone choosing between the two deserves to know before they paste
+        // a seed that controls real money.
+        if (kIsWeb) ...[
+          const SizedBox(height: 24),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+                color: kCard, borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.amber.withOpacity(0.35))),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.info_outline, size: 17, color: Colors.amber),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Text(
+                    'You are using ӾChat in a browser. Your seed is kept in this browser\'s storage, '
+                    'which is weaker than the phone app\'s keystore — and this page is served by whoever '
+                    'runs this node. For an account holding real value, prefer the Android app, or use a '
+                    'seed here that you are willing to treat as disposable.',
+                    style: TextStyle(color: kDim, fontSize: 11.5, height: 1.45)),
+              ),
+            ]),
+          ),
+        ],
       ]);
 
   Widget _backup() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -3732,6 +3780,10 @@ class _FeedScreenState extends State<FeedScreen> {
   // hasn't already dismissed, surface a banner. The manual wallet→"App updates" flow still exists; this
   // just means an update reaches people without them going looking for it.
   Future<void> _autoCheckUpdate() async {
+    // In a browser there is no APK to fetch and no OS installer to hand it to — the page IS the
+    // current version, and reloading is the update. Offering one would download a file nothing can
+    // install, so the whole self-update path is Android-only.
+    if (kIsWeb) return;
     try {
       final r = await Api.releaseCheck();
       if (r == null || r['update'] != true) return;
@@ -4173,7 +4225,16 @@ class _FeedScreenState extends State<FeedScreen> {
               title: const Text('App updates', style: TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 15)),
               subtitle: const Text('signed releases over the relays · no app store', style: TextStyle(color: kDim, fontSize: 12)),
               trailing: Text('v$kAppVersion', style: const TextStyle(color: kDim, fontSize: 12, fontFamily: 'monospace')),
-              onTap: () { Navigator.pop(ctx); _showUpdates(); },
+              onTap: () {
+                Navigator.pop(ctx);
+                if (kIsWeb) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      backgroundColor: kCard,
+                      content: Text('On the web you are always on the current version — just reload the page.')));
+                  return;
+                }
+                _showUpdates();
+              },
             ),
             const SizedBox(height: 6),
             if (!reveal)
@@ -4810,7 +4871,7 @@ class _FeedScreenState extends State<FeedScreen> {
         }
 
         Future<void> install() async {                            // hand the verified APK to the OS installer
-          if (Platform.isIOS) {
+          if (!kIsWeb && Platform.isIOS) {
             showDialog(
               context: ctx,
               builder: (_) => AlertDialog(
@@ -4935,8 +4996,8 @@ class _FeedScreenState extends State<FeedScreen> {
                 SizedBox(width: double.infinity, child: FilledButton.icon(
                   onPressed: install,
                   style: FilledButton.styleFrom(backgroundColor: const Color(0xFF4DD0A7), foregroundColor: Colors.black),
-                  icon: Icon(Platform.isIOS ? Icons.apple : Icons.android, size: 18),
-                  label: Text(Platform.isIOS ? 'Install (iOS gated)' : 'Install', style: const TextStyle(fontWeight: FontWeight.w800)),
+                  icon: Icon(!kIsWeb && Platform.isIOS ? Icons.apple : Icons.android, size: 18),
+                  label: Text(!kIsWeb && Platform.isIOS ? "Install (iOS gated)" : "Install", style: const TextStyle(fontWeight: FontWeight.w800)),
                 )),
               const SizedBox(height: 10),
               const Text('GitHub is only a mirror — the publisher signature is the root of trust. A takedown of any relay doesn’t stop updates.',
@@ -7244,6 +7305,28 @@ class _VideoScreenState extends State<VideoScreen> {
 
   // fetch the movie by CID via the engine (IPFS or relay cache), play from a temp file
   Future<void> _prepare() async {
+    // On the web there is no temp directory to stage the bytes in, so the <video> element streams
+    // straight from the node instead of us downloading the whole clip first — which also means
+    // playback starts without waiting for the full file.
+    if (kIsWeb) {
+      try {
+        final c = VideoPlayerController.networkUrl(Uri.parse('$kBase/api/media?cid=${widget.cid}'))
+          ..setLooping(true);
+        await c.initialize();
+        if (!mounted) {
+          c.dispose();
+          return;
+        }
+        setState(() {
+          _c = c;
+          _ready = true;
+        });
+        c.play();
+      } catch (_) {
+        if (mounted) setState(() => _err = 'could not play movie');
+      }
+      return;
+    }
     final bytes = await Api.media(widget.cid);
     if (bytes == null) {
       if (mounted) setState(() => _err = 'movie unavailable');
