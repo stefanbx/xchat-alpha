@@ -922,11 +922,17 @@ def _relay_url(account):  # a relay account -> the URL it announced on its own c
     return None
 
 def _relay_accounts():  # scan every rendezvous (keyless) for the set of relay accounts that checked in
+    # An empty result here is AMBIGUOUS: it means either "nobody has checked in" or "every RPC failed".
+    # Swallowing the difference let one dead endpoint be reported as an authoritative "0 announced" —
+    # the panel then told an operator whose relays WERE on-chain to go announce one. Track whether any
+    # rendezvous actually answered and RAISE when none did, so the caller can tell the two apart.
     accts = set()
+    answered = False
     for rv in rendezvous_accts():
         try:
             b = rpc({'action': 'receivable', 'account': rv, 'count': '300',
                      'source': 'true', 'include_only_confirmed': 'false'}).get('blocks') or {}
+            answered = True                        # this rendezvous replied — an empty set here is REAL
             if isinstance(b, dict):
                 for v in b.values():
                     if isinstance(v, dict) and v.get('source'):
@@ -936,6 +942,8 @@ def _relay_accounts():  # scan every rendezvous (keyless) for the set of relay a
                     accts.add(x['account'])
         except Exception:
             pass
+    if not answered:
+        raise RuntimeError('no rendezvous could be read — every Nano RPC failed (not an empty directory)')
     return accts
 # the engine passes XC_NS (its port) so two engines on one machine hold two different wallets.
 # falls back to the legacy shared path when unset (single-engine dev).
@@ -976,27 +984,34 @@ def key_for_account(account):                           # private key hex for an
 # NOT pass env to helpers) OR the XCHAT_BOOTSTRAP env var. Falls back to the local relays.
 _ONCHAIN_CACHE = '/tmp/xc_onchain_relays.json'
 _KNOWN_RELAYS = '/tmp/xc_known_relays.json'  # the list the client keeps: reconnect straight here, re-scan in the background
+_ONCHAIN_FAIL_TTL = 20   # a FAILED scan is retried far sooner than a good one — but not on every spawn
 
 def onchain_relays(ttl=120):  # SCAN the ledger for self-announced relays (no directory, no SPOF)
     try:                                            # short on-disk cache: one ledger scan per helper wave, not per spawn
         c = json.load(open(_ONCHAIN_CACHE))
-        if time.time() - c['ts'] < ttl and 'relays' in c:   # honor an EMPTY result too — see below
-            return c['relays']
+        if 'relays' in c:                           # honor an EMPTY result too — see below
+            # A cached FAILURE is a rate-limiter, never an answer: it expires quickly, and while it
+            # holds we serve the last KNOWN-GOOD set rather than [], so an RPC outage can never be
+            # reported as "nothing is announced on the ledger".
+            if time.time() - c['ts'] < (_ONCHAIN_FAIL_TTL if c.get('failed') else ttl):
+                return known_relays() if c.get('failed') else c['relays']
     except Exception:
         pass
-    relays = []
+    failed = False
     try:
         relays = sorted({u for a in _relay_accounts() if (u := _relay_url(a))})
     except Exception:
-        relays = []
+        relays, failed = [], True
     # ALWAYS cache the scan result, INCLUDING an empty one. On a node where no relay has announced
     # on-chain (the mainnet default until the operator does a funded announce) the scan returns [], and
     # the old check (`c.get('relays')` truthy) treated that as "no cache" — so EVERY helper spawn re-ran
     # the slow mainnet ledger scan. Under the app's launch burst that meant many concurrent scans, which
     # pegged the node and hung it. Caching [] fixes it. Only a NON-empty set is mirrored into the
     # persisted known-relays list (never wipe that list with an empty scan).
+    # A FAILED scan is cached too — the storm it would otherwise cause is worst when the RPCs are slow —
+    # but FLAGGED, so it rate-limits without ever being mistaken for a real "zero relays" answer.
     try:
-        json.dump({'ts': time.time(), 'relays': relays}, open(_ONCHAIN_CACHE, 'w'))
+        json.dump({'ts': time.time(), 'relays': relays, 'failed': failed}, open(_ONCHAIN_CACHE, 'w'))
     except Exception:
         pass
     if relays:
@@ -1004,7 +1019,7 @@ def onchain_relays(ttl=120):  # SCAN the ledger for self-announced relays (no di
             json.dump({'ts': time.time(), 'relays': relays}, open(_KNOWN_RELAYS, 'w'))
         except Exception:
             pass
-    return relays
+    return known_relays() if failed else relays
 
 def known_relays():  # the persisted list — used to reconnect directly before any fresh scan
     try:

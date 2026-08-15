@@ -395,7 +395,12 @@ export BIND_HOST="${XC_BIND:-127.0.0.1}"
 KEEP_AWAKE="${KEEP_AWAKE:-1}"
 EOF
 cat >> "$XC_HOME/run.sh" <<'EOF'
-export XC_NANO_RPC="${XC_NANO_RPC:-https://rpc.nano.to,https://nanoslo.0x.no/proxy,https://rainstorm.city/api}"
+# Ledger RPCs in PREFERENCE order. This export is what every child actually gets, so the order here is
+# the one that counts (start_node repeats the same list only so it reads correctly on its own). Keep the
+# most reliable endpoint FIRST: xc_common's `_rpc_good` index is per-PROCESS, and helpers are spawned per
+# request, so each one re-tries the head of this list. A dead endpoint in front cost ~10.5s on the first
+# RPC of EVERY helper (measured) — it reads as random slowness, not as one bad endpoint.
+export XC_NANO_RPC="${XC_NANO_RPC:-https://nanoslo.0x.no/proxy,https://rainstorm.city/api,https://rpc.nano.to}"
 cd "$XC_HOME"
 echo "$$" > "$XC_HOME/supervisor.pid"
 
@@ -444,7 +449,7 @@ start_node() {
     cd "$XC_HOME/node" || return 0
     XC_WORK="http://127.0.0.1:$WORKD_PORT" \
     XC_WORK_LOCAL=1 \
-    XC_NANO_RPC="${XC_NANO_RPC:-https://nanoslo.0x.no/proxy,https://rpc.nano.to,https://rainstorm.city/api}" \
+    XC_NANO_RPC="${XC_NANO_RPC:-https://nanoslo.0x.no/proxy,https://rainstorm.city/api,https://rpc.nano.to}" \
     XCHAT_BOOTSTRAP="$(echo "$BOOTSTRAP" | tr ' ' ',')" \
         "$PY" "$XC_HOME/node/kt_server.py" "$NODE_PORT" >>"$XC_HOME/node.log" 2>&1 &
     NODE_PID=$!
