@@ -533,6 +533,11 @@ cat >> "$XC_HOME/run.sh" <<'EOF'
 # request, so each one re-tries the head of this list. A dead endpoint in front cost ~10.5s on the first
 # RPC of EVERY helper (measured) — it reads as random slowness, not as one bad endpoint.
 export XC_NANO_RPC="${XC_NANO_RPC:-https://nanoslo.0x.no/proxy,https://rainstorm.city/api,https://rpc.nano.to}"
+# The node pins each thread to IPFS to get its CID. xc_common defaults IPFS_PATH to /tmp/ipfsB, which
+# macOS wipes on reboot — so the repo silently stops existing and every post falls back to the second
+# repo (or fails outright on a machine that has only the one). Point it at a persistent path instead.
+# A fresh machine still needs `ipfs init` once; this only stops a working repo from evaporating.
+export IPFS_PATH="${IPFS_PATH:-$HOME/.ipfs}"
 cd "$XC_HOME"
 echo "$$" > "$XC_HOME/supervisor.pid"
 
