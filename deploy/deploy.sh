@@ -11,6 +11,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The landing page quotes the APK's version, size and SHA-256. Derive them from the artifact before
+# staging: hand-typed, they drifted to "18 MB · v2.3.5" and a checksum that did NOT match the APK the
+# page linked — so anyone following the page's own "verify the checksum" step saw a mismatch.
+./deploy/stamp-release.sh
+
 rm -rf deploy/app && mkdir -p deploy/app
 cp backend/*.py deploy/app/
 cp backend/*.html deploy/app/ 2>/dev/null || true   # download/landing page served by the node front door
