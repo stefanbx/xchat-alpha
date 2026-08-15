@@ -53,7 +53,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload reproduced APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: xchat-arm64-reproduced
           path: out/*.apk
