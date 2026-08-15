@@ -3,6 +3,9 @@ app/build/
 app/.dart_tool/
 app/.gradle/
 **/__pycache__/
+# wrangler's local cache. No leading slash on purpose: wrangler creates this in whatever directory it
+# is invoked from, so it turns up at the repo root as readily as under cf-worker/.
+.wrangler/
 # secrets / local state — never commit.
 # The signing keys live in ~/.xchat and are only referenced from here; these patterns are the
 # backstop for the day someone copies one into the tree "just for a second".
