@@ -30,6 +30,16 @@
 #   --domain relay.example.com --tunnel-token <token>   Cloudflare named tunnel (token from their
 #                                            dashboard: Networks -> Tunnels -> your tunnel)
 #
+# Being reachable is not the same as being FINDABLE. To be discovered by people who don't already
+# have your URL, the node announces itself on the XNO ledger — which needs a permanent address AND a
+# key to sign with. One command each, in this order:
+#
+#   sh install-relay.sh --setup-worker    free permanent workers.dev address (installs Node if needed)
+#   sh install-relay.sh --setup-operator  creates the signing key and tells you what to fund it with.
+#                                         The announce spends 4 raw — dust. The account just has to
+#                                         exist on-chain. The seed is written to ~/.xchat-relay/
+#                                         operator.seed, mode 600 — back it up.
+#
 #   sh install-relay.sh --status      what's running, the public URL, and whether you're announced
 #   sh install-relay.sh --uninstall   stop it and delete ~/.xchat-relay
 set -eu
@@ -115,6 +125,7 @@ while [ $# -gt 0 ]; do
         --start)           ACTION=start ;;
         --uninstall)       ACTION=uninstall ;;
         --setup-worker)    ACTION=setup-worker ;;
+        --setup-operator)  ACTION=setup-operator ;;
         --worker-name)     shift; WORKER_NAME="${1:-}"; [ -n "$WORKER_NAME" ] || die "--worker-name needs a value" ;;
         --worker-name=*)   WORKER_NAME="${1#*=}" ;;
         --help|-h)         ACTION=help ;;
@@ -152,7 +163,8 @@ case "$ACTION" in
         if [ -s "$XC_HOME/operator.seed" ]; then
             ok "operator key present (announces are signed with it)"
         else
-            warn "no operator key — self-announce is disabled (see --help)"
+            warn "no operator key — this node cannot announce itself on the ledger"
+            say "  Fix it once:  sh $SELF --setup-operator"
         fi
         if [ -s "$XC_HOME/selfannounce.log" ]; then
             say "last announce: $(tail -n 1 "$XC_HOME/selfannounce.log")"
@@ -160,6 +172,72 @@ case "$ACTION" in
         say ""
         say "settings:   http://127.0.0.1:$ADMIN_PORT"
         say "logs:       $XC_HOME/relay.log"
+        exit 0 ;;
+    setup-operator)
+        # The LAST manual step. Announcing on the ledger is signed by an operator key, and that key has
+        # to exist on-chain — which means somebody sends it real XNO once. Nothing automated that, and
+        # nothing explained it either: --help never mentioned it, the default install never mentioned
+        # it, and --status pointed at a --help that didn't cover it. So an operator's node stayed
+        # undiscoverable with no route to fixing it short of reading the source.
+        #
+        # This generates the key, tells them exactly what to send and how little, and writes the seed
+        # only after the ledger confirms the account is open. Re-runnable: it never regenerates over an
+        # existing seed, because that would strand whatever they already funded.
+        [ -d "$XC_HOME" ] || die "$XC_HOME not found — install the relay first"
+        OPY="$XC_HOME/venv/bin/python3"; [ -x "$OPY" ] || OPY=$(command -v python3 || true)
+        [ -n "$OPY" ] || die "python3 not found"
+        "$OPY" -c 'import nanopy' 2>/dev/null || die "nanopy missing — re-run the installer first"
+        SEEDF="$XC_HOME/operator.seed"
+        # `|| RC=$?` on purpose: this script runs under `set -e`, and the helper exits non-zero to mean
+        # "key exists but is not funded yet" — the single most likely outcome. Left bare, set -e killed
+        # the script right there and the operator saw the address with no instructions after it.
+        RC=0
+        XC_HOME="$XC_HOME" SEEDF="$SEEDF" "$OPY" - <<'PYOP' || RC=$?
+import importlib.util, os, secrets, stat, sys
+XC, SEEDF = os.environ['XC_HOME'], os.environ['SEEDF']
+os.environ['XC_NANO_RPC'] = 'http://127.0.0.1:9'      # don't let the import scan the ledger
+spec = importlib.util.spec_from_file_location('xc', os.path.join(XC, 'xc_common.py'))
+xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
+xc.RPCS = ['https://nanoslo.0x.no/proxy', 'https://rainstorm.city/api', 'https://node.somenano.com/proxy']
+import nanopy
+
+existing = os.path.exists(SEEDF) and os.path.getsize(SEEDF) >= 64
+if existing:
+    seed = open(SEEDF).read().strip()
+else:
+    # 0600 from the moment it exists — this key signs on-chain, and it is written before it is funded.
+    seed = secrets.token_hex(32)
+    fd = os.open(SEEDF + '.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, (seed + '\n').encode()); os.close(fd)
+    os.replace(SEEDF + '.tmp', SEEDF)
+os.chmod(SEEDF, stat.S_IRUSR | stat.S_IWUSR)
+acct = xc.derive(nanopy.deterministic_key(seed, 0))[0]
+
+try:
+    info = xc.rpc({'action': 'account_info', 'account': acct})
+except Exception as e:
+    print('  could not reach a Nano RPC to check the balance: %s' % str(e)[:70]); sys.exit(2)
+
+if isinstance(info, dict) and not info.get('error'):
+    print('  FUNDED %s' % acct)
+    sys.exit(0)
+print('  %s %s' % ('reusing existing operator key' if existing else 'created an operator key', acct))
+sys.exit(1)
+PYOP
+        chmod 600 "$SEEDF" 2>/dev/null || true
+        if [ "$RC" = 0 ]; then
+            ok "operator key is funded — this node can announce itself"
+            say "  Restart to publish it:  sh $SELF --stop && sh $SELF --start"
+        elif [ "$RC" = 1 ]; then
+            say ''
+            say "  Send it a tiny amount of XNO — any dust will do. The announce itself spends 4 raw"
+            say "  (that is 0.000000000000000000000000004 XNO); the account just has to EXIST on-chain."
+            say "  Some faucets will open it for free. ${c_dim}The seed is in $SEEDF, mode 600 — back it up.${c_0}"
+            say ''
+            say "  Then run this again:  sh $SELF --setup-operator"
+        else
+            warn "could not check the balance — try again when you have a network"
+        fi
         exit 0 ;;
     setup-worker)
         # ONE-TIME: give this node a short, stable, free hostname that survives tunnel churn.
@@ -1103,13 +1181,18 @@ if [ "$MODE" = quick ]; then
     say "${c_dim}The address changes each restart. That's fine — your relay's identity doesn't, so peers${c_0}"
     say "${c_dim}follow it to the new address. Want a permanent one? Re-run with --domain your.host and,${c_0}"
     say "${c_dim}if it's a Cloudflare tunnel, --tunnel-token <token from the Cloudflare dashboard>.${c_0}"
+    say ""
+    say "${c_dim}A changing address cannot go on the ledger, so nobody can FIND this node yet — they need${c_0}"
+    say "${c_dim}the URL from you. Two commands fix that for good, in this order:${c_0}"
+    say "${c_dim}  sh $SELF --setup-worker     a free, permanent workers.dev address in front of the tunnel${c_0}"
+    say "${c_dim}  sh $SELF --setup-operator   the key that signs the on-chain announce (needs XNO dust)${c_0}"
 elif [ ${#DOMAIN} -le 32 ]; then
     # On-chain announce is the strongest form of discovery (no bootstrap needed at all), but it costs
     # a real transaction from a funded account, so it stays the operator's own deliberate step — this
     # installer never asks for a seed.
     say "${c_dim}Your address is permanent, so you can also announce it ON-CHAIN — then nodes find you by${c_0}"
-    say "${c_dim}scanning the ledger, with no bootstrap at all. From a repo checkout, with a funded key:${c_0}"
-    say "${c_dim}  XC_RELAY_OPERATOR_SEED=<64-hex seed> python3 backend/xc_reldir.py announce-mainnet https://$DOMAIN${c_0}"
+    say "${c_dim}scanning the ledger, with no bootstrap. One command sets up the key it is signed with:${c_0}"
+    say "${c_dim}  sh $SELF --setup-operator${c_0}"
 else
     say "${c_dim}Your address is permanent. It's ${#DOMAIN} characters, though, and an on-chain announce packs${c_0}"
     say "${c_dim}the host into a 32-byte block link — a shorter hostname would let you announce on-chain too.${c_0}"
