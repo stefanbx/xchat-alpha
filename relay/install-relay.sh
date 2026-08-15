@@ -191,13 +191,28 @@ case "$ACTION" in
         [ -f "$XC_HOME/worker.conf" ] && { KV_NAMESPACE_ID=''; . "$XC_HOME/worker.conf"; KV_ID="$KV_NAMESPACE_ID"; }
         if [ -z "$KV_ID" ]; then
             say "Creating the KV namespace..."
-            KV_OUT=$(cd "$CFDIR" && npx --yes wrangler kv namespace create BACKEND_KV 2>&1) || {
-                printf '%s\n' "$KV_OUT" >&2; die "could not create the KV namespace (output above)"; }
+            # A create can fail simply because the namespace ALREADY EXISTS on this account — the
+            # normal state for anyone re-running this after reinstalling the relay, since worker.conf
+            # (our only other record of the id) lives in ~/.xchat-relay and goes with it. Treating that
+            # as fatal left the operator with no route forward at all: the name is taken, and the id
+            # they need is sitting in their account, unreadable to them. Look it up and carry on.
+            if ! KV_OUT=$(cd "$CFDIR" && npx --yes wrangler kv namespace create BACKEND_KV 2>&1); then
+                KV_ID=$(npx --yes wrangler kv namespace list 2>/dev/null \
+                    | tr -d ' \n' | tr '{' '\n' | grep '"title":"BACKEND_KV"' \
+                    | grep -oE '"id":"[0-9a-f]{32}"' | grep -oE '[0-9a-f]{32}' | head -1)
+                if [ -n "$KV_ID" ]; then
+                    say "  a BACKEND_KV namespace already exists on this account — reusing it"
+                else
+                    printf '%s\n' "$KV_OUT" >&2; die "could not create the KV namespace (output above)"
+                fi
+            fi
+            # Only parse the create output when the lookup above didn't already supply an id — otherwise
+            # this would overwrite a perfectly good reused id with nothing.
             # Prefer an explicitly LABELLED id — wrangler renders it as `id = "..."` (toml snippet) or
             # `"id": "..."` (json), and both forms are covered. Falling straight to "first 32-hex run"
             # would be wrong the moment wrangler prints the ACCOUNT id first: those are 32 hex too, and
             # we'd silently bind the worker to a namespace that doesn't exist.
-            KV_ID=$(printf '%s' "$KV_OUT" \
+            [ -n "$KV_ID" ] || KV_ID=$(printf '%s' "$KV_OUT" \
                 | grep -oE '"?id"?[[:space:]]*[:=][[:space:]]*"?[0-9a-f]{32}' \
                 | grep -oE '[0-9a-f]{32}' | head -1)
             [ -n "$KV_ID" ] || KV_ID=$(printf '%s' "$KV_OUT" | grep -oE '[0-9a-f]{32}' | head -1)
