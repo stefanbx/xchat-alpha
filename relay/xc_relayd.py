@@ -514,7 +514,27 @@ def grant_pin(cid, payhash):
         to_us = (c.get('link_as_account') == RELAY_ACCT
                  or c.get('link', '').upper() == xc.nano_to_pub(RELAY_ACCT).upper())
         amt = int(bi.get('amount', '0'))
+        confirmed = str(bi.get('confirmed', '')).lower() == 'true'
+        subtype = str(bi.get('subtype', '')).lower()
     except Exception:
+        return 0
+    # CONFIRMED ONLY. A block can be in the ledger without being cemented, and an unconfirmed block may
+    # still be rolled back — so granting pin time on one lets storage be bought with a payment that
+    # never lands. This FAILS CLOSED: anything other than an explicit 'true' buys nothing, including an
+    # RPC that omits the field entirely. (The endpoint's own 402 text always claimed "confirmed"; the
+    # check was simply missing.)
+    if not confirmed:
+        if 'confirmed' not in bi:
+            # An operator problem, not a payer problem, and otherwise indistinguishable: an RPC that
+            # never reports confirmation silently disables paid pins on this relay. Say so once per
+            # attempt rather than rejecting in silence.
+            print(f'pay-to-pin: RPC gave no confirmation status for {payhash[:12]}… — no pin granted '
+                  f'(is XC_NANO_RPC a full node?)', flush=True)
+        return 0
+    # Defence in depth: `amount` and `link` only mean "paid us" on a SEND. Read off a receive or epoch
+    # block they describe something else entirely. Tolerated when absent, since not every proxy returns
+    # subtype and the link/amount checks below still have to pass.
+    if subtype and subtype != 'send':
         return 0
     if not to_us or amt <= 0:
         return 0
