@@ -14,15 +14,22 @@
 import importlib.util, json, os, socket, subprocess, sys, time, urllib.error, urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Discovery reads the ledger first. A test must not depend on a mainnet (or a dev node that happens
+# to be up on this machine), so point it at a closed port: the scan fails, and the bootstrap below
+# is what is left. Set before xc_common is imported — it scans at import time.
+DEAD_RPC = 'http://127.0.0.1:9'
+os.environ.setdefault('XC_NANO_RPC', DEAD_RPC)
+# Build the signing preimages with the node's OWN sig_canon. A local copy would drift silently and
+# this test would keep passing while the wire format diverged — which is exactly what happened: the
+# preimages here stayed on the retired '|'-joined form after the node moved to v2, so every signed
+# write was rejected as "bad post signature" and the refusal checks below passed for the wrong reason.
 spec = importlib.util.spec_from_file_location("xc_common", os.path.join(ROOT, "backend", "xc_common.py"))
+xc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(xc)
 
 # A seed of its own, not the '07' demo identity: if a dev relay is running on this machine it may
 # already hold posts and DMs for that account, and the test would read them back as its own.
 SEED = '5a' * 32
-# Discovery reads the ledger first. A test must not depend on a mainnet (or a dev node that happens
-# to be up on this machine), so point it at a closed port: the scan fails, and the bootstrap below
-# is what is left.
-DEAD_RPC = 'http://127.0.0.1:9'
 # discovery's shared scratch files. They belong to whatever else is running on this machine, so the
 # test borrows them and puts them back.
 SHARED = ('/tmp/xchat_bootstrap.txt', '/tmp/xc_known_relays.json', '/tmp/xc_onchain_relays.json')
@@ -142,7 +149,7 @@ def main():
 
         # ---- POST: prepare (app-signed event) -> sign the head over the returned CID -> submit ----
         text = 'hello from an on-device signature'
-        s = phone.sign(f'you.xno|post|{text}|{ts}')
+        s = phone.sign(xc.sig_canon('post', 'you.xno', 'post', text, ts))
         prep = api(node_port, '/api/post_prepare', {'handle': 'you.xno', 'account': acct, 'kind': 'post',
                                                     'text': text, 'ts': ts, 'sig': s['sig'], 'pub': s['pub']})
         check(prep.get('ok') and prep.get('cid'), 'post prepare accepts the signed event', prep)
@@ -165,7 +172,7 @@ def main():
 
         # ---- FOLLOWS (the path that was still node-signed until this pass) ----
         follows = sorted(['nano_1aaa', 'nano_1bbb'])
-        fs = phone.sign(f"{acct}|{ts}|{','.join(follows)}")
+        fs = phone.sign(xc.sig_canon('follow', acct, ts, ','.join(follows)))
         api(node_port, '/api/follows_set', {'account': acct, 'follows': follows, 'ts': ts,
                                             'sig': fs['sig'], 'pub': fs['pub']})
         got = api(node_port, f'/api/follows_get?account={acct}')
@@ -176,7 +183,7 @@ def main():
         check(again.get('follows') == follows, 'a forged follow list is refused', again)
 
         # ---- PROFILE ----
-        ps = phone.sign(f'{acct}|{ts}|Alice|my bio||')
+        ps = phone.sign(xc.sig_canon('profile', acct, ts, 'Alice', 'my bio', '', ''))
         api(node_port, '/api/profile_set', {'account': acct, 'display': 'Alice', 'bio': 'my bio',
                                             'avatar': '', 'banner': '', 'ts': ts,
                                             'sig': ps['sig'], 'pub': ps['pub']})
@@ -184,7 +191,7 @@ def main():
         check(prof.get('display') == 'Alice' and prof.get('bio') == 'my bio', 'profile publish + read back', prof)
 
         # ---- COMMENT ----
-        cs = phone.sign(f'p1|{acct}|{ts}|nice one|')
+        cs = phone.sign(xc.sig_canon('comment', 'p1', acct, ts, 'nice one', ''))
         api(node_port, '/api/comment_post', {'post_id': 'p1', 'account': acct, 'handle': 'you.xno',
                                              'text': 'nice one', 'parent': '', 'ts': ts,
                                              'sig': cs['sig'], 'pub': cs['pub']})
@@ -192,7 +199,7 @@ def main():
         check(any(c.get('text') == 'nice one' for c in cg.get('comments', [])), 'comment publish + read back', cg)
 
         # ---- POLL VOTE ----
-        vs = phone.sign(f'poll1|{acct}|1|{ts}')
+        vs = phone.sign(xc.sig_canon('poll', 'poll1', acct, '1', ts))
         api(node_port, '/api/poll_vote', {'poll_id': 'poll1', 'account': acct, 'option': '1', 'ts': ts,
                                           'sig': vs['sig'], 'pub': vs['pub']})
         pg = api(node_port, f'/api/poll_get?poll=poll1&account={acct}')
@@ -200,7 +207,7 @@ def main():
               'poll vote counted', pg)
 
         # ---- DMs: the app seals, the relay only ever holds ciphertext ----
-        ds = phone.sign(f'{acct}|{ts}|{phone.dm_pub}')
+        ds = phone.sign(xc.sig_canon('dmkey', acct, ts, phone.dm_pub))
         api(node_port, '/api/dm_key_set', {'account': acct, 'dm_pk': phone.dm_pub, 'ts': ts,
                                            'sig': ds['sig'], 'pub': ds['pub']})
         kg = api(node_port, f'/api/dm_key_get?account={acct}')
