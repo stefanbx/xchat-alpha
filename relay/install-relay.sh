@@ -169,8 +169,35 @@ case "$ACTION" in
         # whose host routinely exceeds the 32 bytes the on-chain link can hold. Announcing that would
         # be both impossible and wrong. A workers.dev hostname is short, free and permanent; the worker
         # reads the current tunnel from KV, so the address the ledger carries never has to change.
-        command -v npx >/dev/null 2>&1 || die "npx not found — install Node.js first (https://nodejs.org), then re-run"
         [ -d "$XC_HOME" ] || die "$XC_HOME not found — install the relay first"
+        # wrangler runs on Node, and this is the ONLY command that needs it — so fetch it here rather
+        # than in the install. Bundling it for everyone would add ~50MB to a base install that never
+        # touches it, on top of the ipfs the node genuinely can't work without. Requiring the operator
+        # to install Node by hand was the alternative, and "install this other thing first" is exactly
+        # the friction that leaves a node unannounced.
+        if ! command -v npx >/dev/null 2>&1; then
+            NODE_DIR="$XC_HOME/bin/node"
+            if [ -x "$NODE_DIR/bin/npx" ]; then
+                PATH="$NODE_DIR/bin:$PATH"; export PATH
+            else
+                NV=v24.19.0        # pinned like cloudflared/kubo: a moving 'latest' makes installs differ
+                case "$ARCH" in amd64) NA=x64 ;; arm64) NA=arm64 ;; *) NA="$ARCH" ;; esac
+                if [ "$OS" = Darwin ]; then NOS=darwin; NX=tar.gz; else NOS=linux; NX=tar.xz; fi
+                step "downloading Node.js (wrangler runs on it — only --setup-worker needs this)"
+                if fetch "https://nodejs.org/dist/$NV/node-$NV-$NOS-$NA.$NX" "$XC_HOME/bin/node.tar" 2>/dev/null \
+                   && tar -xf "$XC_HOME/bin/node.tar" -C "$XC_HOME/bin" 2>/dev/null \
+                   && mv "$XC_HOME/bin/node-$NV-$NOS-$NA" "$NODE_DIR" 2>/dev/null; then
+                    rm -f "$XC_HOME/bin/node.tar"
+                    PATH="$NODE_DIR/bin:$PATH"; export PATH
+                else
+                    rm -rf "$XC_HOME/bin/node.tar" "$XC_HOME/bin/node-$NV-$NOS-$NA"
+                    die "could not download Node.js for $NOS-$NA (needed for wrangler).
+Install it yourself from https://nodejs.org and re-run --setup-worker."
+                fi
+            fi
+            command -v npx >/dev/null 2>&1 || die "Node.js unpacked but npx still isn't runnable"
+            ok "node ready ($(node --version 2>&1))"
+        fi
         CFDIR="$XC_HOME/cf-worker"; mkdir -p "$CFDIR/src"
         # Fetch the worker source rather than embedding a copy here: two copies of the same proxy would
         # drift, and the one an operator deploys is the one that must match the repo.
