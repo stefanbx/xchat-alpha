@@ -33,6 +33,12 @@ import 'ledger_discovery.dart';
 const String kDefaultBase = 'https://xchat-alpha-node.fly.dev'; // hosted alpha node (run your own + repoint in Settings)
 String kBase = kDefaultBase;
 
+// Preferred endpoint for delegated proof-of-work (tip settlement, sends). A node that advertises
+// `work: local` in /api/status runs an on-box (often GPU) work server that does PoW in ~a second, vs the
+// public work-RPC lottery a plain node falls back to. null => none known, use kBase. Resolved in the
+// background; block_process falls back to kBase automatically if this node is unreachable (home nodes sleep).
+String? kWorkBase;
+
 // SEVERAL independent default endpoints, across DIFFERENT providers, so a fresh install isn't single-homed
 // even before ledger discovery runs: if the primary's host is taken down, the app can still fail over to a
 // baked-in alternative on its very first launch. Today: the Fly node + a Cloudflare-Worker-fronted node
@@ -131,12 +137,29 @@ Future<bool> healEndpointsFromLedger({bool switchBase = true}) async {
   }
 }
 
+// Pick the fastest proof-of-work node among the known endpoints: one that advertises `work: local`
+// (an on-box/GPU work server). Best-effort and cheap; sets kWorkBase (or clears it to fall back to
+// kBase when none advertise local). block_process then routes PoW there so tips settle in ~a second.
+Future<void> resolveWorkBase() async {
+  for (final e in kEndpoints) {
+    try {
+      final r = await http.get(Uri.parse('$e/api/status')).timeout(const Duration(seconds: 5));
+      final d = jsonDecode(r.body);
+      if (d is Map && d['online'] == true && d['work'] == 'local') {
+        kWorkBase = e;
+        return;
+      }
+    } catch (_) {}
+  }
+  kWorkBase = null; // none advertise local → use the default endpoint for PoW
+}
+
 // On-device signer, built from the local seed. Every write the app publishes (follows, comments,
 // polls, profile, …) is signed HERE and only the signed record is sent — the node never sees the
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.3.8'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.3.9'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -1016,14 +1039,24 @@ class Api {
 
   // broadcast an app-signed state block; the node adds delegated PoW and processes it (no seed)
   static Future<Map<String, dynamic>?> blockProcess(Map<String, dynamic> block, String subtype) async {
-    try {
-      final r = await http.post(Uri.parse('$kBase/api/block_process'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'block': block, 'subtype': subtype}));
-      return jsonDecode(r.body) as Map<String, dynamic>;
-    } catch (_) {
-      return null;
+    // Route delegated PoW to a fast (work:local) node when we have one, then fall back to kBase. A
+    // freshly-signed block is idempotent to re-`process` (same hash), so a fallback can't double-spend —
+    // it just lands the block a slept/unreachable work node couldn't. Skips duplicates in the list.
+    final bases = <String>[if (kWorkBase != null) kWorkBase!, kBase].toSet().toList();
+    final body = jsonEncode({'block': block, 'subtype': subtype});
+    Map<String, dynamic>? last;
+    for (final base in bases) {
+      try {
+        final r = await http.post(Uri.parse('$base/api/block_process'),
+            headers: {'Content-Type': 'application/json'}, body: body);
+        final d = jsonDecode(r.body) as Map<String, dynamic>;
+        if (d['ok'] == true) return d;   // landed — done
+        last = d;                        // a ledger error (fork/old block); retrying elsewhere is harmless
+      } catch (_) {
+        // work node unreachable (home nodes sleep) — fall through to the next base
+      }
     }
+    return last;
   }
 
   // one on-device send of a raw amount to an address; returns the block hash (null on failure)
@@ -5245,6 +5278,7 @@ class _FeedScreenState extends State<FeedScreen> {
     if (kEndpoints.length <= kBootstrapEndpoints.length) {
       unawaited(healEndpointsFromLedger(switchBase: false));
     }
+    unawaited(resolveWorkBase()); // pick a fast-PoW (work:local) node for tip settlement, if any
     _refreshNotifs();    // notifications + raise Android alerts for new like/comment/tip
     _refreshDmBadge();   // mail-icon unread count + launcher badge (fire-and-forget)
     Api.announcement().then((a) { if (mounted) setState(() => _announcement = a); });  // coordinated-event banner
