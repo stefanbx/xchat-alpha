@@ -26,14 +26,23 @@ SEED = '07' * 32
 # used for weeks — and it went unnoticed because `dart` is usually absent and the run aborted first.
 # Calling the real functions keeps the check that actually matters (the DART app and the PYTHON node
 # must agree byte-for-byte) and removes the copy that can silently go stale.
+#
+# EVERY name the app's battery emits must appear here. The comparison is guarded by `name in CANON`,
+# so a missing entry does not fail — it silently downgrades that type to "the signature verifies
+# against the message it was signed over", which is true by construction and proves nothing. dm_key
+# was in exactly that state: reported ok on every run, never once compared against the node's canon.
+#
+# `d` is the whole payload from the Dart side, for the cases that need a value only the app can
+# supply (the DM public key is derived from the seed, so it cannot be a constant here).
 CANON = {
-    'head':          lambda a: xc.sig_canon('head', a, 5, 'bafycid', 9999999),          # xc_post.py
-    'post_event':    lambda a: xc.sig_canon('post', 'you.xno', 'post', 'hello|world', 1700000000),
-    'comment':       lambda a: xc.sig_canon('comment', 'p1', a, 1700000000, 'nice one', ''),
-    'comment_reply': lambda a: xc.sig_canon('comment', 'p1', a, 1700000000, 'replying', 'c0'),
-    'follow':        lambda a: xc.sig_canon('follow', a, 1700000000, 'nano_a,nano_b'),
-    'poll':          lambda a: xc.sig_canon('poll', 'poll1', a, 0, 1700000000),
-    'profile':       lambda a: xc.sig_canon('profile', a, 1700000000, 'Alice', 'my bio', '', ''),
+    'head':          lambda a, d: xc.sig_canon('head', a, 5, 'bafycid', 9999999),        # xc_post.py
+    'post_event':    lambda a, d: xc.sig_canon('post', 'you.xno', 'post', 'hello|world', 1700000000),
+    'comment':       lambda a, d: xc.sig_canon('comment', 'p1', a, 1700000000, 'nice one', ''),
+    'comment_reply': lambda a, d: xc.sig_canon('comment', 'p1', a, 1700000000, 'replying', 'c0'),
+    'follow':        lambda a, d: xc.sig_canon('follow', a, 1700000000, 'nano_a,nano_b'),
+    'poll':          lambda a, d: xc.sig_canon('poll', 'poll1', a, 0, 1700000000),
+    'profile':       lambda a, d: xc.sig_canon('profile', a, 1700000000, 'Alice', 'my bio', '', ''),
+    'dm_key':        lambda a, d: xc.sig_canon('dmkey', a, 1700000000, d['dm_pub']),      # xc_dm.py
 }
 
 
@@ -57,9 +66,17 @@ def main():
 
     for s in d['sigs']:
         name, msg, sig, pub = s['name'], s['msg'], s['sig'], s['pub']
+        # An unknown name is a FAILURE, not a skip. The old `if name in CANON` meant a type the app
+        # emits but this table forgot fell through to the signature check alone — which compares the
+        # message against itself and can never fail. That is how dm_key printed ok for months without
+        # its preimage ever being checked.
+        if name not in CANON:
+            print(f"FAIL  {name}: the app signs this but CANON has no entry — add one, or it is untested")
+            fails += 1
+            continue
         # the app's canonical message must be the one the node rebuilds
-        if name in CANON and CANON[name](acct) != msg:
-            print(f"FAIL  {name}: canonical message differs\n      app:  {msg!r}\n      node: {CANON[name](acct)!r}")
+        if CANON[name](acct, d) != msg:
+            print(f"FAIL  {name}: canonical message differs\n      app:  {msg!r}\n      node: {CANON[name](acct, d)!r}")
             fails += 1
             continue
         if not xc.verify_msg(pub, msg, sig):
@@ -73,7 +90,7 @@ def main():
 
     # a signature from another identity must not pass as this account's
     other = xc.keyof(0x42)
-    forged = dict(l.split(' ', 1) for l in xc._sign_lines(other, CANON['profile'](acct)))
+    forged = dict(l.split(' ', 1) for l in xc._sign_lines(other, CANON['profile'](acct, d)))
     if xc.pub_to_addr(forged['pub']) == acct:
         print("FAIL  a different key derived the same account"); fails += 1
     else:
