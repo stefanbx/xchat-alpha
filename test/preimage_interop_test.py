@@ -8,12 +8,16 @@
 # preimage is still accepted (the transition contract: verifiers take either, signers emit v2).
 #
 #   python3 test/preimage_interop_test.py
-import json, os, subprocess, sys, importlib.util
+import json, os, shutil, subprocess, sys, importlib.util
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SEED = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90'
 POST, TS = 'u1786728999', 1786728999
-DART = os.path.expanduser('~/flutter/bin/dart')
+# PATH first, then the usual local SDK spot. Hard-coding ~/flutter/bin/dart alone meant this test
+# silently skipped its whole cross-language half on any machine that installs Flutter elsewhere —
+# including CI, where it reported "ok" while checking nothing. A skip that looks like a pass is worse
+# than a failure: it is the green tick that made the preimage drift invisible in the first place.
+DART = shutil.which('dart') or os.path.expanduser('~/flutter/bin/dart')
 
 spec = importlib.util.spec_from_file_location('xc', os.path.join(REPO, 'backend', 'xc_common.py'))
 xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
