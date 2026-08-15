@@ -488,7 +488,11 @@ PYCFG
         # exists. The relay's identity is its own keypair, not this hostname, so peers recognise it
         # across the change and replace the old address rather than accumulating dead ones.
         : > "$XC_HOME/tunnel.log"
-        "$CF" tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" >>"$XC_HOME/tunnel.log" 2>&1 &
+        # Expose the NODE (kt_server) when one is running: it serves /api AND proxies every other path to
+        # the relay, so tunnelling 8790 gives a full node (the app needs /api). Relay-only installs tunnel
+        # the relay port.
+        TUNNEL_PORT="$PORT"; [ "$WITH_NODE" = 1 ] && TUNNEL_PORT="$NODE_PORT"
+        "$CF" tunnel --no-autoupdate --url "http://127.0.0.1:$TUNNEL_PORT" >>"$XC_HOME/tunnel.log" 2>&1 &
         CF_PID=$!
         URL=''; i=0
         while [ $i -lt 60 ]; do
@@ -511,6 +515,34 @@ PYCFG
 
     echo "$URL" > "$XC_HOME/public-url.txt"
     log "public url: $URL (mode=$MODE)"
+
+    # Optional Cloudflare Worker front: a stable, short workers.dev url that reverse-proxies to this node.
+    # It fixes two things for a home node — a quick tunnel's hostname is too long for the 32-byte on-chain
+    # announce AND it churns every restart. Drop a worker.conf next to this file (WORKER_URL + KV_NAMESPACE_ID)
+    # and the node keeps the worker's KV pointed at the current tunnel url, then announces the FIXED worker
+    # url on-chain. Without worker.conf we announce the tunnel url directly (only works for hosts <=32 bytes).
+    ANNOUNCE_URL="$URL"
+    if [ -f "$XC_HOME/worker.conf" ]; then
+        . "$XC_HOME/worker.conf"
+        ANNOUNCE_URL="${WORKER_URL:-$URL}"
+        if [ -n "$KV_NAMESPACE_ID" ]; then
+            ( sleep 8
+              PATH="/opt/homebrew/bin:/usr/local/bin:$PATH:/usr/bin:/bin"   # find node/npx in a service env
+              command -v npx >/dev/null 2>&1 &&
+                npx wrangler kv key put --remote --namespace-id="$KV_NAMESPACE_ID" backend "$URL" \
+                  >>"$XC_HOME/kv-update.log" 2>&1
+            ) &
+        fi
+    fi
+    # Register the node on the XNO ledger so the app can rediscover it from an unstoppable source.
+    # Idempotent (xc_reldir ensure re-commits only when the announced url changed); needs a one-time-funded
+    # operator seed in operator.seed. Backgrounded + non-fatal: it never blocks serving.
+    if [ "$WITH_NODE" = 1 ] && [ -s "$XC_HOME/operator.seed" ]; then
+        ( sleep 25
+          XC_RELAY_OPERATOR_SEED="$(cat "$XC_HOME/operator.seed")" NODE_PUBLIC_URL="$ANNOUNCE_URL" \
+            "$PY" "$XC_HOME/node/xc_reldir.py" ensure "$ANNOUNCE_URL" >>"$XC_HOME/selfannounce.log" 2>&1
+        ) &
+    fi
     AWAKE=$(awake_prefix)
     on_power && log "on mains power — will stay awake to serve" || log "on battery — will sleep normally"
     RELAY_PUBLIC_URL="$URL" $AWAKE "$PY" "$XC_HOME/xc_relayd.py" "$PORT" "$XC_HOME/relay-state.json" $BOOTSTRAP &
