@@ -1,6 +1,6 @@
 # ӾChat — a censorship-free X, discovered on the XNO ledger
 
-**Alpha whitepaper · v0.3 · app v2.3.4**
+**Alpha whitepaper · v0.3 · app v2.3.5**
 
 ӾChat is a Twitter/X-style social app for phones with no company, no server account, and
 no removable point of control. Your identity is a cryptographic keypair, your posts are

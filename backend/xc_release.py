@@ -5,6 +5,8 @@
 # the publisher signature + hash, then installs. GitHub is a mirror, not the root of trust —
 # the signature is. Takedown of any one relay doesn't stop updates.
 # Usage: xc_release.py keygen    (create the publisher key ONCE, outside the repo)
+#        xc_release.py rootkeygen (create the OFFLINE revocation root, once — issue #10)
+#        xc_release.py revoke <successor-account>  (answer a leaked publisher key)
 #        xc_release.py publish   (reads /tmp/xc_rel_{apk,version,changelog}.txt)
 #        xc_release.py check     (reads /tmp/xc_rel_current.txt  -> newest signed release)
 #        xc_release.py fetch      (reads /tmp/xc_rel_{cid,sha}.txt -> verified APK on disk)
@@ -97,6 +99,46 @@ if mode == 'keygen':
           f'publisher account: {addr}\n\n'
           f'Pin it: set PUBLISHER_PINNED in this file (or XC_PUBLISHER_ACCOUNT) to that account.\n'
           f'BACK THE KEY UP. Lose it and you cannot sign another update; leak it and someone else can.')
+
+elif mode == 'rootkeygen':
+    # The OFFLINE ROOT key. It signs one thing only — a revocation naming a successor publisher — so it
+    # is used approximately never and should live somewhere the build machine is not: a hardware token,
+    # a paper backup, an offline box. Generating it here writes 0600 outside the repo, exactly like the
+    # publisher key; MOVE IT off this machine afterwards. Pin the printed account as
+    # XC_REVOCATION_ACCOUNT on relays and in the app before it can do anything.
+    import secrets
+    path = os.path.expanduser(os.environ.get('XC_ROOT_KEY_FILE', '~/.xchat/root.key'))
+    if os.path.exists(path):
+        print(f'refusing to overwrite {path} — a root key already exists there'); sys.exit(1)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    k = secrets.token_hex(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(fd, k.encode()); os.close(fd)
+    print(f'root key written to {path} (0600)')
+    print(f'pin this account:  XC_REVOCATION_ACCOUNT={xc.derive(k)[0]}')
+    print('MOVE THE KEY OFF THIS MACHINE. It is the only answer to a leaked publisher key.')
+
+elif mode == 'revoke':
+    # xc_release.py revoke <successor-account>   — signs with the offline root key
+    path = os.path.expanduser(os.environ.get('XC_ROOT_KEY_FILE', '~/.xchat/root.key'))
+    try:
+        rootk = open(path).read().strip()
+    except Exception:
+        print(f'no root key at {path} — run `xc_release.py rootkeygen` (offline) first'); sys.exit(1)
+    successor = sys.argv[2] if len(sys.argv) > 2 else ''
+    ts = int(time.time())
+    rec = {'revoked': PUBLISHER, 'successor': successor, 'ts': ts}
+    d = dict(l.split(' ', 1) for l in xc._sign_lines(rootk, xc.sig_canon('revocation', PUBLISHER, successor, ts)))
+    rec['sig'] = d['sig']; rec['pub'] = d['pub']
+    sent = 0
+    for r in RELAYS:
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                r + '/revoke', json.dumps(rec).encode(), {'Content-Type': 'application/json'}), timeout=10).read()
+            sent += 1
+        except Exception:
+            pass
+    print(json.dumps({'ok': True, 'revoked': PUBLISHER, 'successor': successor, 'relays': sent}, indent=2))
 
 elif mode == 'publish':
     key = publisher_key()
