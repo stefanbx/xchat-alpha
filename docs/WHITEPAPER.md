@@ -1,6 +1,6 @@
 # ӾChat — a censorship-free X, discovered on the XNO ledger
 
-**Alpha whitepaper · v0.2 · app v2.2.7**
+**Alpha whitepaper · v0.3 · app v2.3.4**
 
 ӾChat is a Twitter/X-style social app for phones with no company, no server account, and
 no removable point of control. Your identity is a cryptographic keypair, your posts are
@@ -548,6 +548,18 @@ now shipped:
   path-derived entries (the AOT snapshot's embedded source URI and a 20-byte ELF build-id), which the
   fixed canonical path in the container removes. So anyone can rebuild from the open source and confirm
   the released binary **is** the published code — trust in an update rests on readable code, not a key.
+
+- **Anyone can run a relay, and a browser can be the client (v2.3.4).** One command installs a relay
+  with a free tunnel, a loopback-only settings page, and a login service — so contributing no longer
+  requires a public IP or a sysadmin. The same app now also runs **in a browser** at any node's
+  `/chat`, with a BigInt ed25519-blake2b for the web (JavaScript has no 64-bit integers, so the
+  Android signer's arithmetic cannot compile there) checked byte-for-byte against the Android
+  implementation and against the node's independent Python verifier. Relays hold a hash-placed
+  **share** of the corpus rather than a copy of everything, keep a stable identity across address
+  changes, and — where the machine has a GPU — sell the **proof-of-work** that tips wait on, which
+  nodes discover by gossip and verify before use. Honest limits: a browser has no keystore, so the
+  client says so and points anyone holding real value at the phone; and the GPU signer's BigInt
+  arithmetic is not constant-time.
 
 **How that claim is tested.** `test/interop_test.py` signs one canonical message per write path with
 the *shipped* app wallet (Dart/nanodart) and verifies each with the *shipped* node verifier
