@@ -760,10 +760,13 @@ ensure_ipfs() {
         log "ipfs not installed — the node serves fine, but posting (which pins to IPFS) will fail"
         return 0
     fi
-    if ipfs repo stat >/dev/null 2>&1; then                       # already a working repo
+    # By CONFIG, not by `ipfs repo stat`: stat also fails on a repo that is merely out of date after a
+    # kubo upgrade, and calling that "not a working repo" sent us on to `ipfs init`, which then failed
+    # too and logged "posting will fail" about a repo that was perfectly fine.
+    if [ -f "$IPFS_PATH/config" ]; then
         return 0
     fi
-    if [ -d "$IPFS_PATH" ] && [ -n "$(ls -A "$IPFS_PATH" 2>/dev/null)" ] && [ ! -f "$IPFS_PATH/config" ]; then
+    if [ -d "$IPFS_PATH" ] && [ -n "$(ls -A "$IPFS_PATH" 2>/dev/null)" ]; then
         log "IPFS repo at $IPFS_PATH looks half-built (no config) — leaving it untouched;"
         log "  inspect it, then run:  IPFS_PATH=$IPFS_PATH ipfs init"
         return 0

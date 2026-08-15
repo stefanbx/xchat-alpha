@@ -27,10 +27,18 @@ rm -f "$IPFS_PATH/repo.lock"        # a hard restart can leave a stale lock that
 # unusable — blocks present, config or blocks/SHARDING missing — and init REFUSES that rather than
 # repairing it. The container then starts, serves reads, and fails every post with no signal at all.
 # Init only when there is no working repo, then say plainly whether there is one.
-ipfs repo stat >/dev/null 2>&1 || ipfs init >/dev/null 2>&1 || true
-if ! ipfs repo stat >/dev/null 2>&1; then
-    echo "WARNING: no usable IPFS repo at $IPFS_PATH — posting will fail (reads still work)"
-    echo "WARNING: if the directory is non-empty but has no config, it is half-built; inspect it"
+# Judge the repo by its CONFIG, not by `ipfs repo stat`. stat also fails on a repo that is merely
+# OUT OF DATE — which is what a kubo upgrade produces — so using it as the arbiter reported a healthy
+# fs-repo@15 as "no usable IPFS repo, posting will fail" seconds before the daemon migrated it to @18
+# and served fine. A warning that cries wolf is how the real one gets ignored.
+if [ -f "$IPFS_PATH/config" ]; then
+    :                                # a real repo; --migrate below handles any version skew
+elif [ -n "$(ls -A "$IPFS_PATH" 2>/dev/null)" ]; then
+    echo "WARNING: $IPFS_PATH is non-empty but has no config — a half-built repo, left untouched"
+    echo "WARNING: posting will fail until it is a usable repo; inspect it, then run: ipfs init"
+else
+    ipfs init >/dev/null 2>&1 || true
+    [ -f "$IPFS_PATH/config" ] || echo "WARNING: could not create an IPFS repo at $IPFS_PATH — posting will fail"
 fi
 ipfs config --json Addresses.Gateway '"/ip4/127.0.0.1/tcp/8081"' >/dev/null 2>&1 || true
 # --migrate: this repo is fs-repo@15 and kubo v0.43 wants @18. Without the flag kubo asks at a
