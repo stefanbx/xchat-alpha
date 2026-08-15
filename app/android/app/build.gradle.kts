@@ -53,6 +53,12 @@ android {
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName(if (hasReleaseKey) "release" else "debug")
+            // NOTE: a universal APK carries the native libs (libflutter.so + libapp.so) once PER ABI, so
+            // the default build ships arm64-v8a + armeabi-v7a + x86_64 — and x86_64 is emulator-only dead
+            // weight (~10 MB) that no real phone runs. `ndk.abiFilters` here is IGNORED by `flutter build
+            // apk` (Flutter injects -Ptarget-platform=all), so the distributed release MUST be built with:
+            //   flutter build apk --release --target-platform android-arm64,android-arm
+            // which drops x86_64 and cuts the download ~26.9 MB -> ~18 MB while excluding no real device.
         }
     }
 
