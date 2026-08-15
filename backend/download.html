@@ -55,6 +55,18 @@
   .why{display:grid;gap:12px}
   .why div{padding-left:16px;border-left:2px solid rgba(44,166,224,.4)}
   .why b{color:#fff}
+  .cta2{display:block;width:100%;text-align:center;cursor:pointer;font:inherit;text-decoration:none;
+    background:rgba(79,209,197,.10);border:1px solid rgba(79,209,197,.42);color:var(--accent2);
+    font-weight:700;font-size:16px;padding:15px 18px;border-radius:12px;transition:background .15s ease}
+  .cta2:hover{background:rgba(79,209,197,.17)}
+  .cta2:active{transform:translateY(1px)}
+  .cta2.done{background:rgba(56,193,114,.14);border-color:rgba(56,193,114,.5);color:var(--good)}
+  .cmd{display:flex;align-items:center;gap:10px;background:#080b0d;border:1px solid var(--line);
+    border-radius:10px;padding:12px;margin:12px 0 0;overflow-x:auto}
+  /* wraps rather than scrolls: a half-visible command reads as a broken page to the people this
+     section is written for, and it's the one snippet here they're meant to run */
+  .cmd code{font-size:12.5px;color:var(--accent2);white-space:pre-wrap;word-break:break-word}
+  .cmd .p{color:var(--muted);user-select:none}
   .foot{text-align:center;color:var(--muted);font-size:13px;margin-top:32px;line-height:1.9}
   .foot a{color:var(--accent);text-decoration:none}
   .foot a:hover{text-decoration:underline}
@@ -77,9 +89,15 @@
 
   <a class="cta" href="https://github.com/stefanbx/xchat-alpha/raw/master/apk/xchat-alpha.apk">
     Download for Android
-    <small>signed APK · 20 MB · verify the checksum below</small>
+    <small>signed APK · 18 MB · v2.3.4 · verify the checksum below</small>
   </a>
-  <p class="osnote">Android only for now (Apple gates sideloading). iOS is on the roadmap.</p>
+  <a class="cta2" href="/chat" style="max-width:420px;margin:0 auto 12px;display:block">
+    Or open it right here in your browser
+    <small style="display:block;font-weight:500;font-size:12.5px;opacity:.8;margin-top:3px">
+      no install, no app store · same app, running on this page</small>
+  </a>
+  <p class="osnote">The Android app keeps your key in the phone's keystore — the safest place for an
+     account holding real value. The browser is for reading, trying it, and posting from a laptop.</p>
 
   <div class="card">
     <h2>Install (60 seconds)</h2>
@@ -93,7 +111,7 @@
   <div class="card">
     <h2>Verify it's the real build</h2>
     <p class="muted" style="margin:0 0 10px">SHA-256 of <span class="mono">xchat-alpha.apk</span>:</p>
-    <div class="hash">bc93eb567b27fb470f05ab0d0f6f5fdd81b7c8ac6efb7bd7d21180314ba7f86f</div>
+    <div class="hash">f933ce78c2f9aa102d12e526b1c591c82faaeff2fd50620aae027a69b94de051</div>
     <div class="verify">shasum -a 256 xchat-alpha.apk</div>
     <p class="muted" style="margin:12px 0 0;font-size:13px">The whole app is open source and the build is
        reproducible — you can rebuild this exact APK yourself from the repo.</p>
@@ -109,6 +127,38 @@
     </div>
   </div>
 
+  <div class="card">
+    <h2>Run a relay — one command</h2>
+    <p class="muted" style="margin:0 0 6px">A relay is what makes ӾChat hard to switch off: it keeps
+       everyone's signed posts and hands them out. The more people run one, the less any single
+       machine matters. <b style="color:var(--ink)">You don't need to be technical</b> — and you don't
+       need a server. A spare laptop is fine.</p>
+    <ol class="steps" style="margin:16px 0 0">
+      <li>Open <b>Terminal</b> — on a Mac press <b>⌘ Space</b>, type <i>terminal</i>, hit Enter.</li>
+      <li>Tap the button, <b>paste</b> into the black window (<b>⌘ V</b>), press <b>Enter</b>.</li>
+      <li>That's it. It prints your relay's web address, gives you a settings page and an
+          <span class="mono">xchat</span> command, and starts itself every time you log in.</li>
+    </ol>
+    <div class="cmd"><span class="p">$</span><code id="cmd">curl -fsSL https://xchat-alpha-node.fly.dev/relay.sh | sh</code></div>
+    <button class="cta2" id="copy" style="margin-top:12px" type="button">Copy the install command</button>
+    <p class="muted" style="margin:14px 0 0;font-size:13px">
+      It installs into one folder in your home directory and opens a free Cloudflare tunnel, so it
+      works behind a home router — no ports to forward, no account to make. Nothing else on your
+      machine is touched, and it holds no key to your money: a relay stores signed bytes, it can't
+      post or spend as anyone. It does make itself a permanent <b style="color:var(--ink)">identity</b>
+      on first run, so it stays the same relay to everyone else even when your machine's address
+      changes. It stores a <b style="color:var(--ink)">share</b> of the network rather than a copy of
+      everything, and if your computer has a GPU it also computes the proof-of-work that makes
+      everyone's tips settle in seconds — which you get paid for, like pinning. Add
+      <span class="mono" style="color:var(--accent2)">--with-node</span> to also run your own node, or
+      <span class="mono" style="color:var(--accent2)">--domain your.host</span> for a fixed address.
+      Read it before you run it — <a href="https://github.com/stefanbx/xchat-alpha/blob/master/relay/install-relay.sh"
+      style="color:var(--accent);text-decoration:none">it's plain, commented shell</a>, and that URL
+      serves the same text in your browser. To remove it later:
+      <span class="mono" style="color:var(--accent2)">sh ~/.xchat-relay/install-relay.sh --uninstall</span>.
+    </p>
+  </div>
+
   <p class="foot">
     Source &amp; checksums → <a href="https://github.com/stefanbx/xchat-alpha">github.com/stefanbx/xchat-alpha</a><br>
     How it works → <a href="https://github.com/stefanbx/xchat-alpha/blob/master/docs/WHITEPAPER.md">read the whitepaper</a><br>
@@ -116,5 +166,37 @@
   </p>
 
 </div>
+<script>
+// Copy-to-clipboard for the relay one-liner. navigator.clipboard needs a secure context, which the
+// node has (force_https) — the textarea path covers plain-http mirrors and older browsers.
+(function () {
+  var btn = document.getElementById('copy'), cmd = document.getElementById('cmd');
+  if (!btn || !cmd) return;
+  btn.addEventListener('click', function () {
+    var text = cmd.textContent, done = function (okay) {
+      btn.textContent = okay ? 'Copied — now paste it into Terminal' : 'Press ⌘C to copy it';
+      btn.classList.toggle('done', okay);
+      setTimeout(function () { btn.textContent = 'Copy the install command'; btn.classList.remove('done'); }, 4000);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { fallback(); });
+    } else { fallback(); }
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      var okay = false;
+      try { okay = document.execCommand('copy'); } catch (e) { okay = false; }
+      document.body.removeChild(ta);
+      // nothing copied: leave the command selected so the reader can just hit ⌘C
+      if (!okay && window.getSelection) {
+        var r = document.createRange(); r.selectNodeContents(cmd);
+        var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+      }
+      done(okay);
+    }
+  });
+})();
+</script>
 </body>
 </html>

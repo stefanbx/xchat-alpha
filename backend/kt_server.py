@@ -42,6 +42,46 @@ except Exception:
                      '<p><a style="color:#2ca6e0" href="https://github.com/stefanbx/xchat-alpha">Source &amp; checksums</a></p></body>')
 DOWNLOAD_PATHS = ('/', '/download', '/get', '/app')
 
+# The one-command relay installer, served next to the download page so the short, memorable
+# `curl -fsSL <node>/relay.sh | sh` on the landing page resolves to ӾChat's own infra rather than a
+# code-hosting account someone can suspend. Served as text/plain ON PURPOSE: piping a script into a
+# shell is only defensible if the same URL renders as readable source in a browser first.
+RELAY_INSTALLER = ''
+for _p in (os.path.join(HERE, 'install-relay.sh'),                    # staged flat (deploy)
+           os.path.join(HERE, '..', 'relay', 'install-relay.sh')):    # repo layout
+    try:
+        with open(_p, encoding='utf-8') as _f:
+            RELAY_INSTALLER = _f.read()
+        break
+    except Exception:
+        pass
+RELAY_INSTALL_PATHS = ('/relay.sh', '/install-relay.sh')
+
+# The Flutter web build of the app, served from this node at /chat. Same origin as /api/*, which is
+# the point: the browser talks to the node that handed it the page — no CORS, no third-party host,
+# and a laptop can use ӾChat with no APK at all. Staged by deploy.sh from app/build/web; absent in a
+# plain checkout (it's a build artifact), in which case /chat simply says so.
+WEB_APP_DIR = ''
+for _p in (os.path.join(HERE, 'web'), os.path.join(HERE, '..', 'app', 'build', 'web')):
+    if os.path.isdir(_p):
+        WEB_APP_DIR = os.path.realpath(_p)
+        break
+WEB_TYPES = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+             '.json': 'application/json', '.css': 'text/css', '.wasm': 'application/wasm',
+             '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml',
+             '.ttf': 'font/ttf', '.otf': 'font/otf', '.woff': 'font/woff', '.woff2': 'font/woff2',
+             '.ico': 'image/x-icon', '.bin': 'application/octet-stream', '.symbols': 'text/plain'}
+
+def web_app_file(path):
+    # Resolve a /chat/... request to a file inside the build, or None. Every path is realpath'd and
+    # checked to still be under the build dir, so '..' segments (or a symlink planted in it) can't
+    # walk out and serve, say, the node's own source.
+    rel = path[len('/chat'):].lstrip('/') or 'index.html'
+    full = os.path.realpath(os.path.join(WEB_APP_DIR, rel))
+    if not (full == WEB_APP_DIR or full.startswith(WEB_APP_DIR + os.sep)) or not os.path.isfile(full):
+        return None
+    return full
+
 def _env():
     return {**os.environ, 'XC_NS': NS,
             'PATH': os.environ.get('PATH', '/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin')}
@@ -185,9 +225,13 @@ def api_account_state(acct):
     except Exception as e:
         return json.dumps({'ok': False, 'error': f'ledger unreachable: {e}'})
     if 'error' in ai:                                        # unopened account: the app will send an OPEN block
-        return json.dumps({'opened': False, 'frontier': '0' * 64, 'balance': '0', 'representative': acct})
+        return json.dumps({'opened': False, 'frontier': '0' * 64, 'balance': '0',
+                           'representative': acct, 'block_count': 0})
     return json.dumps({'opened': True, 'frontier': ai['frontier'], 'balance': ai['balance'],
-                       'representative': ai.get('representative', acct)})
+                       'representative': ai.get('representative', acct),
+                       # total blocks on this account's chain = every on-chain transaction it has made
+                       # (opens/receives/sends/changes). The app shows this as the user's "Nano txns".
+                       'block_count': int(ai.get('block_count', 0) or 0)})
 
 def api_receivables(acct):
     try:
@@ -264,6 +308,48 @@ def api_head(acct):
     if not best:
         return json.dumps({'ok': True, 'head': None})
     return json.dumps({'ok': True, 'head': {'seq': best['seq'], 'cid': best['cid'], 'handle': best.get('handle', '')}})
+
+_PRESENCE_WINDOW = float(os.environ.get('XC_PRESENCE_WINDOW', '150'))   # seconds a head stays "online"
+def api_presence():
+    # Accounts online right now = those whose signed head was refreshed within the presence window.
+    # The app republishes its head every ~45s while open (see Api.republish), and the relay stamps each
+    # head's receive time as `ts`, so a fresh head ≈ an open app. A public read across relays (max ts
+    # per account), no seed, no per-account tracking beyond the head every account already publishes.
+    now = time.time()
+    latest = {}
+    for r in xc.discover_relays():
+        try:
+            for h in json.loads(urllib.request.urlopen(r + '/heads', timeout=3).read()).get('heads', []):
+                a = h.get('author'); ts = float(h.get('ts', 0) or 0)
+                if a and ts > 0:
+                    latest[a] = max(latest.get(a, 0.0), ts)
+        except Exception:
+            pass
+    online = [a for a, ts in latest.items() if now - ts <= _PRESENCE_WINDOW]
+    return json.dumps({'ok': True, 'online': online, 'window': int(_PRESENCE_WINDOW)})
+
+def api_channels():
+    # Directory of channels across relays: union by account, taking the max online/follower counts a
+    # relay reports (relays converge but may lag). Public read; the relay computes the per-channel
+    # follower + online-reader tallies from its own profiles/follows/heads.
+    merged = {}
+    for r in xc.discover_relays():
+        try:
+            for c in json.loads(urllib.request.urlopen(r + '/channels', timeout=4).read()).get('channels', []):
+                a = c.get('account')
+                if not a:
+                    continue
+                m = merged.get(a)
+                if m is None:
+                    merged[a] = dict(c)
+                else:
+                    m['online'] = max(m.get('online', 0), c.get('online', 0))
+                    m['followers'] = max(m.get('followers', 0), c.get('followers', 0))
+                    if not m.get('display'): m['display'] = c.get('display', '')
+                    if not m.get('avatar'): m['avatar'] = c.get('avatar', '')
+        except Exception:
+            pass
+    return json.dumps({'ok': True, 'channels': list(merged.values())})
 
 RELAYDIR_TTL = float(os.environ.get('XC_RELAYDIR_TTL', '180'))
 _relaydir_ts = [0.0]
@@ -467,6 +553,8 @@ def route(path, query, body):
         with ipc_lock('release'):
             put('/tmp/xc_rel_cid.txt', b('cid')); put('/tmp/xc_rel_sha.txt', b('sha256')); spawn('xc_release.py','fetch'); return read('/tmp/xc_release_result.json','{}')
 
+    if path.startswith('/api/channels'):     return api_channels()           # channel directory + online readers
+    if path.startswith('/api/presence'):     return api_presence()           # accounts online now (fresh heads)
     if path.startswith('/api/head'):         return api_head(q('account'))   # app re-signs it to republish (seedless)
     if path.startswith('/api/gossip'):
         with ipc_lock('gossip'):
@@ -506,6 +594,35 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_text(self, text, status=200):
+        data = text.encode() if isinstance(text, str) else text
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Cache-Control', 'public, max-age=300')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_file(self, path):
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+        except Exception:
+            return self._send_text('not found', 404)
+        ext = os.path.splitext(path)[1].lower()
+        self.send_response(200)
+        self.send_header('Content-Type', WEB_TYPES.get(ext, 'application/octet-stream'))
+        self.send_header('Content-Length', str(len(data)))
+        # index.html must never be cached or a redeploy leaves browsers on the old shell forever;
+        # everything else is content-hashed or versioned by the Flutter loader, so cache it hard.
+        if os.path.basename(path) in ('index.html', 'flutter_bootstrap.js', 'version.json'):
+            self.send_header('Cache-Control', 'no-cache')
+        else:
+            self.send_header('Cache-Control', 'public, max-age=604800')
+        self.end_headers()
+        self.wfile.write(data)
+
     def _proxy_relay(self, raw):
         # Forward a relay-owned request to the loopback relay, verbatim (method + path + query + body).
         # Pass the REAL client IP so the relay throttles per-attacker: without this every proxied write
@@ -527,9 +644,43 @@ class H(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         if self.command == 'GET' and u.path in DOWNLOAD_PATHS:  # human landing / download page (front door)
             return self._send_html(DOWNLOAD_PAGE)
+        if self.command == 'GET' and (u.path == '/chat' or u.path.startswith('/chat/')):
+            if not WEB_APP_DIR:
+                return self._send_html('<!doctype html><meta charset=utf-8><title>ӾChat</title>'
+                                       '<body style="background:#050607;color:#eef3f7;font-family:sans-serif;'
+                                       'text-align:center;padding:14vh 6vw"><h1>ӾChat for the browser</h1>'
+                                       '<p>This node is running without the web build staged.</p>'
+                                       '<p><a style="color:#2ca6e0" href="/">Get the Android app instead</a></p></body>')
+            f = web_app_file(u.path)
+            if f is None:
+                # Unknown path under /chat: hand back the app shell so a deep link still boots it.
+                f = os.path.join(WEB_APP_DIR, 'index.html')
+                if not os.path.isfile(f):
+                    return self._send_text('web build incomplete', 404)
+            return self._send_file(f)
+        if self.command == 'GET' and u.path in RELAY_INSTALL_PATHS:   # one-command relay installer
+            if not RELAY_INSTALLER:
+                return self._send_text('# installer not staged on this node; see\n'
+                                       '# https://github.com/stefanbx/xchat-alpha/blob/master/relay/install-relay.sh\n', 404)
+            return self._send_text(RELAY_INSTALLER)
         if not u.path.startswith('/api/') and u.path != '/':   # /api/* is kt_server's; the rest is the relay's
             return self._proxy_relay(raw)
         self._send(route(u.path, urllib.parse.parse_qs(u.query), body))
+
+    def do_OPTIONS(self):
+        # CORS PREFLIGHT. Responses already carry Access-Control-Allow-Origin, which is enough for the
+        # app's GETs — but a POST with Content-Type: application/json is not a "simple" request, so the
+        # browser sends OPTIONS first and refuses to send the real request unless it is answered. With
+        # no handler here BaseHTTPRequestHandler replies 501 without CORS headers, so from a browser
+        # every signed WRITE (post, tip, dm key, engagement) failed while reads worked — invisible
+        # unless you check the console. Same-origin use (the app served at /chat) never hit this.
+        self.send_response(204)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Max-Age', '86400')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
 
     def do_GET(self):
         try:

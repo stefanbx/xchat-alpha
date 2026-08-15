@@ -45,12 +45,12 @@ seed** — and post.  ·  **Read the design** → [`docs/WHITEPAPER.md`](docs/WH
 
 ## Install the app
 
-Download `apk/xchat-alpha.apk` (**v2.2.7**) onto an Android phone and open it (allow "install from
+Download `apk/xchat-alpha.apk` (**v2.3.4**) onto an Android phone and open it (allow "install from
 this source" once). **Verify it first:**
 
 ```
 sha256sum xchat-alpha.apk
-# expected: bc93eb567b27fb470f05ab0d0f6f5fdd81b7c8ac6efb7bd7d21180314ba7f86f
+# expected: f933ce78c2f9aa102d12e526b1c591c82faaeff2fd50620aae027a69b94de051
 ```
 
 Signing certificate SHA-256: `d3c83e1a08edc6339a95489bce6cd017e10c921272af15429aa07a9919b7788e`
@@ -88,6 +88,41 @@ node + a relay + IPFS into one image (`fly deploy`). The reference hosted node r
 ## Run your own relay
 
 A relay is pure Python and stores only signed bytes.
+
+**The one-command way** (macOS/Linux) — for anyone who'd rather not think about any of the below:
+
+```bash
+curl -fsSL https://xchat-alpha-node.fly.dev/relay.sh | sh
+```
+
+[`relay/install-relay.sh`](relay/install-relay.sh) installs into `~/.xchat-relay`, opens a free
+Cloudflare quick tunnel so a laptop behind NAT still gets a reachable `https://` URL, and registers
+the relay to start at login (launchd / systemd `--user`). The relay binds to loopback only — the
+tunnel is the sole way in. `--status` shows the URL, `--uninstall` removes everything. The same URL
+serves the script as plain text, so read it first.
+
+A quick tunnel's hostname changes on every restart, so **a relay's identity is its own keypair, not
+its URL**. Each relay generates one on first run (kept beside its state file, holds no funds) and
+signs `relay_announce` records binding *account → current url*. Peers key on the account, so a relay
+that comes back at a new address **replaces** its old entry instead of leaving a dead one behind, and
+because the record is signed it can be gossiped on by any peer without that peer being able to alter
+the URL. Relays also re-probe what they know and forget a URL after `XC_RELAY_FAIL_MAX` consecutive
+failures — so address churn is self-healing rather than cumulative. Relays that predate this still
+interoperate: `/relays` keeps its flat url list and unsigned announces are accepted as before.
+
+**Want a permanent address instead?** Point a hostname at the machine and pass it:
+
+```bash
+sh ~/.xchat-relay/install-relay.sh --domain relay.example.com
+sh ~/.xchat-relay/install-relay.sh --domain relay.example.com --tunnel-token <cloudflare-token>
+```
+
+The first assumes you route that name to `127.0.0.1:7401` yourself (reverse proxy, existing tunnel);
+the second runs a Cloudflare *named* tunnel, whose hostname is permanent. With a stable name of 32
+characters or fewer you can also announce it on-chain (below) and be discovered with no bootstrap at
+all — the installer prints the exact command but never handles your seed.
+
+**By hand**, if you want the pieces where you can see them:
 
 ```bash
 cd relay

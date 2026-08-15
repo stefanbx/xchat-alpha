@@ -16,7 +16,7 @@ def rd(p, d=''):
     return open(p).read().strip() if os.path.exists(p) else d
 
 def canon(poll_id, account, option, ts):
-    return f"{poll_id}|{account}|{option}|{ts}"
+    return xc.sig_canon('poll', poll_id, account, option, ts)
 
 def verify(pub, msg, sig):
     try:

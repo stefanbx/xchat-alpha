@@ -19,7 +19,7 @@ def rd(p, d=''):
         return d
 
 def canon(post_id, account, ts, text, parent=''):
-    return f"{post_id}|{account}|{ts}|{text}|{parent}"
+    return xc.sig_canon('comment', post_id, account, ts, text, parent)
 
 def verify(pub, msg, sig):
     try:

@@ -3,8 +3,10 @@
 // verifier. The node only relays already-signed payloads and reads the ledger — it holds no seed.
 import 'dart:convert';
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:nanodart/nanodart.dart';
 import 'package:pinenacl/x25519.dart' as pnacl;
+import 'crypto/ed25519_blake2b.dart' as webed;
 
 class NanoWallet {
   final String seed; // 64 hex — held only here, only on this device
@@ -12,9 +14,26 @@ class NanoWallet {
   late final String pub;      // 32-byte public key, hex
   late final String account;  // nano_ address
 
+  // The curve arithmetic — and ONLY the curve arithmetic — differs by platform. nanodart signs
+  // through a TweetNaCl port built on Uint64List, which dart2js cannot compile 64-bit ints for, so in
+  // a browser every derivation and signature throws. Web therefore goes through the BigInt
+  // implementation in crypto/ed25519_blake2b.dart, which is checked byte-for-byte against nanodart
+  // (test/ed25519_blake2b_test.dart) and against the node's Python verifier (test/crosscheck_nanopy.sh).
+  // Android is deliberately left on nanodart: it is what every existing install has always signed
+  // with, and this change must not be able to touch it.
+  static Uint8List _b(String hex) => NanoHelpers.hexToBytes(hex);
+  static String _h(Uint8List b) => NanoHelpers.byteToHex(b).toLowerCase();
+
+  /// Sign a hex-encoded payload (a 32-byte block hash, or a canonical message already hex-encoded).
+  String _signHex(String payloadHex) => kIsWeb
+      ? _h(webed.signDetached(_b(payloadHex), _b(priv), publicKey: _b(pub)))
+      : NanoSignatures.signBlock(payloadHex, priv).toLowerCase();
+
   NanoWallet(this.seed) {
-    priv = NanoKeys.seedToPrivate(seed, 0);
-    pub = NanoKeys.createPublicKey(priv).toLowerCase();
+    priv = NanoKeys.seedToPrivate(seed, 0);   // Blake2b only (pointycastle Register64) — web-safe
+    pub = kIsWeb
+        ? _h(webed.publicKeyFromSecret(_b(priv)))
+        : NanoKeys.createPublicKey(priv).toLowerCase();
     account = NanoAccounts.createAccount(NanoAccountType.NANO, pub);
   }
 
@@ -23,12 +42,10 @@ class NanoWallet {
 
   /// Sign an arbitrary canonical message (head, comment, follow, poll, profile, dm-key).
   /// Returns {sig, pub} — matches the server-side signer byte-for-byte.
-  Map<String, String> signMsg(String msg) =>
-      {'sig': NanoSignatures.signBlock(_hex(msg), priv).toLowerCase(), 'pub': pub};
+  Map<String, String> signMsg(String msg) => {'sig': _signHex(_hex(msg)), 'pub': pub};
 
   /// Sign a 32-byte Nano state-block hash (tips / send / representative change).
-  String signBlockHash(String hash32Hex) =>
-      NanoSignatures.signBlock(hash32Hex, priv).toLowerCase();
+  String signBlockHash(String hash32Hex) => _signHex(hash32Hex);
 
   /// The 32-byte public key (hex) of any nano_ address — a send's `link`, and it validates the shape.
   String pubOf(String addr) => NanoAccounts.extractPublicKey(addr).toLowerCase();
@@ -56,23 +73,53 @@ class NanoWallet {
     };
   }
 
-  // ---- canonical message builders (must match the node's helpers exactly) ----
-  String headMsg(int seq, String cid, int expires) => '$account|$seq|$cid|$expires';
-  String postEventMsg(String handle, String kind, String text, int ts) => '$handle|$kind|$text|$ts';
-  String commentMsg(String postId, int ts, String text, String parent) =>
-      '$postId|$account|$ts|$text|$parent';
-  String followMsg(int ts, List<String> follows) {
-    final s = [...follows]..sort();
-    return '$account|$ts|${s.join(',')}';
+  /// A CHANNEL is a distinct publishing identity: its own keypair, deterministically derived from this
+  /// seed so it's restorable on any device from the same seed, and followable like any account.
+  /// channelSeed = blake2b256(seed || "xchat-channel:" + name). Returns a NanoWallet you sign with to
+  /// publish/manage the channel.
+  NanoWallet channelWallet(String name) {
+    final cs = Blake2b.digest256([
+      _bytesOfHex(seed),
+      Uint8List.fromList(utf8.encode('xchat-channel:${name.trim().toLowerCase()}')),
+    ]);
+    return NanoWallet(_hexOfBytes(cs));
   }
-  String pollMsg(String pollId, String option, int ts) => '$pollId|$account|$option|$ts';
+
+  // ---- canonical message builders (must match the node's helpers exactly) ----
+  // Unambiguous signing preimage — the exact mirror of the node's xc_common.sig_canon (issue #2):
+  // a domain+type tag so a signature for one message type can't be replayed as another, and each
+  // field length-prefixed by its UTF-8 byte count so a '|' inside free text can't shift boundaries
+  // and collide two different tuples. Signed as UTF-8 bytes. HARD wire break: keep in lockstep with
+  // the node; old-format signatures no longer verify.
+  String sigCanon(String type, List<Object> fields) {
+    var out = 'xchat/sig/v2/$type';
+    for (final f in fields) {
+      final s = f is String ? f : f.toString();
+      out += '|${utf8.encode(s).length}:$s';
+    }
+    return out;
+  }
+
+  String headMsg(int seq, String cid, int expires) => sigCanon('head', [account, seq, cid, expires]);
+  String postEventMsg(String handle, String kind, String text, int ts) =>
+      sigCanon('post', [handle, kind, text, ts]);
+  String commentMsg(String postId, int ts, String text, String parent) =>
+      sigCanon('comment', [postId, account, ts, text, parent]);
+  String followMsg(int ts, List<String> follows) {
+    // dedupe + sort to match the node's canon (sorted(set(...))): a duplicate in the list would
+    // otherwise make the app sign a preimage the node never reconstructs, and the write is rejected.
+    final s = {...follows}.toList()..sort();
+    return sigCanon('follow', [account, ts, s.join(',')]);
+  }
+  String pollMsg(String pollId, String option, int ts) => sigCanon('poll', [pollId, account, option, ts]);
   String profileMsg(int ts, String display, String bio, String avatar, String banner) =>
-      '$account|$ts|$display|$bio|$avatar|$banner';
-  String dmKeyMsg(int ts, String dmPub) => '$account|$ts|$dmPub';
+      sigCanon('profile', [account, ts, display, bio, avatar, banner]);
+  String dmKeyMsg(int ts, String dmPub) => sigCanon('dmkey', [account, ts, dmPub]);
+  // report/reshare stay on the legacy 'report|…' / 'reshare|…' preimage for now: those are ALSO
+  // verified by the separately-deployed relay, so migrating them needs a coordinated relay deploy
+  // (tracked as a follow-up to issue #2). Their literal-prefix already gives partial type separation.
   String reportMsg(String postId, int ts) => 'report|$account|$postId|$ts';
-  String deleteMsg(String postId, int ts) => 'delete|$account|$postId|$ts';
-  // A reshare earns a slice of every tip to the post, so it is SIGNED like a report: the relay verifies
-  // it before crediting the resharer, blocking a forged "first resharer" from skimming others' tips.
+  String deleteMsg(String postId, int ts) => sigCanon('delete', [account, postId, ts]);
   String reshareMsg(String postId, int ts) => 'reshare|$account|$postId|$ts';
 
   // ---- encrypted DMs (on-device): a SEPARATE X25519 keypair derived from the seed, sealing with

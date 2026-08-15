@@ -7,6 +7,14 @@ primary_region = "iad"
   auto_stop_machines = "off"
   auto_start_machines = true
   min_machines_running = 1
+  # Self-healing: if the relay process hangs, Fly restarts the machine within ~30s. /heads is a cheap
+  # always-200 read (no RPC, no aggregation), so a hang there is a real "process wedged" signal.
+  [[http_service.checks]]
+    grace_period = "40s"
+    interval = "15s"
+    timeout = "5s"
+    method = "GET"
+    path = "/heads"
 [[vm]]
   cpu_kind = "shared"
   cpus = 1

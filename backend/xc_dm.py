@@ -47,7 +47,7 @@ def peer_dm_pk(account):                                   # fetch + verify a pe
             rec = json.loads(urllib.request.urlopen(r + '/dmkey?account=' + account, timeout=4).read()).get('record')
             if not rec:
                 continue
-            msg = f"{rec['account']}|{rec['ts']}|{rec['dm_pk']}"
+            msg = xc.sig_canon('dmkey', rec['account'], rec['ts'], rec['dm_pk'])
             if rec['account'] == account and xc.pub_to_addr(rec['pub']) == account and verify(rec['pub'], msg, rec['sig']):
                 return rec['dm_pk']
         except Exception:
@@ -60,7 +60,7 @@ if mode == 'register':
     rec = json.load(open('/tmp/xc_dm_rec.json'))
     acc = rec.get('account', ''); dm_pk = rec.get('dm_pk', ''); ts = rec.get('ts')
     sig = rec.get('sig', ''); pub = rec.get('pub', '')
-    if not (xc.pub_to_addr(pub) == acc and verify(pub, f"{acc}|{ts}|{dm_pk}", sig)):
+    if not (xc.pub_to_addr(pub) == acc and verify(pub, xc.sig_canon('dmkey', acc, ts, dm_pk), sig)):
         json.dump({'ok': False, 'error': 'bad signature'}, open('/tmp/xc_dm_result.json', 'w')); sys.exit()
     relays = post('/dmkey', {'account': acc, 'dm_pk': dm_pk, 'ts': ts, 'sig': sig, 'pub': pub})
     json.dump({'ok': True, 'relays': relays}, open('/tmp/xc_dm_result.json', 'w'))

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Shared helpers for the ӾChat per-user-thread backend (dev Nano network + IPFS).
-import json, subprocess, urllib.request, urllib.parse, base64, hashlib, os, time, ipaddress
+import json, subprocess, urllib.request, urllib.parse, base64, hashlib, os, time, ipaddress, socket
 from concurrent.futures import ThreadPoolExecutor
 # Nano RPC endpoint(s). XC_NANO_RPC may be ONE url or a comma-separated list; defaults to the local
 # dev node. When a PUBLIC mainnet RPC is configured, known-good public fallbacks are appended —
@@ -115,6 +115,37 @@ def ipfs_add(path):
         pass
     return cid
 
+def content_matches_cid(cid, data):
+    # Content-addressing is only an INTEGRITY guarantee if the bytes are re-hashed against the CID. When
+    # the node falls back to an untrusted relay's /blob cache (the local IPFS origin didn't have it), a
+    # rogue relay can return arbitrary bytes for a legitimate CID — feed/profile/comment/media forgery —
+    # unless we verify here. The local `ipfs cat` path self-verifies; this guards the RELAY path.
+    #   sha256-<hex>  : recompute sha256 (exact, cheap).
+    #   IPFS CID      : recompute with the SAME deterministic add options ipfs_add uses, --only-hash so
+    #                   nothing is pinned and no daemon is needed. Identical bytes => identical CID.
+    # Unverifiable (ipfs missing, tool error) returns False: treat as missing rather than render forged
+    # content (per the content-addressing security model).
+    if not data or not cid:
+        return False
+    try:
+        if cid.startswith('sha256-'):
+            return hashlib.sha256(data).hexdigest() == cid.split('sha256-', 1)[1]
+        import tempfile
+        tf = tempfile.NamedTemporaryFile(prefix='xc_cidchk_', delete=False)
+        try:
+            tf.write(data); tf.close()
+            got = subprocess.check_output(
+                ['ipfs', 'add', '-Q', '--only-hash', '--cid-version=1', '--raw-leaves=false', tf.name],
+                env={**os.environ, 'IPFS_PATH': IPFS_PATH}, timeout=20).decode().strip()
+        finally:
+            try:
+                os.remove(tf.name)
+            except Exception:
+                pass
+        return got == cid
+    except Exception:
+        return False
+
 # ---- Nano crypto (pure Python via nanopy; ed25519-blake2b). Replaces the former native
 # helpers /tmp/{derivekey,ktblock,xc_sign,xc_verify} so the node runs on any OS, no build step.
 import nanopy as _np
@@ -159,8 +190,16 @@ def verify_msg(pub, msg, sig):
     return _verify_ok(pub, msg, sig) == 'ok'
 
 def sig_canon(msg_type, *fields):
-    # Domain+type tag + length-prefixed fields (used by the network-announcement record only; the
-    # post/head/etc. signing paths on this build are UNCHANGED / old-format).
+    # Unambiguous signing preimage (issue #2). Two defenses against one signature being valid for a
+    # different message than intended:
+    #   1) DOMAIN + TYPE TAG ('xchat/sig/v2/<type>') — a signature over a 'post' can't be replayed as a
+    #      'profile'/'follow'/etc.; each type has a disjoint preimage space.
+    #   2) LENGTH-PREFIXED fields ('<utf8_bytelen>:<field>') — the old 'a|b|c' join was ambiguous
+    #      because a field could itself contain '|' (free text, handles, bios), so distinct field
+    #      tuples could produce identical bytes. Prefixing every field with its exact UTF-8 byte length
+    #      makes the encoding injective: distinct tuples always yield distinct bytes.
+    # Signed as UTF-8 bytes. The Dart app builds the IDENTICAL string in NanoWallet.sigCanon — keep the
+    # two in lockstep (this is a hard wire-format break; old-format signatures no longer verify).
     out = 'xchat/sig/v2/' + msg_type
     for f in fields:
         s = f if isinstance(f, str) else str(f)
@@ -443,11 +482,23 @@ def url_to_link(url):  # a relay URL packed into a 32-byte block link as ASCII (
         raise ValueError(f'relay URL is {len(b)} bytes; the on-chain link holds at most 32 (use a short host)')
     return (b + bytes(32 - len(b))).hex()
 
+def _ip_is_internal(ip):
+    # An address the node must never be steered at: loopback/private/link-local (incl. cloud metadata
+    # 169.254.169.254), reserved, multicast, unspecified. Also block IPv4-mapped IPv6 (::ffff:127.0.0.1)
+    # by unwrapping it first — otherwise ::ffff:10.0.0.1 sails past the v6 checks to an internal v4 host.
+    try:
+        if getattr(ip, 'ipv4_mapped', None):
+            ip = ip.ipv4_mapped
+    except Exception:
+        pass
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
 def is_safe_relay_url(u):
     # SSRF guard for relay URLs learned from UNTRUSTED sources (on-chain announcements + peer gossip).
     # Those become GET/POST targets for the node's helpers, so a hostile announcer could point discovery
     # at an internal address (cloud metadata 169.254.169.254, 127.0.0.1:<admin>, a LAN box). Require
-    # http(s) and reject loopback/private/link-local/reserved IP literals and obvious internal names.
+    # http(s) and reject loopback/private/link-local/reserved targets.
     # (The node's OWN co-located relay is loopback, but it enters via the explicit bootstrap, not here.)
     try:
         p = urllib.parse.urlparse(u)
@@ -457,11 +508,26 @@ def is_safe_relay_url(u):
         if host == 'localhost' or host.endswith('.local') or host.endswith('.internal'):
             return False
         try:
-            ip = ipaddress.ip_address(host)
-            return not (ip.is_private or ip.is_loopback or ip.is_link_local
-                        or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+            return not _ip_is_internal(ipaddress.ip_address(host))
         except ValueError:
-            return True                      # a DNS name (not an IP literal) — allowed
+            pass                             # not an IP literal — a DNS name; resolve and validate below
+        # DNS name: an IP-literal blocklist alone is bypassed by a hostname whose A/AAAA record points
+        # at an internal address (classic DNS-rebinding SSRF). Resolve EVERY record and reject if ANY is
+        # internal — a name that resolves to a public address now can't smuggle in a loopback answer.
+        try:
+            addrs = socket.getaddrinfo(host, p.port or (443 if p.scheme == 'https' else 80),
+                                       proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            return False                     # unresolvable — treat as unsafe
+        if not addrs:
+            return False
+        for _fam, _type, _proto, _canon, sockaddr in addrs:
+            if _ip_is_internal(ipaddress.ip_address(sockaddr[0])):
+                return False
+        return True
+        # NOTE: this is check-time validation; a hostile resolver can still flip the record to an internal
+        # IP between this check and the actual fetch (TOCTOU rebinding). Fully closing that needs pinning
+        # the validated IP for the connection — a larger change tracked separately (issue #3 residual).
     except Exception:
         return False
 

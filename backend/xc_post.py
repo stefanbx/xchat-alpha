@@ -130,7 +130,7 @@ if mode == 'prepare':
     rec = json.load(open('/tmp/xc_post_rec.json'))
     handle = rec.get('handle', 'you.xno'); acc = rec.get('account', ''); kind = rec.get('kind', 'post')
     text = rec.get('text', ''); ts = rec.get('ts'); sig = rec.get('sig', ''); pub = rec.get('pub', '')
-    if not (xc.pub_to_addr(pub) == acc and verify(pub, f"{handle}|{kind}|{text}|{ts}", sig)):
+    if not (xc.pub_to_addr(pub) == acc and verify(pub, xc.sig_canon('post', handle, kind, text, ts), sig)):
         json.dump({"ok": False, "error": "bad post signature"}, open('/tmp/xc_post_result.json', 'w')); sys.exit()
     p = {"id": rec.get('id') or ("u" + str(ts)), "handle": handle, "account": acc, "kind": kind,
          "text": text, "ts": ts, "likes": 0, "reposts": 0, "media": rec.get('media') or None,
@@ -148,7 +148,7 @@ if mode == 'prepare':
     seq = next_seq(acc)
     now = int(time.time()); expires = now + xc.HEAD_TTL
     json.dump({"ok": True, "cid": cid, "seq": seq, "expires": expires, "post_id": p['id'],
-               "head_msg": f"{acc}|{seq}|{cid}|{expires}"}, open('/tmp/xc_post_result.json', 'w'))
+               "head_msg": xc.sig_canon('head', acc, seq, cid, expires)}, open('/tmp/xc_post_result.json', 'w'))
 
 elif mode == 'submit':
     # The head is ALREADY SIGNED BY THE APP (over the CID prepare returned). Verify + gossip. The
@@ -156,7 +156,7 @@ elif mode == 'submit':
     head = json.load(open('/tmp/xc_head_rec.json'))
     acc = head.get('author', ''); seq = head.get('seq'); cid = head.get('cid', '')
     expires = head.get('expires'); sig = head.get('sig', ''); pub = head.get('pub', ''); handle = head.get('handle', 'you.xno')
-    if not (xc.pub_to_addr(pub) == acc and verify(pub, f"{acc}|{seq}|{cid}|{expires}", sig)):
+    if not (xc.pub_to_addr(pub) == acc and verify(pub, xc.sig_canon('head', acc, seq, cid, expires), sig)):
         json.dump({"ok": False, "error": "bad head signature"}, open('/tmp/xc_post_result.json', 'w')); sys.exit()
     cand = f'/tmp/xc_thread_cand_{acc}.json'
     committed = f'/tmp/xc_thread_{acc}.json'
@@ -180,7 +180,7 @@ elif mode == 'delete':
     rec = json.load(open('/tmp/xc_delete_rec.json'))
     acc = rec.get('account', ''); pid = rec.get('post_id', ''); ts = rec.get('ts')
     sig = rec.get('sig', ''); pub = rec.get('pub', ''); handle = rec.get('handle', 'you.xno')
-    if not (xc.pub_to_addr(pub) == acc and verify(pub, f"delete|{acc}|{pid}|{ts}", sig)):
+    if not (xc.pub_to_addr(pub) == acc and verify(pub, xc.sig_canon('delete', acc, pid, ts), sig)):
         json.dump({"ok": False, "error": "bad delete signature"}, open('/tmp/xc_post_result.json', 'w')); sys.exit()
     thread, got_content, reached = current_thread(acc, handle)  # LIVE thread from the signed head + IPFS
     if not reached:                                    # relays unreachable — refuse, don't wipe a thread we can't see
@@ -198,7 +198,7 @@ elif mode == 'delete':
     seq = next_seq(acc)
     now = int(time.time()); expires = now + xc.HEAD_TTL
     json.dump({"ok": True, "cid": cid, "seq": seq, "expires": expires, "post_id": pid,
-               "head_msg": f"{acc}|{seq}|{cid}|{expires}"}, open('/tmp/xc_post_result.json', 'w'))
+               "head_msg": xc.sig_canon('head', acc, seq, cid, expires)}, open('/tmp/xc_post_result.json', 'w'))
 
 elif mode == 'replicate':
     # BACKFILL: ensure every live head's content is on the relays as a blob (keyed by CID), so content

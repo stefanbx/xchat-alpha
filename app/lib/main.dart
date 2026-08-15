@@ -1,4 +1,4 @@
-// ӾChat — a censorship-free X. The "Ӿ" is the XNO (Nano) symbol.
+// Ӿ Chat — a censorship-free X. The "Ӿ" is the XNO (Nano) symbol.
 // Identity = a Nano keypair. Feed = read from the ledger. Tips = feeless Nano.
 // Backend = the Keel engine (same censorship-free stack as KeelTube).
 import 'dart:async';
@@ -6,12 +6,17 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:video_compress/video_compress.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:http/http.dart' as http;
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:app_badge_plus/app_badge_plus.dart';
 import 'package:battery_plus/battery_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -42,6 +47,16 @@ Future<void> _loadEndpoints() async {
     kDefaultBase,
   ]) {
     if (e.isNotEmpty && seen.add(e)) list.add(e);
+  }
+  // On the web, prefer the origin that served the page — same-origin means no CORS preflight, and a
+  // laptop pointed at its own node should talk to its own node. A RELAY-only host has no /api at all,
+  // so adopt the origin only if it actually answers; otherwise fall through to the remembered list.
+  if (kIsWeb) {
+    final origin = Uri.base.origin;
+    if (origin.startsWith('http') && await _endpointHealthy(origin)) {
+      list.remove(origin);
+      list.insert(0, origin);
+    }
   }
   kEndpoints = list;
   kBase = kEndpoints.first;                            // trust the cached last-good endpoint; no probe here
@@ -79,7 +94,10 @@ Future<bool> resolveEndpoint() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.2.7'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.3.4'; // this build; the update checker compares against the signed release.
+// 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
+// (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
+// heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
 // Keep in lockstep with pubspec `version:`. Small ALPHA patch steps (2.2.0 → 2.2.1 → 2.2.2 …), anchored at
 // 2.2.x: the version doubles as the update-check comparison and the phone already installed 2.2.0, so going
 // below it would strand that install. (The 2.x floor is a one-time legacy of superseding the ~v2.1.0 lineage.)
@@ -105,14 +123,22 @@ class XChatApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'ӾChat',
+      title: 'Ӿ Chat',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
         brightness: Brightness.dark,
         scaffoldBackgroundColor: kBg,
         colorScheme: const ColorScheme.dark(primary: kAccent, surface: kBg),
-        fontFamily: 'Roboto',
+        // No explicit fontFamily: pinning one family exclusively suppressed Flutter's glyph FALLBACK,
+        // so emoji (and the Cyrillic Ӿ) rendered blank. The platform default is still Roboto but keeps
+        // the full fallback chain (Noto Color Emoji + Cyrillic), so emoji and Ӿ now render. [verify on build]
+        // Snackbars override their bg to the near-black kCard, but M3's default content text assumes the
+        // light inverse-surface — so the text came out dark-on-dark. Pin light text on the dark surface.
+        snackBarTheme: const SnackBarThemeData(
+          backgroundColor: kCard,
+          contentTextStyle: TextStyle(color: kText, fontSize: 14),
+        ),
       ),
       home: const RootGate(),
     );
@@ -135,10 +161,16 @@ class WalletStore {
   static const _secure = FlutterSecureStorage(
       aOptions: AndroidOptions(encryptedSharedPreferences: true));
 
+  // A BROWSER HAS NO KEYSTORE. flutter_secure_storage's web backend is IndexedDB with the wrapping
+  // key stored right next to the data, so routing web through it would buy nothing and imply hardware
+  // protection that does not exist — and it throws outright where crypto.subtle is unavailable. Use
+  // the ordinary store on web and say so in the UI (see the warning on the onboarding screen), so the
+  // weaker guarantee is a thing the user is told, not a thing the code quietly pretends away.
   static Future<String?> get() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (kIsWeb) return prefs.getString(_k);
     final s = await _secure.read(key: _k);
     if (s != null && s.isNotEmpty) return s;
-    final prefs = await SharedPreferences.getInstance();
     final legacy = prefs.getString(_k);
     if (legacy == null || legacy.isEmpty) return null;
     await _secure.write(key: _k, value: legacy);
@@ -146,10 +178,16 @@ class WalletStore {
     return legacy;
   }
 
-  static Future<void> save(String s) async => _secure.write(key: _k, value: s);
+  static Future<void> save(String s) async {
+    if (kIsWeb) {
+      await (await SharedPreferences.getInstance()).setString(_k, s);
+      return;
+    }
+    await _secure.write(key: _k, value: s);
+  }
 
   static Future<void> clear() async {
-    await _secure.delete(key: _k);
+    if (!kIsWeb) await _secure.delete(key: _k);
     await (await SharedPreferences.getInstance()).remove(_k);
   }
 }
@@ -262,6 +300,82 @@ class BookmarkStore {
       ((await SharedPreferences.getInstance()).getStringList(_k) ?? <String>[]).toSet();
   static Future<void> save(Set<String> s) async =>
       (await SharedPreferences.getInstance()).setStringList(_k, s.toList());
+}
+
+// On-device record of every settled tip — what ACTUALLY moved on-chain, per leg (creator / relay /
+// reposter), each with its Nano block hash. This is the TIPPER's own receipt trail: the network only
+// notifies the recipient, so without this the sender had no way to see, or independently verify, what
+// they paid. Newest first, capped; each entry a small JSON blob.
+class TxLogStore {
+  static const _k = 'xchat_txlog';
+  static const _cap = 300;
+  static Future<List<Map<String, dynamic>>> get() async {
+    final raw = (await SharedPreferences.getInstance()).getStringList(_k) ?? const <String>[];
+    return raw
+        .map((s) { try { return Map<String, dynamic>.from(jsonDecode(s)); } catch (_) { return <String, dynamic>{}; } })
+        .where((m) => m.isNotEmpty)
+        .toList();
+  }
+  static Future<void> add(Map<String, dynamic> tx) async {
+    final sp = await SharedPreferences.getInstance();
+    final raw = sp.getStringList(_k) ?? <String>[];
+    raw.insert(0, jsonEncode(tx));
+    if (raw.length > _cap) raw.removeRange(_cap, raw.length);
+    await sp.setStringList(_k, raw);
+  }
+}
+
+// Per-device engagement memory: which posts THIS device has liked / reposted / counted as viewed.
+// Persisted so a view or like is registered ONCE per device, ever — not re-sent on every app launch.
+// Without this, _liked/_viewed lived only in RAM: each restart re-counted an impression for every post
+// scrolled past and let the user re-like, so the public counters ballooned (3 users → dozens of "views").
+class EngageStore {
+  static Future<Set<String>> _get(String k) async =>
+      ((await SharedPreferences.getInstance()).getStringList(k) ?? const <String>[]).toSet();
+  static Future<void> _save(String k, Set<String> s) async =>
+      (await SharedPreferences.getInstance()).setStringList(k, s.toList());
+  static Future<Set<String>> liked() => _get('xchat_liked');
+  static Future<void> saveLiked(Set<String> s) => _save('xchat_liked', s);
+  static Future<Set<String>> likedComments() => _get('xchat_liked_comments');   // per-device: like a comment once
+  static Future<void> saveLikedComments(Set<String> s) => _save('xchat_liked_comments', s);
+  static Future<Set<String>> reposted() => _get('xchat_reposted');
+  static Future<void> saveReposted(Set<String> s) => _save('xchat_reposted', s);
+  static Future<Set<String>> viewed() => _get('xchat_viewed');
+  static Future<void> saveViewed(Set<String> s) => _save('xchat_viewed', s);
+}
+
+// Android system notifications (likes / comments / tips / DMs) + the unread-DM count on the app icon.
+// This app has no push server (notifications are POLLED from the relays), so alerts fire when the app
+// polls — foreground, or a periodic tick — not via FCM when fully killed.
+class Notifs {
+  static final FlutterLocalNotificationsPlugin _p = FlutterLocalNotificationsPlugin();
+  static bool _ready = false;
+  static Future<void> init() async {
+    if (_ready) return;
+    const init = InitializationSettings(android: AndroidInitializationSettings('@mipmap/ic_launcher'));
+    await _p.initialize(init);
+    // Android 13+ needs a runtime grant for POST_NOTIFICATIONS.
+    await _p.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
+    _ready = true;
+  }
+  static Future<void> show(int id, String title, String body) async {
+    await init();
+    const details = NotificationDetails(
+        android: AndroidNotificationDetails('xchat_activity', 'Activity',
+            channelDescription: 'Likes, comments, tips and messages on your posts',
+            importance: Importance.high, priority: Priority.high, icon: '@mipmap/ic_launcher'));
+    await _p.show(id, title, body, details);
+  }
+  static Future<void> setBadge(int count) async {
+    try {
+      if (count > 0) {
+        await AppBadgePlus.updateBadge(count);
+      } else {
+        await AppBadgePlus.updateBadge(0);   // clear
+      }
+    } catch (_) {}   // launcher may not support numeric badges
+  }
 }
 
 // remembers the update version the user dismissed, so the auto-check banner nags once per version, not
@@ -396,7 +510,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   Widget _brand() => Column(children: const [
         NanoMark(size: 64),
         SizedBox(height: 14),
-        Text('ӾChat',
+        Text('Ӿ Chat',
             style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 28)),
         SizedBox(height: 6),
         Text('a censorship-free X. your account is a Nano keypair — no email, no server.',
@@ -416,6 +530,31 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         }),
         const SizedBox(height: 12),
         _bigBtn('I already have a seed', kCard, kText, () => setState(() => _step = 'restore')),
+        // Say the quiet part out loud. On Android the seed sits in the Keystore; in a browser it sits
+        // in ordinary site storage, readable by anything that can run script on this page — including
+        // whoever is hosting it. Someone choosing between the two deserves to know before they paste
+        // a seed that controls real money.
+        if (kIsWeb) ...[
+          const SizedBox(height: 24),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+                color: kCard, borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.amber.withOpacity(0.35))),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Icon(Icons.info_outline, size: 17, color: Colors.amber),
+              const SizedBox(width: 9),
+              Expanded(
+                child: Text(
+                    'You are using ӾChat in a browser. Your seed is kept in this browser\'s storage, '
+                    'which is weaker than the phone app\'s keystore — and this page is served by whoever '
+                    'runs this node. For an account holding real value, prefer the Android app, or use a '
+                    'seed here that you are willing to treat as disposable.',
+                    style: TextStyle(color: kDim, fontSize: 11.5, height: 1.45)),
+              ),
+            ]),
+          ),
+        ],
       ]);
 
   Widget _backup() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -498,7 +637,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
             padding: const EdgeInsets.only(top: 4),
             child: Text(_verr!, style: const TextStyle(color: Color(0xFFEF6C9B), fontSize: 13))),
         const Spacer(),
-        _bigBtn(_busy ? 'Setting up…' : 'Confirm & enter ӾChat', kAccent, Colors.black, _busy ? null : () {
+        _bigBtn(_busy ? 'Setting up…' : 'Confirm & enter Ӿ Chat', kAccent, Colors.black, _busy ? null : () {
           for (int i = 0; i < _vpos.length; i++) {
             if (_vctl[i].text.trim().toLowerCase() != _newSeed[_vpos[i]].toLowerCase()) {
               setState(() => _verr = "That doesn't match your seed. Check your written copy (or go back to view it again).");
@@ -725,15 +864,33 @@ class Api {
       final relayRaw = relay.isNotEmpty ? amtRaw * BigInt.from(sp) ~/ BigInt.from(100) : BigInt.zero;
       final reposterRaw = reposter.isNotEmpty ? amtRaw * BigInt.from(rp) ~/ BigInt.from(100) : BigInt.zero;
       final creatorRaw = amtRaw - relayRaw - reposterRaw;
-      // sequential on-device sends (each consumes the frontier)
-      final ch = await _sendRaw(w, to, creatorRaw);
-      if (relay.isNotEmpty && relayRaw > BigInt.zero) await _sendRaw(w, relay, relayRaw);
-      if (reposter.isNotEmpty && reposterRaw > BigInt.zero) await _sendRaw(w, reposter, reposterRaw);
+      // Split legs, creator first so a partial chain still pays the creator. All legs are sent as ONE
+      // locally-chained sequence (see _sendChain) — the old code re-read the frontier over RPC between
+      // legs, so the relay/reposter block was signed on a not-yet-observed frontier and silently
+      // rejected as a fork. Every follow-on leg was dropped and the failure never surfaced.
+      final legs = <Map<String, dynamic>>[
+        {'role': 'creator', 'to': to, 'raw': creatorRaw},
+        if (relay.isNotEmpty && relayRaw > BigInt.zero) {'role': 'relay', 'to': relay, 'raw': relayRaw},
+        if (reposter.isNotEmpty && reposterRaw > BigInt.zero)
+          {'role': 'reposter', 'to': reposter, 'raw': reposterRaw},
+      ];
+      final results = await _sendChain(w, legs);
+      final creatorLeg = results.firstWhere((r) => r['role'] == 'creator', orElse: () => {'ok': false});
+      final paidRaw = results
+          .where((r) => r['ok'] == true)
+          .fold<BigInt>(BigInt.zero, (a, r) => a + (r['raw'] as BigInt));
       return {
-        'ok': ch != null, 'to': to, 'amount': amount, 'hash': ch,
-        'creator_xno': creatorRaw / BigInt.from(10).pow(30),
-        'relay': relay.isEmpty ? null : relay, 'relay_xno': relayRaw / BigInt.from(10).pow(30),
-        'reposter': reposter.isEmpty ? null : reposter, 'reposter_xno': reposterRaw / BigInt.from(10).pow(30),
+        // "settled" means the CREATOR was actually paid — not merely that the tally was cleared.
+        'ok': creatorLeg['ok'] == true,
+        'to': to, 'amount': amount, 'hash': creatorLeg['hash'],
+        'legs': results
+            .map((r) => {
+                  'role': r['role'], 'to': r['to'],
+                  'xno': (r['raw'] as BigInt) / BigInt.from(10).pow(30),
+                  'ok': r['ok'] == true, 'hash': r['hash'], 'error': r['error'],
+                })
+            .toList(),
+        'paid_xno': paidRaw / BigInt.from(10).pow(30),
         'split_pct': sp, 'repost_pct': rp, 'work_delegated': true,
       };
     } catch (e) {
@@ -839,6 +996,41 @@ class Api {
     final r = await blockProcess(block, 'send');
     if (r?['ok'] == true) return r?['hash'] as String?;
     return null;
+  }
+
+  // Send several amounts from ONE account as a single locally-chained sequence. Each block uses the
+  // PREVIOUS leg's own block hash as its `previous` (the node returns it on process), so a follow-on
+  // leg never re-reads a frontier the just-broadcast block may not be reflected in yet — that stale
+  // RPC read is exactly what made the relay/reposter leg fork and get silently dropped. Advances the
+  // local balance/frontier only on a confirmed broadcast; stops the chain at the first failure so no
+  // later leg is stranded on an unknown `previous`. Returns one result row per leg (never throws).
+  static Future<List<Map<String, dynamic>>> _sendChain(
+      NanoWallet w, List<Map<String, dynamic>> legs) async {
+    final out = <Map<String, dynamic>>[];
+    final st = await accountState(w.account);
+    if (st == null || st['opened'] != true) {
+      for (final l in legs) out.add({...l, 'ok': false, 'hash': null, 'error': 'wallet empty'});
+      return out;
+    }
+    var prev = '${st['frontier']}';
+    var bal = BigInt.parse('${st['balance']}');
+    final rep = '${st['representative']}';
+    var broken = false;
+    for (final l in legs) {
+      final to = l['to'] as String;
+      final raw = l['raw'] as BigInt;
+      if (broken) { out.add({...l, 'ok': false, 'hash': null, 'error': 'skipped (prior leg failed)'}); continue; }
+      if (raw <= BigInt.zero) { out.add({...l, 'ok': false, 'hash': null, 'error': 'zero amount'}); continue; }
+      if (bal < raw) { out.add({...l, 'ok': false, 'hash': null, 'error': 'insufficient balance'}); broken = true; continue; }
+      final newBal = bal - raw;
+      final block = w.signStateBlock(previous: prev, representative: rep, balance: newBal, link: w.pubOf(to));
+      final r = await blockProcess(block, 'send');
+      final ok = r?['ok'] == true;
+      final hash = r?['hash'] as String?;
+      out.add({...l, 'ok': ok, 'hash': ok ? hash : null, 'error': ok ? null : (r?['error']?.toString() ?? 'broadcast failed')});
+      if (ok && hash != null) { prev = hash; bal = newBal; } else { broken = true; }
+    }
+    return out;
   }
 
   // identity: the app already holds the account (on-device key); the node only reads the balance.
@@ -977,6 +1169,27 @@ class Api {
     } catch (_) {}
   }
 
+  // channel directory: [{account, display, bio, avatar, followers, online}]. A public read; no seed.
+  static Future<List<Map<String, dynamic>>> channels() async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/channels')).timeout(const Duration(seconds: 12));
+      return (((jsonDecode(r.body))['channels'] as List?) ?? const [])
+          .map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  // accounts online right now (heads refreshed within the presence window). A public read; no seed.
+  static Future<Set<String>> presence() async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/presence')).timeout(const Duration(seconds: 8));
+      return (((jsonDecode(r.body))['online'] as List?) ?? const []).map((e) => '$e').toSet();
+    } catch (_) {
+      return const <String>{};
+    }
+  }
+
   static Future<void> like(String pid, int delta) => _engagePost('like', pid, delta);
   // A reshare earns a slice of every tip to the post, so it is SIGNED on-device (canon
   // reshare|account|post_id|ts). The relay verifies it before crediting the resharer — an unsigned
@@ -1019,13 +1232,34 @@ class Api {
   }
 
   static Future<List<Map<String, dynamic>>> notify() async {
+    final w = gWallet;
+    if (w == null) return [];
     try {
-      final r = await http.get(Uri.parse('$kBase/api/notify'));
+      // key notifications by the UNIQUE account, not the shared 'you.xno' handle — otherwise every
+      // user reads one common bucket and sees everyone else's tip/like alerts (issue: alerts predating
+      // your own install). The relay routes by whatever string it's given, so the account rides the
+      // existing 'handle' param end-to-end (no relay change needed).
+      final r = await http.get(Uri.parse('$kBase/api/notify?account=${w.account}'));
       final d = jsonDecode(r.body);
       return ((d['notifs'] as List?) ?? []).cast<Map<String, dynamic>>();
     } catch (_) {
       return [];
     }
+  }
+
+  // A coordinated-event banner (network migration etc.). The node returns it ONLY when a valid,
+  // publisher-signed, unexpired record is configured — so normal operation returns {active:false} and
+  // the app shows nothing. Returns the banner text, or null.
+  static Future<String?> announcement() async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/announcement'));
+      final d = jsonDecode(r.body);
+      if (d is Map && d['active'] == true) {
+        final t = '${d['text'] ?? ''}'.trim();
+        return t.isEmpty ? null : t;
+      }
+    } catch (_) {}
+    return null;
   }
 
   static Future<Map<String, dynamic>?> supporter(bool on, String account) async {
@@ -1121,8 +1355,8 @@ class Api {
   // node assembles the thread, pins it, and returns the content CID + head seq; (2) sign the head
   // "account|seq|cid|expires" locally + POST to /api/post_submit — the node verifies + gossips it.
   // The seed never leaves the device; the node only assembles content and relays signed records.
-  static Future<String> post(String text, {String handle = 'you.xno', String media = '', String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = '', int? ts}) async {
-    final w = gWallet;
+  static Future<String> post(String text, {String handle = 'you.xno', String media = '', String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = '', int? ts, NanoWallet? signer}) async {
+    final w = signer ?? gWallet;   // `signer` lets a post be authored by a channel identity, not the user
     if (w == null) return '';
     ts ??= DateTime.now().millisecondsSinceEpoch ~/ 1000;   // a flushed queued post keeps its compose time
     final mk = (mediaKind == 'photo' || mediaKind == 'movie') ? mediaKind : 'movie';
@@ -1360,9 +1594,21 @@ class Api {
     }
   }
 
+  // The RAW (unverified) profile record straight from the relay (the node proxies non-/api paths to it).
+  // Used only to recover our OWN display name whose signed record was invalidated by a signing-format
+  // change, so we can re-sign it under the current scheme. Not trusted for other accounts.
+  static Future<Map<String, dynamic>?> profileRaw(String account) async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/profile?account=$account'));
+      return (jsonDecode(r.body)['record'] as Map?)?.cast<String, dynamic>();
+    } catch (_) {
+      return null;
+    }
+  }
+
   // on-device signed: the app signs the profile record locally; the node only verifies + relays.
-  static Future<Map<String, dynamic>?> profileSet(String display, String bio, String avatar, String banner) async {
-    final w = gWallet;
+  static Future<Map<String, dynamic>?> profileSet(String display, String bio, String avatar, String banner, {NanoWallet? signer, String type = ''}) async {
+    final w = signer ?? gWallet;   // `signer` lets a channel set ITS OWN profile (name/desc/avatar)
     if (w == null) return null;
     final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final s = w.signMsg(w.profileMsg(ts, display, bio, avatar, banner));
@@ -1370,7 +1616,8 @@ class Api {
       final r = await http.post(Uri.parse('$kBase/api/profile_set'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({'account': w.account, 'display': display, 'bio': bio, 'avatar': avatar,
-                            'banner': banner, 'ts': ts, 'sig': s['sig'], 'pub': s['pub']}));
+                            'banner': banner, 'ts': ts, 'sig': s['sig'], 'pub': s['pub'],
+                            if (type.isNotEmpty) 'type': type}));
       return jsonDecode(r.body);
     } catch (_) {
       return null;
@@ -1473,6 +1720,16 @@ String _compact(int n) {
   final m = n / 1000000; return '${m < 10 ? m.toStringAsFixed(1) : m.round()}M';
 }
 
+// Format an XNO tip amount compactly — a small tip keeps its significant decimals (0.001 stays
+// "0.001", not rounded to "0.00"); a whole number drops the decimals. Used for tip amounts everywhere
+// so sub-0.01 tips are shown (and, via _xnoToRaw, sent) at full precision.
+String fmtXno(double v) {
+  if (v >= 1) return v == v.roundToDouble() ? v.toStringAsFixed(0) : v.toStringAsFixed(2);
+  var s = v.toStringAsFixed(6);
+  if (s.contains('.')) s = s.replaceFirst(RegExp(r'0+$'), '').replaceFirst(RegExp(r'\.$'), '');
+  return s.isEmpty ? '0' : s;
+}
+
 String timeAgo(int ts) {
   if (ts == 0) return '';
   final s = DateTime.now().millisecondsSinceEpoch ~/ 1000 - ts;
@@ -1538,6 +1795,22 @@ class ProfileCache extends ChangeNotifier {
 }
 
 // an avatar that shows the account's uploaded image once its profile resolves, else a letter tile
+// Who is online right now, from /api/presence (a head refreshed in the last ~2.5 min ≈ an open app,
+// since the app republishes its head every 45s). A ChangeNotifier so every AuthorAvatar toggles its
+// green dot reactively when the set refreshes. No identity tracking beyond the head each account
+// already publishes publicly.
+class PresenceCache extends ChangeNotifier {
+  PresenceCache._();
+  static final PresenceCache I = PresenceCache._();
+  Set<String> _online = {};
+  bool isOnline(String account) => account.isNotEmpty && _online.contains(account);
+  void update(Set<String> online) {
+    if (online.length == _online.length && online.containsAll(_online)) return; // no change → no rebuild
+    _online = online;
+    notifyListeners();
+  }
+}
+
 class AuthorAvatar extends StatelessWidget {
   final String account, handle;
   final double radius;
@@ -1545,27 +1818,111 @@ class AuthorAvatar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: ProfileCache.I,
+      animation: Listenable.merge([ProfileCache.I, PresenceCache.I]),
       builder: (_, __) {
         ProfileCache.I.ensure(account);
         final cid = ProfileCache.I.avatarCid(account);
-        if (cid != null) {
-          return ClipOval(
-            child: SizedBox(
-              width: radius * 2, height: radius * 2,
-              child: MediaImage(cid: cid, fit: BoxFit.cover),
+        final Widget avatar = (cid != null && cid.startsWith('live:'))
+            ? LiveAvatar(style: cid.substring(5), radius: radius)   // animated, code-drawn avatar
+            : cid != null
+                ? ClipOval(
+                    child: SizedBox(
+                      width: radius * 2, height: radius * 2,
+                      child: MediaImage(cid: cid, fit: BoxFit.cover),
+                    ),
+                  )
+                : CircleAvatar(
+                    radius: radius,
+                    backgroundColor: avatarColor(handle),
+                    child: Text(handle.isEmpty ? '?' : handle.substring(0, 1).toUpperCase(),
+                        style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: radius * 0.62)),
+                  );
+        if (!PresenceCache.I.isOnline(account)) return avatar;
+        final d = (radius * 0.55).clamp(8.0, 14.0);        // dot scales with the avatar
+        return Stack(clipBehavior: Clip.none, children: [
+          avatar,
+          Positioned(
+            right: -1, bottom: -1,
+            child: Container(
+              width: d, height: d,
+              decoration: BoxDecoration(
+                color: const Color(0xFF3BD671),            // "online" green
+                shape: BoxShape.circle,
+                border: Border.all(color: kBg, width: 2),  // ring so it reads on any avatar/photo
+              ),
             ),
-          );
-        }
-        return CircleAvatar(
-          radius: radius,
-          backgroundColor: avatarColor(handle),
-          child: Text(handle.isEmpty ? '?' : handle.substring(0, 1).toUpperCase(),
-              style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: radius * 0.62)),
-        );
+          ),
+        ]);
       },
     );
   }
+}
+
+// A LIVE (animated, code-drawn) avatar — no image upload. Stored in the profile as the sentinel
+// "live:<style>" in the avatar field; AuthorAvatar renders this instead of a MediaImage. Older app
+// versions that don't know the sentinel fall back to the initial-letter avatar (graceful).
+class LiveAvatar extends StatefulWidget {
+  final String style;   // currently 'orbit'
+  final double radius;
+  const LiveAvatar({super.key, required this.style, this.radius = 22});
+  @override
+  State<LiveAvatar> createState() => _LiveAvatarState();
+}
+
+class _LiveAvatarState extends State<LiveAvatar> with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, duration: const Duration(seconds: 5))..repeat();
+  }
+  @override
+  void dispose() { _c.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) {
+    final d = widget.radius * 2;
+    return SizedBox(
+      width: d, height: d,
+      child: AnimatedBuilder(
+        animation: _c,
+        builder: (_, __) => CustomPaint(painter: _OrbitPainter(_c.value)),
+      ),
+    );
+  }
+}
+
+// "Orbit": a dark disc with three coloured dots (XNO teal / blue / green) orbiting the Ӿ mark.
+class _OrbitPainter extends CustomPainter {
+  final double t; // 0..1 animation phase
+  _OrbitPainter(this.t);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final r = size.width / 2;
+    canvas.drawCircle(c, r, Paint()..color = const Color(0xFF0B1A22));          // disc
+    canvas.drawCircle(c, r - 1, Paint()                                          // faint rim
+      ..style = PaintingStyle.stroke..strokeWidth = 1
+      ..color = const Color(0xFF14E0C8).withValues(alpha: 0.22));
+    final orbitR = r * 0.74, dotR = (r * 0.14).clamp(1.5, 6.0);
+    const colors = [Color(0xFF14E0C8), Color(0xFF3B82F6), Color(0xFF3BD671)];
+    for (int i = 0; i < 3; i++) {
+      final ang = 2 * math.pi * (t + i / 3);
+      final p = c + Offset(math.cos(ang), math.sin(ang)) * orbitR;
+      canvas.drawCircle(p, dotR, Paint()
+        ..color = colors[i]
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 0.8));
+    }
+    final xr = r * 0.42;                                                          // centre Ӿ mark
+    final pen = Paint()
+      ..color = Colors.white
+      ..strokeWidth = math.max(1.5, r * 0.12)
+      ..strokeCap = StrokeCap.round;
+    canvas.drawLine(c + Offset(-xr * 0.62, -xr), c + Offset(xr * 0.62, xr), pen);
+    canvas.drawLine(c + Offset(xr * 0.62, -xr), c + Offset(-xr * 0.62, xr), pen);
+    canvas.drawLine(c + Offset(-xr * 0.5, 0), c + Offset(xr * 0.5, 0), pen);      // the Ӿ bar
+  }
+  @override
+  bool shouldRepaint(_OrbitPainter old) => old.t != t;
 }
 
 // a subtle dark scrim + camera glyph, laid over an image thumbnail to say "tap to change"
@@ -1667,6 +2024,8 @@ class _FeedScreenState extends State<FeedScreen> {
   int _onchainBlocks = 0;
   int _relaysUp = 0, _relaysTotal = 0;
   final Map<String, double> _pending = {}; // author account -> tallied XNO (off-chain)
+  final Set<String> _settling = {};        // creators with a settle in flight — blocks re-entrant settles
+  bool _settleBusy = false;                 // guards the manual batch settle against a double-tap
   final Map<String, String> _handleOf = {}; // account -> handle, for the settle bar
   // reshare/media attribution LOCKED at tip time (per creator) — a later reshare can't claim it
   final Map<String, String> _reposterOf = {}; // author account -> resharer account to reward
@@ -1675,7 +2034,8 @@ class _FeedScreenState extends State<FeedScreen> {
   bool _autoSettle = false;
   double _autoThreshold = 0.05, _autoCap = 1.0, _autoSpent = 0.0;
   int _tab = 0; // 0 = Home, 1 = Discover (everyone + search)
-  int _homeFeed = 0; // 0 = For You (ranked), 1 = Following (chronological)
+  int _homeFeed = 0; // 0 = For You (ranked), 1 = Following (STRICT: only accounts you follow). Open on
+  // For You so a user who follows nobody isn't greeted by an empty Following tab.
   List<Map<String, dynamic>> _outbox = []; // posts composed OFFLINE, queued + auto-flushed on reconnect
   bool _flushing = false;                  // guards _flushOutbox against re-entrancy
   Map<String, dynamic>? _update;           // a newer signed release found by the launch auto-check
@@ -1689,19 +2049,30 @@ class _FeedScreenState extends State<FeedScreen> {
   final Set<String> _viewed = {}; // ids counted as viewed this session (dedup)
   final Map<String, int> _commentCount = {}; // post_id -> comment count (lazy)
   List<Map<String, dynamic>> _notifs = []; // push payloads (mentions/replies)
+  int _dmUnread = 0;   // conversations with an incoming DM newer than _dmSeenTs (drives the mail badge)
+  int _dmSeenTs = 0;   // unix-s of the last time DMs were opened; persisted so the badge survives restarts
+  int _notifSeenTs = 0;  // unix-s the notifications bell was last opened; older notifs don't count as unread
+  // unread = notifications newer than the last bell-open, minus muted/blocked (matches what _showNotifs lists)
+  int get _notifUnread {
+    final hidden = {..._muted, ..._blocked}.map(_handleFor).toSet();
+    return _notifs.where((n) =>
+        !hidden.contains('${n['from']}') && ((n['ts'] as int?) ?? 0) > _notifSeenTs).length;
+  }
+  String? _announcement;  // publisher-signed coordinated-event banner text; null in normal operation
   String _account = '';
   // supporter mode: contribute (relay/pin) ONLY when charging + on Wi-Fi
   bool _supporterOn = false, _charging = false, _wifi = false;
   int _supporters = 0;
   final Battery _battery = Battery();
   StreamSubscription? _batSub, _connSub;
-  Timer? _republishTimer, _gossipTimer, _feedTimer, _updateTimer;
+  Timer? _republishTimer, _gossipTimer, _feedTimer, _updateTimer, _presenceTimer;
   int _relayed = 0; // signed heads this phone has propagated (backfilled) this session
   bool get _supporterActive => _supporterOn && _charging && _wifi;
 
   @override
   void initState() {
     super.initState();
+    Notifs.init();   // set up Android notifications + ask for the POST_NOTIFICATIONS grant (Android 13+)
     _bootWallet();
     _load();
     _initDevice();
@@ -1712,10 +2083,26 @@ class _FeedScreenState extends State<FeedScreen> {
     MuteStore.get().then((m) { if (mounted) setState(() => _muted = m); });
     BlockStore.get().then((b) { if (mounted) setState(() => _blocked = b); });
     BookmarkStore.get().then((b) { if (mounted) setState(() => _bookmarks = b); });
+    // per-device engagement memory — so a view/like is counted once per device, not re-sent each launch
+    EngageStore.liked().then((s) { if (mounted) setState(() => _liked.addAll(s)); });
+    EngageStore.reposted().then((s) { if (mounted) setState(() => _reposted.addAll(s)); });
+    EngageStore.viewed().then((s) { if (mounted) _viewed.addAll(s); });
+    _refreshTxLog();
+    SharedPreferences.getInstance().then((sp) {
+      if (mounted) setState(() {
+        _dmSeenTs = sp.getInt('dm_seen_ts') ?? 0;
+        _notifSeenTs = sp.getInt('notif_seen_ts') ?? 0;
+      });
+    });
+    _loadChannels();
     // keep our own head alive on the relays (republish < TTL); also backfills new relays
     _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) => Api.republish());
     // quietly poll the feed so posts from OTHER devices appear on their own (no manual refresh)
     _feedTimer = Timer.periodic(const Duration(seconds: 12), (_) => _refreshFeedQuiet());
+    // who's online — refresh the green dots a bit faster than the 45s head heartbeat so they feel live
+    _refreshPresence();
+    _presenceTimer = Timer.periodic(const Duration(seconds: 30), (_) => _refreshPresence());
+    _refreshChannelAccounts(); // learn which accounts are channels (to keep them out of the feed)
     // re-check for a newer release periodically, not only at launch — so a long-lived session still
     // surfaces the update banner (the launch check is in _bootWallet).
     _updateTimer = Timer.periodic(const Duration(hours: 4), (_) => _autoCheckUpdate());
@@ -1726,6 +2113,7 @@ class _FeedScreenState extends State<FeedScreen> {
     _batSub?.cancel();
     _connSub?.cancel();
     _republishTimer?.cancel();
+    _presenceTimer?.cancel();
     _gossipTimer?.cancel();
     _feedTimer?.cancel();
     _updateTimer?.cancel();
@@ -1749,6 +2137,11 @@ class _FeedScreenState extends State<FeedScreen> {
     // most polls are incremental (only new posts, for the pill); every 5th (~60s) pulls the full set
     // so we can also DROP posts whose head expired / was removed — the incremental slice can't show that.
     final reconcile = (++_pollTick % 5 == 0);
+    _refreshDmBadge();   // keep the mail-icon unread count live between full loads
+    if (_pollTick % 2 == 0) _refreshNotifs();   // ~every 24s: pull notifs + raise Android alerts for new ones
+    if (_pollTick % 10 == 0) {   // ~every 2 min: pick up a newly-activated announcement without a relaunch
+      Api.announcement().then((a) { if (mounted && a != _announcement) setState(() => _announcement = a); });
+    }
     try {
       // since-1 re-includes the boundary second (ts filter is strict '>'), so a post arriving in the
       // same second as our newest isn't missed; the id-dedupe below drops the tiny overlap.
@@ -1834,8 +2227,13 @@ class _FeedScreenState extends State<FeedScreen> {
 
   bool _onlineFrom(List<ConnectivityResult> r) =>
       r.isNotEmpty && r.any((x) => x != ConnectivityResult.none);
-  Future<bool> _onlineNow() async =>
-      _onlineFrom(await Connectivity().checkConnectivity());
+  Future<bool> _onlineNow() async {
+    if (_onlineFrom(await Connectivity().checkConnectivity())) return true;
+    // connectivity_plus can report "none" even when the network is fine (emulators, some VPNs / Android
+    // builds). Don't strand posts in the outbox on its say-so — confirm with a real reachability probe
+    // against the node before deciding we're offline.
+    return _endpointHealthy(kBase);
+  }
 
   // A "connectivity regained" event often arrives while the link is still validating (wifi shows "!"),
   // so a single flush attempt can fail fast. Retry a few times with backoff until the queue drains.
@@ -1898,6 +2296,13 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   void _tallyTip(Post p) {
+    if (p.account == _account) {
+      // Tipping your own post would settle as a send-to-yourself — it can't complete and would sit in
+      // the pending list forever. Block it up front.
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          backgroundColor: kCard, content: Text("You can't tip your own post")));
+      return;
+    }
     final amt = _settings.defaultTip;
     if (!_guardTip(amt)) return;
     setState(() {
@@ -1910,19 +2315,25 @@ class _FeedScreenState extends State<FeedScreen> {
       _bumpEngage(p.id, 'tips_xno', amt); // XNO gathered by this post
     });
     Api.tipstat(p.id, _rawOf(amt));
-    if (p.account != _account && _settings.notifyTip) {
-      Api.notifyPush(p.handle, _handle, 'tip', 'tipped your post ${amt.toStringAsFixed(2)} XNO');
-    }
+    // NB: no notification here. A tip is only a PLEDGE until it settles — notifying the creator now
+    // would tell them they were paid for money that may never move (the tally can be dropped, or the
+    // settle can fail). The creator is notified at SETTLE (see _settle / _maybeAutoSettle), when a real
+    // Nano block actually lands.
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         duration: const Duration(milliseconds: 1200),
         backgroundColor: kCard,
-        content: Text('◈ +${amt.toStringAsFixed(2)} XNO tallied off-chain — no network, no block')));
+        content: Text('◈ +${fmtXno(amt)} XNO tallied off-chain — no network, no block')));
     _maybeAutoSettle(p.account, p.handle);
   }
 
   // fire an on-chain settlement automatically ONLY within the user-consented policy
   Future<void> _maybeAutoSettle(String account, String handle) async {
+    if (account == _account) { setState(() => _pending.remove(account)); return; } // self-tip: nothing to settle
     if (!_autoSettle) return;
+    // RE-ENTRANCY GUARD: settle is a multi-second network+PoW round trip fired from every tip tap. Two
+    // overlapping settles for one creator would sign on the same (not-yet-advanced) frontier — one forks
+    // — and the second's success would clear a tally the first hadn't yet accounted for. One at a time.
+    if (_settling.contains(account) || _settleBusy) return;
     final amt = _pending[account] ?? 0;
     if (amt + 1e-9 < _autoThreshold) return; // below the per-creator threshold — keep tallying
     if (_autoSpent + amt > _autoCap + 1e-9) {
@@ -1931,27 +2342,50 @@ class _FeedScreenState extends State<FeedScreen> {
           content: Text('auto-settle cap reached — settle the rest manually')));
       return;
     }
-    final r = await Api.settle(account, amt.toStringAsFixed(2),
+    _settling.add(account);
+    try {
+    final r = await Api.settle(account, amt.toStringAsFixed(6),
         split: _settings.relaySplit, rsplit: _settings.reposterSplit,
         reposter: _reposterOf[account] ?? '', media: _mediaOf[account] ?? '');
     if (r != null && r['ok'] == true) {
+      // same as manual settle: money moved, so notify the creator + record the receipt (both settle
+      // paths must behave identically — otherwise an auto-settled tip would never notify or log).
+      await TxLogStore.add({
+        'ts': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        'handle': handle, 'account': account,
+        'total': amt, 'paid': r['paid_xno'], 'legs': (r['legs'] as List?) ?? const [],
+      });
+      if (account != _account && _settings.notifyTip) {
+        Api.notifyPush(account, _handle, 'tip', 'settled ${fmtXno(amt)} XNO to you on-chain');
+      }
       setState(() {
         _autoSpent += amt;
-        _pending.remove(account);
-        _reposterOf.remove(account);
-        _mediaOf.remove(account);
+        // Subtract ONLY what we settled — anything tallied for this creator DURING the await must stay
+        // pending (removing the whole entry would silently drop those later tips). Drain fully → clear.
+        final rem = (_pending[account] ?? 0) - amt;
+        if (rem > 1e-9) {
+          _pending[account] = rem;
+        } else {
+          _pending.remove(account);
+          _reposterOf.remove(account);
+          _mediaOf.remove(account);
+        }
       });
+      await _refreshTxLog();
       await _load();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           backgroundColor: kCard,
           content: Text(
-              '⚡ auto-settled ${amt.toStringAsFixed(2)} XNO → @$handle · 1 block (policy ≥${_autoThreshold.toStringAsFixed(2)})')));
+              '⚡ auto-settled ${fmtXno(amt)} XNO → @$handle · 1 block (policy ≥${fmtXno(_autoThreshold)})')));
     } else if (r != null && mounted) {
       // a failed auto-settle must not fail silently — the tally stays pending and the user is told why
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           backgroundColor: kCard,
           content: Text('auto-settle held: ${r['error'] ?? 'failed'} — still pending')));
+    }
+    } finally {
+      _settling.remove(account);
     }
   }
 
@@ -2020,30 +2454,193 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   Future<void> _settle() async {
+    if (_settleBusy) return;   // a batch settle is already running — a double-tap must not start a second
+    _settleBusy = true;
+    try {
+    _pending.remove(_account);   // a self-tip settles as send-to-yourself — drop it so it can't get stuck
     final entries = _pending.entries.toList();
-    int blocks = 0, failedCount = 0;
+    int paidCreators = 0, blocks = 0, failedCreators = 0, legShorts = 0;
     String? err;
     for (final e in entries) {
-      final r = await Api.settle(e.key, e.value.toStringAsFixed(2),
+      final handle = _handleOf[e.key] ?? 'creator';
+      final r = await Api.settle(e.key, e.value.toStringAsFixed(6),
           split: _settings.relaySplit, rsplit: _settings.reposterSplit,
           reposter: _reposterOf[e.key] ?? '', media: _mediaOf[e.key] ?? '');
-      if (r != null && r['ok'] == true) {
-        blocks++;
-        // clear ONLY what actually settled — an unpaid tally must stay pending, not silently vanish
-        setState(() { _pending.remove(e.key); _reposterOf.remove(e.key); _mediaOf.remove(e.key); });
+      final legs = (r?['legs'] as List?)?.cast<Map<String, dynamic>>() ?? const <Map<String, dynamic>>[];
+      final creatorPaid = r != null && r['ok'] == true;
+      if (creatorPaid) {
+        paidCreators++;
+        blocks += legs.where((l) => l['ok'] == true).length;
+        if (legs.any((l) => l['role'] != 'creator' && l['ok'] == false)) legShorts++;
+        // Persist the receipt — the tipper's own on-chain trail (roles, amounts, block hashes) — and
+        // tell the creator the money actually MOVED (settle time), not just that a tally was pledged.
+        await TxLogStore.add({
+          'ts': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          'handle': handle, 'account': e.key,
+          'total': e.value, 'paid': r['paid_xno'], 'legs': legs,
+        });
+        if (e.key != _account && _settings.notifyTip) {
+          Api.notifyPush(e.key, _handle, 'tip', 'settled ${fmtXno(e.value)} XNO to you on-chain');
+        }
+        // Subtract ONLY what we settled — a tip tallied to this creator DURING the awaited settle must
+        // survive (removing the whole entry would drop it). Drain fully → clear the entry + its locks.
+        setState(() {
+          final rem = (_pending[e.key] ?? 0) - e.value;
+          if (rem > 1e-9) {
+            _pending[e.key] = rem;
+          } else {
+            _pending.remove(e.key); _reposterOf.remove(e.key); _mediaOf.remove(e.key);
+          }
+        });
       } else {
-        failedCount++;
-        err ??= r?['error']?.toString();
+        failedCreators++;
+        err ??= r?['error']?.toString() ??
+            (legs.firstWhere((l) => l['role'] == 'creator', orElse: () => const {})['error']?.toString());
       }
     }
+    await _refreshTxLog();
+    await _refreshTxCount(); // your on-chain tx count just grew — update the header
     await _load(); // refresh the footprint meter
     if (!mounted) return;
-    final msg = failedCount == 0
-        ? 'settled ${entries.length} creator${entries.length == 1 ? '' : 's'} in $blocks Nano block${blocks == 1 ? '' : 's'} · ⚙ PoW delegated (0 ms on device)'
-        : blocks > 0
-            ? 'settled $blocks of ${entries.length} · $failedCount unpaid (${err ?? 'failed'}) — still pending'
+    final msg = failedCreators == 0
+        ? (legShorts == 0
+            ? '✓ settled $paidCreators creator${paidCreators == 1 ? '' : 's'} · $blocks Nano block${blocks == 1 ? '' : 's'} on-chain'
+            : '✓ paid $paidCreators · $legShorts split leg${legShorts == 1 ? '' : 's'} failed — see Transactions')
+        : paidCreators > 0
+            ? 'paid $paidCreators of ${entries.length} · $failedCreators unpaid (${err ?? 'failed'}) — still pending'
             : 'nothing settled — ${err ?? 'settle failed'}. Your tips are still pending.';
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(backgroundColor: kCard, content: Text(msg)));
+    } finally {
+      _settleBusy = false;
+    }
+  }
+
+  // The tipper's receipt trail, loaded from disk. See TxLogStore — the network notifies the RECIPIENT
+  // of a tip, never the sender, so this on-device log is the only place a tipper can see (and verify
+  // against the ledger) exactly what their settlements moved.
+  List<Map<String, dynamic>> _txLog = [];
+  Future<void> _refreshTxLog() async {
+    final t = await TxLogStore.get();
+    if (mounted) setState(() => _txLog = t);
+  }
+
+  // The header's "Nano txns" = the number of on-chain blocks on YOUR account chain (every settle / send /
+  // receive you've made). Read from the ledger via account_state.block_count; grows as you settle tips.
+  Future<void> _refreshTxCount() async {
+    if (_account.isEmpty) return;
+    final st = await Api.accountState(_account);
+    final bc = (st?['block_count'] as num?)?.toInt();
+    if (bc != null && mounted) setState(() => _onchainBlocks = bc);
+  }
+
+  // pull the set of online accounts into PresenceCache; AuthorAvatars repaint their green dots.
+  Future<void> _refreshPresence() async {
+    PresenceCache.I.update(await Api.presence());
+  }
+
+  // network-wide channel accounts — excluded from the Home/For-You feed so channels live only in the
+  // Channels tab (their posts/articles are read there), not mixed into the personal timeline.
+  Set<String> _channelAccounts = {};
+  Future<void> _refreshChannelAccounts() async {
+    final chs = await Api.channels();
+    if (mounted) setState(() => _channelAccounts = chs.map((c) => '${c['account']}').toSet());
+  }
+
+  // A settled-tips history sheet: one card per settlement, each split leg with its amount, a ✓/✗ for
+  // whether that Nano block actually landed, and the hash (tap to copy → paste into any explorer).
+  void _showTransactions() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kBg,
+      isScrollControlled: true,
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.7, minChildSize: 0.4, maxChildSize: 0.95, expand: false,
+        builder: (_, scroll) => Padding(
+          padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              const Icon(Icons.receipt_long, size: 20, color: kAccent),
+              const SizedBox(width: 8),
+              const Text('Transactions', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+              const Spacer(),
+              Text('${_txLog.length}', style: const TextStyle(color: kDim, fontSize: 13)),
+            ]),
+            const SizedBox(height: 4),
+            const Text('Tips you settled on-chain. Tap a block hash to copy it — paste into any Nano explorer to verify.',
+                style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+            const SizedBox(height: 12),
+            Expanded(
+              child: _txLog.isEmpty
+                  ? const Center(child: Text('No settlements yet.', style: TextStyle(color: kDim, fontSize: 13)))
+                  : ListView.separated(
+                      controller: scroll,
+                      itemCount: _txLog.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 10),
+                      itemBuilder: (_, i) => _txCard(_txLog[i]),
+                    ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _txCard(Map<String, dynamic> tx) {
+    final legs = ((tx['legs'] as List?) ?? const []).cast<Map<String, dynamic>>();
+    final ts = (tx['ts'] as num?)?.toInt() ?? 0;
+    final when = ts == 0 ? '' : DateTime.fromMillisecondsSinceEpoch(ts * 1000).toLocal().toString().substring(0, 16);
+    final paid = (tx['paid'] as num?)?.toDouble() ?? 0;
+    final total = (tx['total'] as num?)?.toDouble() ?? paid;
+    final short = paid + 1e-9 < total;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(12), border: Border.all(color: kLine)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text('@${tx['handle'] ?? 'creator'}',
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 14))),
+          Text('${paid.toStringAsFixed(3)} XNO', style: const TextStyle(color: kAccent, fontWeight: FontWeight.w800, fontSize: 14)),
+        ]),
+        if (when.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 2),
+            child: Text(when, style: const TextStyle(color: kDim, fontSize: 11))),
+        const SizedBox(height: 8),
+        ...legs.map((l) {
+          final ok = l['ok'] == true;
+          final hash = (l['hash'] as String?) ?? '';
+          final xno = (l['xno'] as num?)?.toDouble() ?? 0;
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(children: [
+              Icon(ok ? Icons.check_circle : Icons.cancel, size: 15, color: ok ? kAccent : Colors.redAccent),
+              const SizedBox(width: 6),
+              SizedBox(width: 64, child: Text('${l['role']}', style: const TextStyle(color: kDim, fontSize: 12))),
+              Text('${xno.toStringAsFixed(3)}', style: const TextStyle(color: kText, fontSize: 12.5)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ok && hash.isNotEmpty
+                    ? GestureDetector(
+                        onTap: () {
+                          Clipboard.setData(ClipboardData(text: hash));
+                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                              backgroundColor: kCard, duration: Duration(milliseconds: 1200),
+                              content: Text('block hash copied')));
+                        },
+                        child: Text('${hash.substring(0, 12)}… ⧉',
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: kAccent, fontSize: 11, fontFamily: 'monospace')))
+                    : Text(ok ? '' : '${l['error'] ?? 'failed'}',
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.redAccent, fontSize: 11)),
+              ),
+            ]),
+          );
+        }),
+        if (short) Padding(padding: const EdgeInsets.only(top: 2),
+            child: Text('creator paid; a split leg did not land — retry available next settle',
+                style: TextStyle(color: Colors.orangeAccent.shade100, fontSize: 11))),
+      ]),
+    );
   }
 
   // The settle menu: opened deliberately from the header tips icon, not always on screen. Lists the
@@ -2057,6 +2654,7 @@ class _FeedScreenState extends State<FeedScreen> {
       builder: (_) {
         bool settling = false;                           // persists across StatefulBuilder rebuilds
         return StatefulBuilder(builder: (ctx, setSheet) {
+          _pending.remove(_account);   // hide any self-tip: it can't settle (send-to-self), so never list it
           final entries = _pending.entries.toList();
           final total = _pending.values.fold<double>(0, (a, b) => a + b);
           return Padding(
@@ -2068,6 +2666,11 @@ class _FeedScreenState extends State<FeedScreen> {
                 const Text('Tips to settle', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
                 const Spacer(),
                 IconButton(
+                  onPressed: () { Navigator.pop(ctx); _showTransactions(); },
+                  icon: const Icon(Icons.receipt_long, size: 20, color: kDim),
+                  tooltip: 'Transactions',
+                ),
+                IconButton(
                   onPressed: () { Navigator.pop(ctx); _showAutoSettle(); },
                   icon: Icon(Icons.tune, size: 20, color: _autoSettle ? kAccent : kDim),
                   tooltip: 'Auto-settle policy',
@@ -2075,7 +2678,7 @@ class _FeedScreenState extends State<FeedScreen> {
               ]),
               Text(
                   _autoSettle
-                      ? 'Tips tally off-chain. Auto-settle is on (≥${_autoThreshold.toStringAsFixed(2)} XNO each). Settle the rest now, or leave them to accrue.'
+                      ? 'Tips tally off-chain. Auto-settle is on (≥${fmtXno(_autoThreshold)} XNO each). Settle the rest now, or leave them to accrue.'
                       : 'Tips tally off-chain — nothing has moved yet. Settling sends one direct Nano block to each creator.',
                   style: const TextStyle(color: kDim, fontSize: 12, height: 1.4)),
               const SizedBox(height: 14),
@@ -2091,7 +2694,7 @@ class _FeedScreenState extends State<FeedScreen> {
                         Expanded(child: Text('@${_handleOf[e.key] ?? 'creator'}',
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(color: kText, fontSize: 14, fontWeight: FontWeight.w600))),
-                        Text('${e.value.toStringAsFixed(2)} XNO',
+                        Text('${fmtXno(e.value)} XNO',
                             style: const TextStyle(color: kAccent, fontWeight: FontWeight.w700, fontSize: 14)),
                       ]),
                     )),
@@ -2100,29 +2703,29 @@ class _FeedScreenState extends State<FeedScreen> {
                   Text('${entries.length} creator${entries.length == 1 ? '' : 's'}',
                       style: const TextStyle(color: kDim, fontSize: 12)),
                   const Spacer(),
-                  Text('${total.toStringAsFixed(2)} XNO total',
+                  Text('${fmtXno(total)} XNO total',
                       style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 15)),
                 ]),
                 const SizedBox(height: 14),
                 SizedBox(
                   width: double.infinity,
                   child: FilledButton(
-                    onPressed: settling
-                        ? null
-                        : () async {
-                            setSheet(() => settling = true);
-                            await _settle();               // shows the result snackbar on the main scaffold
-                            if (ctx.mounted) Navigator.pop(ctx);
+                    onPressed: () {
+                            // Nautilus-style: acknowledge instantly and settle on-chain in the BACKGROUND,
+                            // so the user isn't held on a spinner through the multi-second PoW + broadcast.
+                            // _settle() (guarded by _settleBusy) posts the final result when the blocks land.
+                            Navigator.pop(ctx);
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                                backgroundColor: kCard,
+                                content: Text('◈ Tip sent — settling ${fmtXno(total)} XNO on-chain in the background…')));
+                            _settle();
                           },
                     style: FilledButton.styleFrom(
                         backgroundColor: kAccent, foregroundColor: Colors.black,
                         padding: const EdgeInsets.symmetric(vertical: 14),
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24))),
-                    child: settling
-                        ? const SizedBox(height: 20, width: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.black))
-                        : Text('Settle ${total.toStringAsFixed(2)} XNO',
-                            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
+                    child: Text('Settle ${fmtXno(total)} XNO',
+                        style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15)),
                   ),
                 ),
                 const SizedBox(height: 8),
@@ -2206,10 +2809,18 @@ class _FeedScreenState extends State<FeedScreen> {
 
   // Home shows the people you follow (+ your own posts); everyone if you follow no one yet
   List<Post> _homePosts() {
-    final base = _follows.isEmpty
-        ? _posts
-        : _posts.where((p) => _follows.contains(p.account) || p.account == _account);
-    return base.where((p) => !_reported.contains(p.id) && !_hidden(p.account)).toList();
+    // STRICT Following: ONLY the accounts you follow — not your own posts (those live on your profile
+    // and in For You). Follow nobody → empty, and the feed shows a discover prompt instead of falling
+    // back to everyone. Roots only (replyTo == null) — replies render NESTED under their parent.
+    if (_follows.isEmpty) return const [];
+    return _posts
+        .where((p) =>
+            _follows.contains(p.account) &&
+            !_reported.contains(p.id) &&
+            !_hidden(p.account) &&
+            !_channelAccounts.contains(p.account) && // channels have their own tab
+            p.replyTo == null)
+        .toList();
   }
 
   // ---- "For You": a TRANSPARENT, tunable ranking (unlike a black-box algorithm) ----
@@ -2235,7 +2846,8 @@ class _FeedScreenState extends State<FeedScreen> {
   // ranked feed across everyone (minus muted/blocked/reported), highest score first
   List<Post> _forYouPosts() {
     final list = _posts
-        .where((p) => !_reported.contains(p.id) && !_hidden(p.account) && p.replyTo == null)
+        .where((p) => !_reported.contains(p.id) && !_hidden(p.account) && p.replyTo == null &&
+            !_channelAccounts.contains(p.account)) // channels live in the Channels tab, not the feed
         .toList();
     list.sort((a, b) => _score(b).compareTo(_score(a)));
     return list;
@@ -2248,7 +2860,7 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
 
-  String _rawOf(double xno) => '${(xno * 100).round()}${'0' * 28}'; // XNO(2dp) -> raw string
+  String _rawOf(double xno) => Api._xnoToRaw(xno.toStringAsFixed(6)).toString(); // XNO(6dp) -> raw string (supports sub-0.01 tips)
 
   void _bumpEngage(String pid, String field, num delta) {
     final e = _eng(pid);
@@ -2263,8 +2875,9 @@ class _FeedScreenState extends State<FeedScreen> {
       _bumpEngage(p.id, 'likes', liked ? -1 : 1);
     });
     Api.like(p.id, liked ? -1 : 1);
+    EngageStore.saveLiked(_liked); // persist so this device's like counts once (no re-like each session)
     if (!liked && p.account != _account && _settings.notifyLike) {
-      Api.notifyPush(p.handle, _handle, 'like',
+      Api.notifyPush(p.account, _handle, 'like',
           'liked: ${p.text.length > 40 ? '${p.text.substring(0, 40)}…' : p.text}');
     }
   }
@@ -2276,8 +2889,9 @@ class _FeedScreenState extends State<FeedScreen> {
       _bumpEngage(p.id, 'reposts', rp ? -1 : 1);
     });
     Api.repost(p.id, rp ? -1 : 1, _account); // record WHO reshared (reward attribution)
+    EngageStore.saveReposted(_reposted); // persist so this device's repost counts once
     if (!rp && p.account != _account) {
-      Api.notifyPush(p.handle, _handle, 'repost', 'reposted your post');
+      Api.notifyPush(p.account, _handle, 'repost', 'reposted your post');
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           backgroundColor: kCard,
           content: Text('🔁 reposted — spreads to your followers; you earn a cut of its future tips')));
@@ -2286,11 +2900,11 @@ class _FeedScreenState extends State<FeedScreen> {
 
   // count one impression per post/comment per session (fire-and-forget; shows on next refresh)
   void _countView(String id) {
-    if (id.isNotEmpty && _viewed.add(id)) Api.view(id);
+    if (id.isNotEmpty && _viewed.add(id)) { Api.view(id); EngageStore.saveViewed(_viewed); }
   }
 
   // build a fully-wired post card (reused by the profile screen's Posts/Media tabs)
-  Widget _profileCard(Post post) {
+  Widget _profileCard(Post post, {bool expanded = false}) {
     _countView(post.id); // this card is being rendered → an impression
     final mod = _mod(post.id);
     if (mod.hide) {
@@ -2298,6 +2912,7 @@ class _FeedScreenState extends State<FeedScreen> {
     }
     return PostCard(
         post: post,
+        expanded: expanded,
         softFlag: mod,
         pending: _pending[post.account] ?? 0,
         engage: _eng(post.id),
@@ -2312,6 +2927,11 @@ class _FeedScreenState extends State<FeedScreen> {
         onRepost: () => _toggleRepost(post),
         onReport: () => _reportPost(post),
         onComment: () => _openComments(post),
+        onReply: () => _compose(replyToPost: post),                 // X-style reply → new post w/ reply_to
+        // count the WHOLE thread below this post (transitive), incl. buffered new posts — a reply chain
+        // shows its true size, not just direct children (which read as "1" on a multi-deep thread).
+        replyCount: _threadReplyCount(post.id),
+        replyingToHandle: post.replyTo == null ? '' : (_postById(post.replyTo)?.handle ?? ''),
         onQuote: () => _quotePost(post),
         onOpenThread: () => _openThread(post),
         onOpenProfile: () => _openProfile(post.account, post.handle),
@@ -2335,6 +2955,48 @@ class _FeedScreenState extends State<FeedScreen> {
   bool _inThread(Post p) =>
       (p.replyTo != null && p.replyTo!.isNotEmpty) || _posts.any((x) => x.replyTo == p.id);
 
+  // Count EVERY reply in the thread below a post (transitive), not just direct children. Replies chain
+  // (A <- B <- C), so a direct-only count shows 1 on a 3-deep thread — which reads as "several comments
+  // but it says 1". Walks children across the loaded feed + the buffered new posts. Guards against a
+  // cycle with `seen`. O(n) over loaded posts; the feed is small, and it's only called per visible card.
+  int _threadReplyCount(String rootId) {
+    final kids = <String, List<String>>{};
+    for (final p in [..._posts, ..._newPosts]) {
+      final parent = p.replyTo;
+      if (parent != null && parent.isNotEmpty) (kids[parent] ??= []).add(p.id);
+    }
+    final seen = <String>{};
+    final stack = <String>[rootId];
+    var n = 0;
+    while (stack.isNotEmpty) {
+      for (final child in (kids[stack.removeLast()] ?? const [])) {
+        if (seen.add(child)) { n++; stack.add(child); }
+      }
+    }
+    return n;
+  }
+
+  // Every reply in the thread below a post, in reading order (depth-first, oldest-first at each level).
+  // Used to render replies NESTED under their parent in the feed. Spans the loaded feed + new posts.
+  List<Post> _threadReplies(String rootId) {
+    final kids = <String, List<Post>>{};
+    for (final p in [..._posts, ..._newPosts]) {
+      final parent = p.replyTo;
+      if (parent != null && parent.isNotEmpty) (kids[parent] ??= []).add(p);
+    }
+    final out = <Post>[];
+    final seen = <String>{};
+    void walk(String id) {
+      final cs = (kids[id] ?? [])..sort((a, b) => a.ts.compareTo(b.ts));
+      for (final c in cs) {
+        if (seen.add(c.id)) { out.add(c); walk(c.id); }
+      }
+    }
+    walk(rootId);
+    return out;
+  }
+
+
   Post _threadRoot(Post p) {
     var cur = p;
     final seen = <String>{};
@@ -2347,21 +3009,13 @@ class _FeedScreenState extends State<FeedScreen> {
     return cur;
   }
 
-  // root + its descendants, oldest-first (the reading order of a thread)
-  List<Post> _threadChain(Post root) {
-    final chain = <Post>[root];
-    bool added = true;
-    while (added) {
-      added = false;
-      final lastId = chain.last.id;
-      for (final p in _posts) {
-        if (p.replyTo == lastId && !chain.contains(p)) { chain.add(p); added = true; }
-      }
-    }
-    return chain;
-  }
+  // root + ALL its descendants in reading order. Uses the same transitive DFS walk as the feed count
+  // (_threadReplies), so a BRANCHED thread — two replies to the same post, a reply to a reply — shows
+  // every message. (The old walk only extended from the last-added node, dropping sibling branches.)
+  List<Post> _threadChain(Post root) => [root, ..._threadReplies(root.id)];
 
   void _openThread(Post p) {
+    if (p.kind == 'article') { _openArticle(p); return; }   // long-form → full-screen reader
     final root = _threadRoot(p);
     final chain = _threadChain(root);
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => Scaffold(
@@ -2371,8 +3025,241 @@ class _FeedScreenState extends State<FeedScreen> {
       body: ListView.separated(
         itemCount: chain.length,
         separatorBuilder: (_, __) => Container(color: kLine, height: 1),
-        itemBuilder: (_, i) => _profileCard(chain[i]),
+        // the focused (root) post shows its full text; replies keep the compact "Show more" behaviour
+        itemBuilder: (_, i) => _profileCard(chain[i], expanded: i == 0),
       ),
+    )));
+  }
+
+  // full-screen article reader: cover + title + author + markdown body + engagement (reuses feed handlers)
+  void _openArticle(Post p) {
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => Scaffold(
+      backgroundColor: kBg,
+      appBar: AppBar(backgroundColor: kBg, elevation: 0, iconTheme: const IconThemeData(color: kText),
+          title: const Text('Article', style: TextStyle(color: kText, fontWeight: FontWeight.w800))),
+      body: ListView(children: [
+        if (p.media != null && p.media!.isNotEmpty)
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 240),
+            child: SizedBox(width: double.infinity, child: MediaImage(cid: p.media!, fit: BoxFit.cover)),
+          ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(18, 18, 18, 32),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(p.title ?? '',
+                style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 26, height: 1.25)),
+            const SizedBox(height: 14),
+            GestureDetector(
+              onTap: () => _openProfile(p.account, p.handle),
+              child: Row(children: [
+                AuthorAvatar(account: p.account, handle: p.handle, radius: 18),
+                const SizedBox(width: 10),
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  AnimatedBuilder(
+                      animation: ProfileCache.I,
+                      builder: (_, __) => Text(ProfileCache.I.displayName(p.account, p.handle),
+                          style: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 15))),
+                  Text('@${p.handle} · ${timeAgo(p.ts)}', style: const TextStyle(color: kDim, fontSize: 12.5)),
+                ]),
+              ]),
+            ),
+            const SizedBox(height: 18),
+            MarkdownBody(
+              data: p.text,
+              styleSheet: MarkdownStyleSheet(
+                p: const TextStyle(color: kText, fontSize: 17, height: 1.6),
+                h1: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 24, height: 1.3),
+                h2: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 20, height: 1.3),
+                h3: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 18),
+                a: const TextStyle(color: kAccent),
+                blockquote: const TextStyle(color: kDim, fontSize: 16, height: 1.5),
+                code: const TextStyle(color: kAccent, fontFamily: 'monospace'),
+                listBullet: const TextStyle(color: kText, fontSize: 17),
+              ),
+            ),
+            const SizedBox(height: 24),
+            Container(height: 1, color: kLine),
+            const SizedBox(height: 12),
+            _readerActionRow(p),
+          ]),
+        ),
+        // Comments below the article. Channels post ARTICLES, and the reader used to show only the body —
+        // so a channel post's replies were invisible ("channels don't show the comments"). Render the
+        // conversation here, the same reply-posts a normal post shows in its thread view.
+        Container(height: 8, color: kBg),
+        Container(height: 1, color: kLine),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(18, 14, 18, 4),
+          child: Row(children: [
+            Icon(Icons.mode_comment_outlined, color: kAccent, size: 18),
+            SizedBox(width: 8),
+            Text('Comments', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 16)),
+          ]),
+        ),
+        Builder(builder: (_) {
+          final replies = _threadReplies(p.id);
+          if (replies.isEmpty) {
+            return const Padding(
+              padding: EdgeInsets.fromLTRB(18, 18, 18, 30),
+              child: Text('No comments yet — tap the reply icon above to be the first.',
+                  style: TextStyle(color: kDim, fontSize: 13.5)));
+          }
+          return Column(children: [
+            for (final r in replies) ...[Container(color: kLine, height: 1), _profileCard(r)],
+          ]);
+        }),
+      ]),
+    )));
+  }
+
+  Widget _readerActionRow(Post p) {
+    final e = _eng(p.id);
+    final liked = _liked.contains(p.id);
+    final reposted = _reposted.contains(p.id);
+    final tips = (e['tips_xno'] is num) ? (e['tips_xno'] as num).toDouble() : 0.0;
+    Widget act(IconData ic, String label, Color c, VoidCallback onTap) => InkWell(
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+            child: Row(children: [
+              Icon(ic, size: 20, color: c),
+              const SizedBox(width: 6),
+              Text(label, style: TextStyle(color: c, fontSize: 13.5, fontWeight: FontWeight.w600)),
+            ]),
+          ),
+        );
+    return Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+      act(liked ? Icons.favorite : Icons.favorite_border, '${e['likes'] ?? 0}', liked ? kAccent : kDim,
+          () => _toggleLike(p)),
+      act(Icons.mode_comment_outlined, '${_commentCount[p.id] ?? 0}', kDim, () => _openComments(p)),
+      act(Icons.repeat, '${e['reposts'] ?? 0}', reposted ? kAccent : kDim, () => _toggleRepost(p)),
+      act(Icons.bolt, tips > 0 ? 'Ӿ ${tips.toStringAsFixed(2)}' : 'Tip', kAccent, () => _tallyTip(p)),
+    ]);
+  }
+
+  // ---- CHANNELS: seed-derived publishing identities (like Medium publications) ----
+  List<String> _myChannels = [];
+  Future<void> _loadChannels() async {
+    final p = await SharedPreferences.getInstance();
+    if (mounted) setState(() => _myChannels = p.getStringList('xchat_channels') ?? []);
+  }
+  Future<void> _saveChannels() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setStringList('xchat_channels', _myChannels);
+  }
+
+  String _channelHandle(String name) => name.trim().toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
+
+  InputDecoration _chanDeco(String hint) => InputDecoration(
+        hintText: hint, hintStyle: const TextStyle(color: kDim), counterText: '',
+        enabledBorder: const UnderlineInputBorder(borderSide: BorderSide(color: kLine)),
+        focusedBorder: const UnderlineInputBorder(borderSide: BorderSide(color: kAccent)),
+      );
+
+  void _createChannel() {
+    final nameCtl = TextEditingController();
+    final descCtl = TextEditingController();
+    final picker = ImagePicker();
+    String avatarCid = '';
+    bool saving = false, uploadingA = false;
+    showModalBottomSheet(
+      context: context, isScrollControlled: true, backgroundColor: kBg,
+      builder: (_) => StatefulBuilder(builder: (ctx, setSheet) {
+        Future<void> pickAvatar() async {
+          final x = await picker.pickImage(
+              source: ImageSource.gallery, maxWidth: 480, maxHeight: 480, imageQuality: 82);
+          if (x == null) return;
+          setSheet(() => uploadingA = true);
+          final bytes = await x.readAsBytes();
+          final cid = await Api.blobPut(bytes);
+          setSheet(() { if (cid != null) avatarCid = cid; uploadingA = false; });
+        }
+        return Padding(
+          padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('New channel', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+              const SizedBox(height: 4),
+              const Text('A publication with its own identity — restorable from your seed, followable by anyone.',
+                  style: TextStyle(color: kDim, fontSize: 12.5, height: 1.4)),
+              const SizedBox(height: 16),
+              // channel photo — the publication's avatar (a content-addressed blob, like a profile picture)
+              Row(children: [
+                GestureDetector(
+                  onTap: uploadingA ? null : pickAvatar,
+                  child: Container(
+                    width: 64, height: 64, clipBehavior: Clip.antiAlias,
+                    decoration: BoxDecoration(shape: BoxShape.circle, color: kCard, border: Border.all(color: kLine)),
+                    child: uploadingA
+                        ? const Center(child: SizedBox(height: 20, width: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2, color: kAccent)))
+                        : (avatarCid.isEmpty
+                            ? const Icon(Icons.add_a_photo_outlined, color: kDim, size: 24)
+                            : MediaImage(cid: avatarCid, fit: BoxFit.cover)),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(child: Text(avatarCid.isEmpty ? 'Add a channel photo (optional)' : 'Photo added — tap to change',
+                    style: const TextStyle(color: kDim, fontSize: 13))),
+              ]),
+              const SizedBox(height: 14),
+              TextField(controller: nameCtl, maxLength: 40, style: const TextStyle(color: kText, fontSize: 15),
+                  decoration: _chanDeco('Channel name')),
+              const SizedBox(height: 8),
+              TextField(controller: descCtl, maxLength: 160, minLines: 2, maxLines: 3,
+                  style: const TextStyle(color: kText, fontSize: 15), decoration: _chanDeco('Description')),
+              const SizedBox(height: 12),
+              SizedBox(width: double.infinity, child: FilledButton(
+                onPressed: saving ? null : () async {
+                  final name = nameCtl.text.trim();
+                  final w = gWallet;
+                  if (name.isEmpty || w == null || _myChannels.contains(name)) { Navigator.pop(ctx); return; }
+                  setSheet(() => saving = true);
+                  final ch = w.channelWallet(name);
+                  await Api.profileSet(name, descCtl.text.trim(), avatarCid, '', signer: ch, type: 'channel');
+                  // surface the new channel's name/photo everywhere at once (don't wait for a relay round-trip)
+                  ProfileCache.I.put(ch.account, {'display': name, 'bio': descCtl.text.trim(), 'avatar': avatarCid});
+                  setState(() => _myChannels.add(name));
+                  await _saveChannels();
+                  if (!_follows.contains(ch.account)) { _follows.add(ch.account); _publishFollows(); }
+                  if (!mounted) return;
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      backgroundColor: kCard, content: Text('channel created — publish articles under it')));
+                },
+                style: FilledButton.styleFrom(backgroundColor: kAccent, foregroundColor: Colors.black),
+                child: Text(saving ? 'Creating…' : 'Create channel', style: const TextStyle(fontWeight: FontWeight.w800)),
+              )),
+            ]),
+          ),
+        );
+      }),
+    );
+  }
+
+  void _openChannels() {
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => Scaffold(
+      backgroundColor: kBg,
+      appBar: AppBar(backgroundColor: kBg, elevation: 0, iconTheme: const IconThemeData(color: kText),
+          title: const Text('Channels', style: TextStyle(color: kText, fontWeight: FontWeight.w800)),
+          actions: [IconButton(icon: const Icon(Icons.add, color: kAccent),
+              onPressed: () { Navigator.pop(context); _createChannel(); }, tooltip: 'New channel')]),
+      body: _myChannels.isEmpty
+          ? const Center(child: Padding(padding: EdgeInsets.all(32),
+              child: Text('No channels yet.\nCreate one to publish articles under a publication identity.',
+                  textAlign: TextAlign.center, style: TextStyle(color: kDim, height: 1.6))))
+          : ListView(children: [
+              for (final name in _myChannels)
+                ListTile(
+                  leading: AuthorAvatar(account: gWallet?.channelWallet(name).account ?? '',
+                      handle: _channelHandle(name), radius: 20),
+                  title: Text(name, style: const TextStyle(color: kText, fontWeight: FontWeight.w700)),
+                  subtitle: Text('@${_channelHandle(name)}', style: const TextStyle(color: kDim, fontSize: 12.5)),
+                  trailing: const Icon(Icons.chevron_right, color: kDim),
+                  onTap: () => _openProfile(gWallet?.channelWallet(name).account ?? '', _channelHandle(name)),
+                ),
+            ]),
     )));
   }
 
@@ -2401,11 +3288,40 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   void _openDms() {
+    // opening the inbox marks everything up to now as seen, so the mail badge clears
+    final nowTs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    _dmSeenTs = nowTs;
+    SharedPreferences.getInstance().then((sp) => sp.setInt('dm_seen_ts', nowTs));
+    setState(() => _dmUnread = 0);
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => DmInboxScreen(
       handleOf: _handleFor,
       isBlocked: (acc) => _blocked.contains(acc), // blocked people's DMs don't reach you
       onOpen: (acc, h) => _openChat(acc, h),
     )));
+  }
+
+  // Count conversations whose newest INCOMING message is newer than the last time DMs were opened.
+  // Runs on launch and on the same quiet cadence as the feed, so a DM that arrives while you're in the
+  // app lights the mail icon on its own (matching the bell). Best-effort: a failed poll leaves it as-is.
+  Future<void> _refreshDmBadge() async {
+    if (gWallet == null) return;
+    try {
+      final convos = await Api.dmInbox();
+      var unread = 0;
+      for (final c in convos) {
+        final msgs = (c['messages'] as List?) ?? const [];
+        var lastIn = 0;
+        for (final m in msgs) {
+          if ((m as Map)['outgoing'] != true) {
+            final ts = (m['ts'] ?? 0) as int;
+            if (ts > lastIn) lastIn = ts;
+          }
+        }
+        if (lastIn > _dmSeenTs) unread++;
+      }
+      if (mounted) setState(() => _dmUnread = unread);
+      Notifs.setBadge(unread);   // unread-DM count on the launcher icon
+    } catch (_) {}
   }
 
   Future<void> _openChat(String account, String handle) async {
@@ -2417,7 +3333,23 @@ class _FeedScreenState extends State<FeedScreen> {
   Future<void> _initProfile() async {
     if (_account.isEmpty) return;
     final p = await Api.profileGet(_account);
-    if (p != null) ProfileCache.I.put(_account, p);
+    if (p != null && '${p['display'] ?? ''}'.trim().isNotEmpty) {
+      ProfileCache.I.put(_account, p);
+      return;
+    }
+    // Our signed profile didn't verify (its record predates the current signing scheme), so our name
+    // shows as the default handle. AUTO-HEAL: recover the display name from the raw relay record and
+    // re-publish it signed under the current scheme — so names come back on their own after a migration,
+    // no manual re-entry. Only our OWN account, and only when the raw record is actually ours.
+    final raw = await Api.profileRaw(_account);
+    final display = '${raw?['display'] ?? ''}'.trim();
+    if (raw != null && raw['account'] == _account && display.isNotEmpty) {
+      await Api.profileSet(display, '${raw['bio'] ?? ''}', '${raw['avatar'] ?? ''}', '${raw['banner'] ?? ''}');
+      final fresh = await Api.profileGet(_account);
+      if (fresh != null) ProfileCache.I.put(_account, fresh);
+    } else if (p != null) {
+      ProfileCache.I.put(_account, p);
+    }
   }
 
   // edit-profile sheet: display name, bio, pick avatar/banner → upload (content-addressed) → publish
@@ -2483,15 +3415,17 @@ class _FeedScreenState extends State<FeedScreen> {
                   child: Container(
                     padding: const EdgeInsets.all(3),
                     decoration: const BoxDecoration(color: kBg, shape: BoxShape.circle),
-                    child: avatar.isNotEmpty
-                        ? Stack(children: [
-                            ClipOval(child: SizedBox(width: 62, height: 62, child: MediaImage(cid: avatar, fit: BoxFit.cover))),
-                            const Positioned.fill(child: ClipOval(child: _CamScrim())),
-                          ])
-                        : CircleAvatar(radius: 31, backgroundColor: kCard,
-                            child: uploadingA
-                                ? const CircularProgressIndicator(strokeWidth: 2, color: kAccent)
-                                : const Icon(Icons.add_a_photo_outlined, color: kDim, size: 20)),
+                    child: avatar.startsWith('live:')
+                        ? LiveAvatar(style: avatar.substring(5), radius: 31)
+                        : avatar.isNotEmpty
+                            ? Stack(children: [
+                                ClipOval(child: SizedBox(width: 62, height: 62, child: MediaImage(cid: avatar, fit: BoxFit.cover))),
+                                const Positioned.fill(child: ClipOval(child: _CamScrim())),
+                              ])
+                            : CircleAvatar(radius: 31, backgroundColor: kCard,
+                                child: uploadingA
+                                    ? const CircularProgressIndicator(strokeWidth: 2, color: kAccent)
+                                    : const Icon(Icons.add_a_photo_outlined, color: kDim, size: 20)),
                   ),
                 ),
               ),
@@ -2508,6 +3442,29 @@ class _FeedScreenState extends State<FeedScreen> {
                 minLines: 2, maxLines: 4, maxLength: 160,
                 decoration: _fieldDeco('Bio'),
               ),
+              const SizedBox(height: 6),
+              // LIVE avatar picker — an animated, code-drawn avatar (no upload). Tap to set/unset.
+              Row(children: [
+                const Text('Live avatar', style: TextStyle(color: kDim, fontSize: 12.5)),
+                const SizedBox(width: 12),
+                GestureDetector(
+                  onTap: () => setSheet(() => avatar = avatar == 'live:orbit' ? '' : 'live:orbit'),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                        color: avatar == 'live:orbit' ? kAccent.withValues(alpha: 0.15) : kCard,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(color: avatar == 'live:orbit' ? kAccent : kLine)),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      const LiveAvatar(style: 'orbit', radius: 11),
+                      const SizedBox(width: 7),
+                      Text('Orbit',
+                          style: TextStyle(color: avatar == 'live:orbit' ? kAccent : kText,
+                              fontWeight: FontWeight.w700, fontSize: 13)),
+                    ]),
+                  ),
+                ),
+              ]),
               const SizedBox(height: 8),
               SizedBox(width: double.infinity, child: FilledButton(
                 onPressed: saving ? null : () async {
@@ -2548,7 +3505,7 @@ class _FeedScreenState extends State<FeedScreen> {
         onTipComment: _tallyCommentTip,
         onCommented: () {
           if (p.account != _account && _settings.notifyComment) {
-            Api.notifyPush(p.handle, _handle, 'comment', 'commented on your post');
+            Api.notifyPush(p.account, _handle, 'comment', 'commented on your post');
           }
         },
       ),
@@ -2557,11 +3514,16 @@ class _FeedScreenState extends State<FeedScreen> {
     if (mounted) setState(() => _commentCount[p.id] = cs.length);
   }
 
-  // tip a COMMENT: tally to the comment's author, stat on the comment's own id, notify.
+  // tip a COMMENT: tally to the comment's author, stat on the comment's own id (notified at settle).
   void _tallyCommentTip(Map<String, dynamic> c) {
+    final acct = (c['account'] ?? '') as String;
+    if (acct == _account) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          backgroundColor: kCard, content: Text("You can't tip your own comment")));
+      return;
+    }
     final amt = _settings.defaultTip;
     if (!_guardTip(amt)) return;
-    final acct = (c['account'] ?? '') as String;
     final handle = (c['handle'] ?? '') as String;
     final cid = (c['cid'] ?? '') as String;
     setState(() {
@@ -2569,13 +3531,11 @@ class _FeedScreenState extends State<FeedScreen> {
       _handleOf[acct] = handle;
     });
     if (cid.isNotEmpty) Api.tipstat(cid, _rawOf(amt));
-    if (acct != _account && _settings.notifyTip) {
-      Api.notifyPush(handle, _handle, 'tip', 'tipped your comment ${amt.toStringAsFixed(2)} XNO');
-    }
+    // no notification here — a tip is a pledge until it settles; the creator is notified at SETTLE.
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
         duration: const Duration(milliseconds: 1200),
         backgroundColor: kCard,
-        content: Text('◈ +${amt.toStringAsFixed(2)} XNO tallied to @$handle (comment) — off-chain')));
+        content: Text('◈ +${fmtXno(amt)} XNO tallied to @$handle (comment) — off-chain')));
     _maybeAutoSettle(acct, handle);
   }
 
@@ -2820,6 +3780,10 @@ class _FeedScreenState extends State<FeedScreen> {
   // hasn't already dismissed, surface a banner. The manual wallet→"App updates" flow still exists; this
   // just means an update reaches people without them going looking for it.
   Future<void> _autoCheckUpdate() async {
+    // In a browser there is no APK to fetch and no OS installer to hand it to — the page IS the
+    // current version, and reloading is the update. Offering one would download a file nothing can
+    // install, so the whole self-update path is Android-only.
+    if (kIsWeb) return;
     try {
       final r = await Api.releaseCheck();
       if (r == null || r['update'] != true) return;
@@ -2842,14 +3806,21 @@ class _FeedScreenState extends State<FeedScreen> {
     final segs = (job['segments'] as List).cast<String>();
     final pollCsv = ((job['poll'] as List?)?.cast<String>() ?? const <String>[]).join('|');
     final baseTs = job['ts'] as int?;
+    // publish under a channel identity if one was chosen: sign with the channel's derived key + its handle
+    final channel = (job['channel'] as String?) ?? '';
+    final signer = (channel.isNotEmpty && gWallet != null) ? gWallet!.channelWallet(channel) : null;
+    final postHandle = channel.isNotEmpty ? _channelHandle(channel) : (job['handle'] as String);
     String prev = '';
     for (int i = 0; i < segs.length; i++) {
       // A post's id is 'u<ts>' (seconds), so every segment MUST get a distinct ts — else a queued thread
       // (all segments share the job's single ts) collapses to one id and the reply chain breaks. +i keeps
       // order and makes each unique. (Also fixes a fast online thread posting >1 segment in the same second.)
-      final id = await Api.post(segs[i], handle: job['handle'] as String,
+      final id = await Api.post(segs[i], handle: postHandle, signer: signer,
           media: i == 0 ? mediaCid : '', mediaKind: i == 0 ? (job['mediaKind'] as String? ?? '') : '',
-          quote: i == 0 ? (job['quote'] as String? ?? '') : '', replyTo: i == 0 ? '' : prev,
+          // first segment threads under the post being replied to (X-style reply); later segments chain
+          // to the previous segment so a multi-part reply stays a self-thread under that first reply.
+          quote: i == 0 ? (job['quote'] as String? ?? '') : '',
+          replyTo: i == 0 ? (job['reply_to'] as String? ?? '') : prev,
           title: i == 0 ? (job['title'] as String? ?? '') : '', poll: i == 0 ? pollCsv : '',
           ts: baseTs == null ? null : baseTs + i);
       if (id.isEmpty) return false;
@@ -2898,11 +3869,16 @@ class _FeedScreenState extends State<FeedScreen> {
     final acc = _wallet?.account;
     if (acc == null) return;
     final remote = (await Api.followsGet(acc)).toSet();
-    if (remote.isEmpty) return;
     final union = {...local, ...remote};
-    if (union.length != local.length) {
-      await FollowStore.save(union);
-      if (mounted) setState(() => _follows = union);
+    _follows = union;
+    if (mounted) setState(() {});
+    await FollowStore.save(union);
+    // HEAL the portable graph: if the relay's published copy is missing anything we hold locally — the
+    // v2 signing migration dropped old-format follow records, or an earlier publish never landed — then
+    // re-sign & republish the union so Following works and the graph survives a reinstall / other device.
+    // (Previously this bailed on an empty remote and never pushed local up, so follows stayed local-only.)
+    if (union.isNotEmpty && union.length != remote.length) {
+      await _publishFollows();
     }
   }
 
@@ -2929,6 +3905,12 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   void _showNotifs() {
+    // Opening the bell marks everything shown so far as SEEN: the unread badge resets to 0 and only
+    // notifications that arrive AFTER now count again (mirrors the DM seen-watermark). Persisted so it
+    // survives restarts.
+    final nowTs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    setState(() => _notifSeenTs = nowTs);
+    SharedPreferences.getInstance().then((sp) => sp.setInt('notif_seen_ts', nowTs));
     // drop notifications from accounts you've muted or blocked
     final hiddenHandles = {..._muted, ..._blocked}.map(_handleFor).toSet();
     final notifs = _notifs.where((n) => !hiddenHandles.contains('${n['from']}')).toList();
@@ -3231,11 +4213,28 @@ class _FeedScreenState extends State<FeedScreen> {
             ),
             ListTile(
               contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.dashboard_customize_outlined, color: kText, size: 20),
+              title: const Text('Channels', style: TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 15)),
+              subtitle: const Text('your publications · long-form articles', style: TextStyle(color: kDim, fontSize: 12)),
+              trailing: Text('${_myChannels.length}', style: const TextStyle(color: kDim, fontSize: 13)),
+              onTap: () { Navigator.pop(ctx); _openChannels(); },
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
               leading: const Icon(Icons.system_update, color: kText, size: 20),
               title: const Text('App updates', style: TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 15)),
               subtitle: const Text('signed releases over the relays · no app store', style: TextStyle(color: kDim, fontSize: 12)),
               trailing: Text('v$kAppVersion', style: const TextStyle(color: kDim, fontSize: 12, fontFamily: 'monospace')),
-              onTap: () { Navigator.pop(ctx); _showUpdates(); },
+              onTap: () {
+                Navigator.pop(ctx);
+                if (kIsWeb) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                      backgroundColor: kCard,
+                      content: Text('On the web you are always on the current version — just reload the page.')));
+                  return;
+                }
+                _showUpdates();
+              },
             ),
             const SizedBox(height: 6),
             if (!reveal)
@@ -3512,8 +4511,8 @@ class _FeedScreenState extends State<FeedScreen> {
               section('Default tip'),
               const Text('The amount added each time you tap Tip.', style: TextStyle(color: kDim, fontSize: 12)),
               const SizedBox(height: 8),
-              Wrap(spacing: 8, children: [0.01, 0.05, 0.10, 0.25, 1.0].map((o) =>
-                chip('${o.toStringAsFixed(2)} XNO', (o - _settings.defaultTip).abs() < 1e-9,
+              Wrap(spacing: 8, children: [0.001, 0.005, 0.01, 0.05, 0.10, 0.25, 1.0].map((o) =>
+                chip('${fmtXno(o)} XNO', (o - _settings.defaultTip).abs() < 1e-9,
                     () => _settings.defaultTip = o)).toList()),
 
               section('Tip split'),
@@ -3537,9 +4536,9 @@ class _FeedScreenState extends State<FeedScreen> {
               section('Notifications'),
               const Text('Tell the creator when their post gets engagement.', style: TextStyle(color: kDim, fontSize: 12)),
               const SizedBox(height: 6),
-              toggle('Likes', 'notify the creator on a like', _settings.notifyLike, (v) => _settings.notifyLike = v),
-              toggle('Comments', 'notify the creator on a comment', _settings.notifyComment, (v) => _settings.notifyComment = v),
-              toggle('Tips', 'notify the creator on a tip', _settings.notifyTip, (v) => _settings.notifyTip = v),
+              toggle('Likes', 'Android alert when someone likes your post', _settings.notifyLike, (v) => _settings.notifyLike = v),
+              toggle('Comments', 'Android alert when someone comments', _settings.notifyComment, (v) => _settings.notifyComment = v),
+              toggle('Tips', 'Android alert when someone tips you', _settings.notifyTip, (v) => _settings.notifyTip = v),
 
               section('Privacy'),
               ListTile(
@@ -3872,7 +4871,7 @@ class _FeedScreenState extends State<FeedScreen> {
         }
 
         Future<void> install() async {                            // hand the verified APK to the OS installer
-          if (Platform.isIOS) {
+          if (!kIsWeb && Platform.isIOS) {
             showDialog(
               context: ctx,
               builder: (_) => AlertDialog(
@@ -3893,7 +4892,7 @@ class _FeedScreenState extends State<FeedScreen> {
           if (res.type != ResultType.done && mounted) {
             ScaffoldMessenger.of(context).showSnackBar(SnackBar(
                 backgroundColor: kCard,
-                content: Text('Couldn’t open the installer (${res.message}). Allow “Install unknown apps” for ӾChat, then tap Install again.')));
+                content: Text('Couldn’t open the installer (${res.message}). Allow “Install unknown apps” for Ӿ Chat, then tap Install again.')));
           }
         }
 
@@ -3997,8 +4996,8 @@ class _FeedScreenState extends State<FeedScreen> {
                 SizedBox(width: double.infinity, child: FilledButton.icon(
                   onPressed: install,
                   style: FilledButton.styleFrom(backgroundColor: const Color(0xFF4DD0A7), foregroundColor: Colors.black),
-                  icon: Icon(Platform.isIOS ? Icons.apple : Icons.android, size: 18),
-                  label: Text(Platform.isIOS ? 'Install (iOS gated)' : 'Install', style: const TextStyle(fontWeight: FontWeight.w800)),
+                  icon: Icon(!kIsWeb && Platform.isIOS ? Icons.apple : Icons.android, size: 18),
+                  label: Text(!kIsWeb && Platform.isIOS ? "Install (iOS gated)" : "Install", style: const TextStyle(fontWeight: FontWeight.w800)),
                 )),
               const SizedBox(height: 10),
               const Text('GitHub is only a mirror — the publisher signature is the root of trust. A takedown of any relay doesn’t stop updates.',
@@ -4144,7 +5143,8 @@ class _FeedScreenState extends State<FeedScreen> {
         // cache is still warming). Only replace when the fetch has posts, or we truly had none.
         if (fd.posts.isNotEmpty || _posts.isEmpty) _posts = fd.posts;
         _newPosts.clear();                    // a full refresh already includes everything
-        _onchainBlocks = fd.onchainBlocks;
+        // (fd.onchainBlocks is always 0 — the feed is off-chain. The header's "Nano txns" count comes
+        //  from the user's own on-chain block count instead; see _refreshTxCount.)
         if (fd.posts.isNotEmpty) {
           _relaysUp = fd.relaysUp;
           _relaysTotal = fd.relaysTotal;
@@ -4157,6 +5157,7 @@ class _FeedScreenState extends State<FeedScreen> {
       });
       _syncSupporter(); // reflect current supporter state now that the account is known
       _initProfile();   // pull our own profile (name/avatar) into the cache
+      _refreshTxCount(); // header "Nano txns" = your on-chain block count (now the account is known)
       _maybeSweep();    // keep only the safety-cap float here; forward the rest to savings
       _loadSecondary(); // notifications + engagement counts, AFTER first paint (off the launch burst)
     } catch (e) {
@@ -4176,13 +5177,44 @@ class _FeedScreenState extends State<FeedScreen> {
   // feed renders so the launch fires 3 requests instead of 5 (lighter burst on the node, faster first frame).
   Future<void> _loadSecondary() async {
     try {
-      final r = await Future.wait([Api.notify(), Api.engagement()]);
-      if (!mounted) return;
-      setState(() {
-        _notifs = r[0] as List<Map<String, dynamic>>;
-        _engage = r[1] as Map<String, dynamic>;
-      });
+      _engage = await Api.engagement();
+      if (mounted) setState(() {});
     } catch (_) {}
+    _refreshNotifs();    // notifications + raise Android alerts for new like/comment/tip
+    _refreshDmBadge();   // mail-icon unread count + launcher badge (fire-and-forget)
+    Api.announcement().then((a) { if (mounted) setState(() => _announcement = a); });  // coordinated-event banner
+  }
+
+  // Poll relay notifications; raise an ANDROID system notification for each NEW like/comment/tip whose
+  // toggle is on. First run baselines to the newest existing so pre-install history never alerts (that
+  // was a real bug once). Also refreshes the in-app _notifs list.
+  Future<void> _refreshNotifs() async {
+    if (gWallet == null) return;
+    final list = await Api.notify();
+    if (mounted) setState(() => _notifs = list);
+    final p = await SharedPreferences.getInstance();
+    final seen = p.getInt('notif_seen_ts') ?? -1;
+    if (seen < 0) {                                    // first run → baseline, don't alert for history
+      var mx = 0;
+      for (final n in list) { final ts = (n['ts'] as num?)?.toInt() ?? 0; if (ts > mx) mx = ts; }
+      await p.setInt('notif_seen_ts', mx);
+      return;
+    }
+    var maxTs = seen;
+    for (final n in list) {
+      final ts = (n['ts'] as num?)?.toInt() ?? 0;
+      if (ts <= seen) continue;
+      if (ts > maxTs) maxTs = ts;
+      final kind = '${n['kind']}';
+      final on = kind == 'like' ? _settings.notifyLike
+          : kind == 'comment' ? _settings.notifyComment
+          : kind == 'tip' ? _settings.notifyTip
+          : false;                                     // only the 3 user-activatable types
+      if (!on) continue;
+      final title = kind == 'tip' ? '◈ New tip' : kind == 'like' ? '❤ New like' : '💬 New comment';
+      Notifs.show('${n['from']}$ts'.hashCode & 0x7fffffff, title, '${n['text']}');
+    }
+    if (maxTs > seen) await p.setInt('notif_seen_ts', maxTs);
   }
 
   // Auto-forward anything above the safety cap to the user's external savings address (which this
@@ -4193,11 +5225,15 @@ class _FeedScreenState extends State<FeedScreen> {
     final addr = _settings.sweepAddr.trim();
     if (!addr.startsWith('nano_') || addr.length < 60 || addr == _account) return;
     final xno = (double.tryParse(_balance) ?? 0) / 1e30;
-    final excess = xno - kWalletCapXno;
+    // NEVER sweep XNO pledged to un-settled tips — subtract the reservation from the sweepable excess,
+    // and pass it to send() as a second guard. Without this, the sweep could forward tip funds to savings
+    // and leave every pending tip permanently unsettleable ("insufficient balance").
+    final reserved = _pendingTotal();
+    final excess = xno - kWalletCapXno - reserved;
     if (excess <= 0.0001) return;
     _sweeping = true;
     try {
-      final r = await Api.send(addr, excess.toStringAsFixed(6));
+      final r = await Api.send(addr, excess.toStringAsFixed(6), reservedXno: reserved);
       if (r != null && r['ok'] == true) {
         await _load();
         if (mounted) {
@@ -4250,12 +5286,13 @@ class _FeedScreenState extends State<FeedScreen> {
     );
   }
 
-  Future<void> _compose({Post? quotedPost}) async {
+  Future<void> _compose({Post? quotedPost, Post? replyToPost}) async {
     final res = await showModalBottomSheet<ComposeResult>(
       context: context,
       isScrollControlled: true,
       backgroundColor: kBg,
-      builder: (_) => ComposeSheet(handle: _handle, account: _account, quotedPost: quotedPost),
+      builder: (_) => ComposeSheet(handle: _handle, account: _account, quotedPost: quotedPost,
+          replyToPost: replyToPost, channels: _myChannels),
     );
     if (res == null || res.segments.isEmpty) return;
     // Build the compose intent. The head signs a node-assigned CID+seq that only exist after the node
@@ -4268,9 +5305,11 @@ class _FeedScreenState extends State<FeedScreen> {
       'segments': res.segments,
       'title': res.title,
       'quote': res.quote,
+      'reply_to': replyToPost?.id ?? '',   // X-style reply: this post threads under replyToPost
       'mediaKind': res.mediaBytes != null ? res.mediaKind : '',
       'mediaB64': res.mediaBytes != null ? base64Encode(res.mediaBytes!) : '',
       'poll': res.pollOptions,
+      'channel': res.channel,
     };
     final n = res.segments.length;
 
@@ -4328,11 +5367,8 @@ class _FeedScreenState extends State<FeedScreen> {
         centerTitle: true,
         leading: IconButton(
           onPressed: _showWallet,
-          icon: CircleAvatar(
-              radius: 15,
-              backgroundColor: avatarColor(_handle),
-              child: Text(_handle.substring(0, 1).toUpperCase(),
-                  style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 13))),
+          // your real avatar (live/animated or photo), not just the handle's initial
+          icon: AuthorAvatar(account: _account, handle: _handle, radius: 15),
         ),
         titleSpacing: 0,
         title: Row(mainAxisSize: MainAxisSize.min, children: const [
@@ -4349,7 +5385,21 @@ class _FeedScreenState extends State<FeedScreen> {
             constraints: const BoxConstraints(),
             padding: const EdgeInsets.symmetric(horizontal: 6),
             onPressed: _openDms,
-            icon: const Icon(Icons.mail_outline, size: 21, color: kText),
+            icon: Stack(clipBehavior: Clip.none, children: [
+              const Icon(Icons.mail_outline, size: 21, color: kText),
+              if (_dmUnread > 0)
+                Positioned(
+                  right: -3, top: -3,
+                  child: Container(
+                    padding: const EdgeInsets.all(3),
+                    decoration: const BoxDecoration(color: Color(0xFFEF6C9B), shape: BoxShape.circle),
+                    constraints: const BoxConstraints(minWidth: 15, minHeight: 15),
+                    child: Text('$_dmUnread',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w800)),
+                  ),
+                ),
+            ]),
           ),
           // push wakeups: bell with unread count
           IconButton(
@@ -4359,22 +5409,23 @@ class _FeedScreenState extends State<FeedScreen> {
             onPressed: _showNotifs,
             icon: Stack(clipBehavior: Clip.none, children: [
               const Icon(Icons.notifications_none, size: 21, color: kText),
-              if (_notifs.isNotEmpty)
+              if (_notifUnread > 0)
                 Positioned(
                   right: -3, top: -3,
                   child: Container(
                     padding: const EdgeInsets.all(3),
                     decoration: const BoxDecoration(color: Color(0xFFEF6C9B), shape: BoxShape.circle),
                     constraints: const BoxConstraints(minWidth: 15, minHeight: 15),
-                    child: Text('${_notifs.length}',
+                    child: Text('$_notifUnread',
                         textAlign: TextAlign.center,
                         style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.w800)),
                   ),
                 ),
             ]),
           ),
-          // pending tips → the settle menu (only shown when something is waiting, or a policy is on)
-          if (_pending.isNotEmpty || _autoSettle)
+          // pending tips → the settle menu. Shown when something is waiting, a policy is on, OR there
+          // is settled history — so the Transactions receipt trail stays reachable after the tally clears.
+          if (_pending.isNotEmpty || _autoSettle || _txLog.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(right: 2),
               child: Stack(clipBehavior: Clip.none, children: [
@@ -4444,7 +5495,7 @@ class _FeedScreenState extends State<FeedScreen> {
                   child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                     Flexible(
                       child: Text(
-                          '⛓ ${_onchainBlocks} Nano block${_onchainBlocks == 1 ? '' : 's'}  ·  ${_posts.length} posts off-chain  ·  📡 ${_relaysUp}/${_relaysTotal} relays',
+                          '⛓ ${_onchainBlocks} Nano txn${_onchainBlocks == 1 ? '' : 's'}  ·  ${_posts.length} posts off-chain  ·  📡 ${_relaysUp}/${_relaysTotal} relays',
                           textAlign: TextAlign.center,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
@@ -4473,6 +5524,7 @@ class _FeedScreenState extends State<FeedScreen> {
           type: BottomNavigationBarType.fixed,
           items: const [
             BottomNavigationBarItem(icon: Icon(Icons.home_outlined), activeIcon: Icon(Icons.home), label: 'Home'),
+            BottomNavigationBarItem(icon: Icon(Icons.dynamic_feed_outlined), activeIcon: Icon(Icons.dynamic_feed), label: 'Channels'),
             BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Discover'),
           ],
         ),
@@ -4487,7 +5539,7 @@ class _FeedScreenState extends State<FeedScreen> {
           // your unsent posts. Send-now + pull-to-refresh retry; Settings holds the server-address editor.
           : (_error != null && _outbox.isEmpty)
               ? _ErrorView(msg: _error!, onRetry: _load, onEndpoint: _showEndpoint)
-              : _tab == 1
+              : _tab == 2
                   ? DiscoverScreen(
                       posts: _posts.where((p) => !_hidden(p.account)).toList(),
                       authors: _authors(),
@@ -4505,7 +5557,9 @@ class _FeedScreenState extends State<FeedScreen> {
                       onCommentPost: _openComments,
                       onOpenProfile: _openProfile,
                       cardBuilder: _profileCard)
-                  : _homeBody(),
+                  : _tab == 1
+                      ? ChannelsScreen(onOpenChannel: _openProfile)
+                      : _homeBody(),
     );
   }
 
@@ -4699,6 +5753,7 @@ class _FeedScreenState extends State<FeedScreen> {
   Widget _homeBody() {
     final posts = _homeFeed == 0 ? _forYouPosts() : _homePosts();
     return Column(children: [
+      if (_announcement != null) _AnnouncementMarquee(text: _announcement!),
       if (_needsBackup) _backupBanner(),
       if (_update != null) _updateBanner(),
       // For You / Following segmented header (X-style), with a transparency ⓘ
@@ -4743,7 +5798,8 @@ class _FeedScreenState extends State<FeedScreen> {
                       : const _LedgerFooter();
                 }
                 // stable identity per post so a feed refresh matches elements by post, not by slot —
-                // without this the list recycles cards across posts and their media gets mismatched
+                // without this the list recycles cards across posts and their media gets mismatched.
+                // clean single card per post; tap it to open the full conversation (X-style thread view).
                 return KeyedSubtree(key: ValueKey(posts[j].id), child: _profileCard(posts[j]));
               },
             ),
@@ -5051,7 +6107,7 @@ class _DiscoverHint extends StatelessWidget {
         padding: const EdgeInsets.all(22),
         alignment: Alignment.center,
         child: const Text(
-            '👋 you follow no one yet — showing everyone.\ntap Discover to find people to follow.',
+            '👋 you follow no one yet.\nFollowing shows only people you follow — tap Discover to find some, or switch to For You.',
             textAlign: TextAlign.center,
             style: TextStyle(color: kDim, fontSize: 12, height: 1.6)),
       );
@@ -5184,8 +6240,9 @@ class _DmChatScreenState extends State<DmChatScreen> {
     if (!mounted) return;
     if (r != null && r['ok'] == true) {
       _ctl.clear();
+      if (mounted) FocusScope.of(context).unfocus();   // close the keyboard/typing view after sending
       await _load();
-      setState(() => _sending = false);
+      if (mounted) setState(() => _sending = false);
     } else {
       setState(() { _sending = false; _err = (r?['error'] ?? 'send failed').toString(); });
     }
@@ -5371,11 +6428,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         Container(
                           padding: const EdgeInsets.all(3),
                           decoration: const BoxDecoration(color: kBg, shape: BoxShape.circle),
-                          child: avatar.isNotEmpty
-                              ? ClipOval(child: SizedBox(width: 72, height: 72, child: MediaImage(cid: avatar, fit: BoxFit.cover)))
-                              : CircleAvatar(radius: 36, backgroundColor: avatarColor(widget.handle),
-                                  child: Text(widget.handle.substring(0, 1).toUpperCase(),
-                                      style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 26))),
+                          child: avatar.startsWith('live:')
+                              ? LiveAvatar(style: avatar.substring(5), radius: 36)
+                              : avatar.isNotEmpty
+                                  ? ClipOval(child: SizedBox(width: 72, height: 72, child: MediaImage(cid: avatar, fit: BoxFit.cover)))
+                                  : CircleAvatar(radius: 36, backgroundColor: avatarColor(widget.handle),
+                                      child: Text(widget.handle.substring(0, 1).toUpperCase(),
+                                          style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 26))),
                         ),
                         const Spacer(),
                         if (widget.isMe)
@@ -5465,6 +6524,88 @@ class _ProfileScreenState extends State<ProfileScreen> {
         ),
       ),
     );
+  }
+}
+
+// CHANNELS tab: a directory of publication identities. Each row shows the channel, its online-reader
+// count (followers with a live head — same heartbeat as the green dot) and total readers. Tapping opens
+// the channel's profile, where its posts + articles live (they're kept out of the personal feed).
+class ChannelsScreen extends StatefulWidget {
+  final void Function(String account, String handle) onOpenChannel;
+  const ChannelsScreen({super.key, required this.onOpenChannel});
+  @override
+  State<ChannelsScreen> createState() => _ChannelsScreenState();
+}
+
+class _ChannelsScreenState extends State<ChannelsScreen> {
+  List<Map<String, dynamic>> _chs = [];
+  bool _loading = true;
+  @override
+  void initState() { super.initState(); _load(); }
+  Future<void> _load() async {
+    final c = await Api.channels();
+    c.sort((a, b) {                                            // most readers first, then most online
+      final fa = (a['followers'] as num?)?.toInt() ?? 0, fb = (b['followers'] as num?)?.toInt() ?? 0;
+      if (fa != fb) return fb - fa;
+      return ((b['online'] as num?)?.toInt() ?? 0) - ((a['online'] as num?)?.toInt() ?? 0);
+    });
+    if (mounted) setState(() { _chs = c; _loading = false; });
+  }
+  @override
+  Widget build(BuildContext context) {
+    return Column(children: [
+      Container(
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+        alignment: Alignment.centerLeft,
+        decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: kLine))),
+        child: const Text('Channels', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 20)),
+      ),
+      Expanded(
+        child: RefreshIndicator(
+          color: kAccent, backgroundColor: kCard, onRefresh: _load,
+          child: _loading
+              ? const Center(child: CircularProgressIndicator(color: kAccent))
+              : _chs.isEmpty
+                  ? ListView(children: const [
+                      Padding(padding: EdgeInsets.fromLTRB(28, 70, 28, 0), child: Text(
+                          'No channels yet.\n\nChannels are publications you can follow — their posts and articles show here, not in your feed.',
+                          textAlign: TextAlign.center, style: TextStyle(color: kDim, fontSize: 13.5, height: 1.6)))])
+                  : ListView.separated(
+                      itemCount: _chs.length,
+                      separatorBuilder: (_, __) => const Divider(color: kLine, height: 1),
+                      itemBuilder: (_, i) {
+                        final c = _chs[i];
+                        final acc = '${c['account']}';
+                        final name = '${c['display'] ?? ''}';
+                        final bio = '${c['bio'] ?? ''}';
+                        final online = (c['online'] as num?)?.toInt() ?? 0;
+                        final readers = (c['followers'] as num?)?.toInt() ?? 0;
+                        return ListTile(
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                          onTap: () => widget.onOpenChannel(acc, name.isEmpty ? 'channel' : name),
+                          leading: AuthorAvatar(account: acc, handle: name.isEmpty ? '?' : name, radius: 24),
+                          title: Text(name.isEmpty ? 'channel' : name,
+                              style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 15)),
+                          subtitle: bio.isEmpty ? null : Text(bio, maxLines: 2, overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: kDim, fontSize: 12.5)),
+                          trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                            Row(mainAxisSize: MainAxisSize.min, children: [
+                              Container(width: 7, height: 7, decoration: BoxDecoration(
+                                  color: online > 0 ? const Color(0xFF3BD671) : kDim, shape: BoxShape.circle)),
+                              const SizedBox(width: 5),
+                              Text('$online online', style: TextStyle(
+                                  color: online > 0 ? const Color(0xFF3BD671) : kDim, fontSize: 12, fontWeight: FontWeight.w700)),
+                            ]),
+                            const SizedBox(height: 3),
+                            Text('$readers reader${readers == 1 ? '' : 's'}',
+                                style: const TextStyle(color: kDim, fontSize: 11)),
+                          ]),
+                        );
+                      },
+                    ),
+        ),
+      ),
+    ]);
   }
 }
 
@@ -5639,10 +6780,13 @@ class PostCard extends StatefulWidget {
   final bool liked, reposted;
   final int commentCount;
   final VoidCallback onTip, onLike, onRepost, onReport, onComment;
-  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete;
+  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete, onReply;
   final bool muted, blocked, bookmarked;
   final Post? quoted; // resolved quoted post (for a quote-post), rendered inline
   final bool inThread; // part of an author thread → show a thread affordance
+  final int replyCount;       // number of reply-posts to this post (X-style reply counter on the bubble)
+  final String replyingToHandle; // if this post is itself a reply, the handle it replies to ('' if none/unknown)
+  final bool expanded;        // start with full post text shown (the focused post at the top of a thread)
   final String repostedBy; // handle of the resharer who spread this to you (X-style header)
   const PostCard(
       {super.key,
@@ -5671,6 +6815,10 @@ class PostCard extends StatefulWidget {
       this.bookmarked = false,
       this.quoted,
       this.inThread = false,
+      this.onReply,
+      this.replyCount = 0,
+      this.replyingToHandle = '',
+      this.expanded = false,
       this.repostedBy = ''});
   static void _noop() {}
   @override
@@ -5678,7 +6826,17 @@ class PostCard extends StatefulWidget {
 }
 
 class _PostCardState extends State<PostCard> {
-  bool _expanded = false;
+  late bool _expanded = widget.expanded;   // start expanded (full text) for the focused post in a thread
+  // Local optimistic like state so the thumb-up responds INSTANTLY on tap — even inside a pushed route
+  // (the Thread/conversation screen) that doesn't rebuild when the parent's like set changes. Without
+  // this, liking a comment/reply in the conversation gave no visible feedback and read as "not working".
+  late bool _likedNow = widget.liked;
+  @override
+  void didUpdateWidget(PostCard old) {
+    super.didUpdateWidget(old);
+    if (widget.liked != old.liked) _likedNow = widget.liked;   // reflect external/authoritative changes
+  }
+
   @override
   Widget build(BuildContext context) {
     final p = widget.post;
@@ -5738,23 +6896,55 @@ class _PostCardState extends State<PostCard> {
               ),
             ]),
             const SizedBox(height: 3),
+            // X-style reply context: "Replying to @handle" when this post threads under another
+            if (p.replyTo != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 3),
+                child: GestureDetector(
+                  onTap: widget.onOpenThread,
+                  child: Text(
+                      widget.replyingToHandle.isNotEmpty
+                          ? 'Replying to @${widget.replyingToHandle}'
+                          : 'Replying to a post',
+                      style: const TextStyle(color: kDim, fontSize: 13)),
+                ),
+              ),
+            if (p.kind == 'article' && p.media != null && p.media!.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(14),
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 170),
+                    child: SizedBox(width: double.infinity, child: MediaImage(cid: p.media!, fit: BoxFit.cover)),
+                  ),
+                ),
+              ),
             if (p.kind == 'article' && p.title != null)
               Padding(
                 padding: const EdgeInsets.only(bottom: 4),
                 child: Text(p.title!,
                     style: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 16, height: 1.3)),
               ),
-            Text(p.text,
-                maxLines: (longText && !_expanded) ? 6 : null,
-                overflow: (longText && !_expanded) ? TextOverflow.ellipsis : TextOverflow.clip,
-                style: const TextStyle(color: kText, fontSize: 15, height: 1.35)),
-            if (longText)
+            // tap the post body → open the full conversation (the entire post + all replies), X-style
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: widget.onOpenThread,
+              child: Text(p.text,
+                  maxLines: (longText && !_expanded) ? 6 : null,
+                  overflow: (longText && !_expanded) ? TextOverflow.ellipsis : TextOverflow.clip,
+                  style: const TextStyle(color: kText, fontSize: 15, height: 1.35)),
+            ),
+            // "Show more" opens the conversation (full text there), exactly like tapping the post body or
+            // "Show this thread" — so there's no inline-expand action fighting the open-thread tap. Only
+            // shows in the feed; the focused post in a thread starts expanded (full text, no "Show more").
+            if (longText && !_expanded)
               GestureDetector(
-                onTap: () => setState(() => _expanded = !_expanded),
-                child: Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: Text(_expanded ? 'Show less' : 'Show more',
-                      style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
+                onTap: widget.onOpenThread,
+                child: const Padding(
+                  padding: EdgeInsets.only(top: 4),
+                  child: Text('Show more',
+                      style: TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
                 ),
               ),
             // photo / GIF attachment (Image.memory animates GIFs)
@@ -5783,31 +6973,21 @@ class _PostCardState extends State<PostCard> {
                 decoration: BoxDecoration(border: Border.all(color: kLine), borderRadius: BorderRadius.circular(12)),
                 child: const Text('quoted post unavailable', style: TextStyle(color: kDim, fontSize: 13)),
               ),
-            // thread affordance
-            if (widget.inThread)
-              GestureDetector(
-                onTap: widget.onOpenThread,
-                child: Padding(
-                  padding: const EdgeInsets.only(top: 8),
-                  child: Row(children: [
-                    const Text('🧵 ', style: TextStyle(fontSize: 13)),
-                    Text(p.replyTo != null ? 'Part of a thread' : 'Show this thread',
-                        style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
-                  ]),
-                ),
-              ),
+            // (the "Show this thread" link was removed — tapping the post already opens its conversation
+            // + comments, so the separate affordance was redundant.)
             const SizedBox(height: 8),
             _Actions(
-              likes: (e['likes'] ?? 0) as int,
               reposts: (e['reposts'] ?? 0) as int,
-              comments: widget.commentCount,
+              replies: widget.replyCount,
               tipsXno: ((e['tips_xno'] ?? 0) as num).toDouble(),
-              liked: widget.liked,
+              liked: _likedNow,
+              // optimistic count so the number moves too: base ± the pending local toggle
+              likes: ((e['likes'] ?? 0) as int) + (_likedNow == widget.liked ? 0 : (_likedNow ? 1 : -1)),
               reposted: widget.reposted,
               pending: widget.pending,
               views: (e['views'] ?? 0) as int,
-              onComment: widget.onComment,
-              onLike: widget.onLike,
+              onReply: widget.onReply,
+              onLike: () { setState(() => _likedNow = !_likedNow); widget.onLike(); },
               onRepost: widget.onRepost,
               onQuote: widget.onQuote,
               onTip: widget.onTip,
@@ -5826,6 +7006,16 @@ class _PostCardState extends State<PostCard> {
       backgroundColor: kBg,
       builder: (_) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // Comments live on as a lightweight "quiet reply" tier alongside the X-style reply-posts —
+          // reachable here from the overflow so the primary bubble stays the reply action.
+          ListTile(
+            leading: const Icon(Icons.mode_comment_outlined, color: kText),
+            title: Text(widget.commentCount > 0 ? 'Comments (${widget.commentCount})' : 'Comments',
+                style: const TextStyle(color: kText, fontWeight: FontWeight.w600)),
+            subtitle: const Text('quiet replies attached under this post',
+                style: TextStyle(color: kDim, fontSize: 11)),
+            onTap: () { Navigator.pop(context); widget.onComment(); },
+          ),
           if (widget.onBookmark != null)
             ListTile(
               leading: Icon(widget.bookmarked ? Icons.bookmark : Icons.bookmark_border, color: kAccent),
@@ -6115,6 +7305,28 @@ class _VideoScreenState extends State<VideoScreen> {
 
   // fetch the movie by CID via the engine (IPFS or relay cache), play from a temp file
   Future<void> _prepare() async {
+    // On the web there is no temp directory to stage the bytes in, so the <video> element streams
+    // straight from the node instead of us downloading the whole clip first — which also means
+    // playback starts without waiting for the full file.
+    if (kIsWeb) {
+      try {
+        final c = VideoPlayerController.networkUrl(Uri.parse('$kBase/api/media?cid=${widget.cid}'))
+          ..setLooping(true);
+        await c.initialize();
+        if (!mounted) {
+          c.dispose();
+          return;
+        }
+        setState(() {
+          _c = c;
+          _ready = true;
+        });
+        c.play();
+      } catch (_) {
+        if (mounted) setState(() => _err = 'could not play movie');
+      }
+      return;
+    }
     final bytes = await Api.media(widget.cid);
     if (bytes == null) {
       if (mounted) setState(() => _err = 'movie unavailable');
@@ -6172,12 +7384,69 @@ class _VideoScreenState extends State<VideoScreen> {
   }
 }
 
+// A right-to-left scrolling banner, shown ONLY during a coordinated event (a publisher-signed
+// announcement the node has verified). Continuous loop; speed is roughly constant regardless of length.
+class _AnnouncementMarquee extends StatefulWidget {
+  final String text;
+  const _AnnouncementMarquee({required this.text});
+  @override
+  State<_AnnouncementMarquee> createState() => _AnnouncementMarqueeState();
+}
+
+class _AnnouncementMarqueeState extends State<_AnnouncementMarquee> with SingleTickerProviderStateMixin {
+  static const _style = TextStyle(color: Colors.black, fontSize: 13, fontWeight: FontWeight.w700, height: 1.0);
+  late final AnimationController _ac;
+  late double _textW;
+
+  @override
+  void initState() {
+    super.initState();
+    _textW = _measure(widget.text);
+    final secs = (_textW / 90 + 5).clamp(10, 45).round();   // ~90 px/s, so long and short banners read alike
+    _ac = AnimationController(vsync: this, duration: Duration(seconds: secs))..repeat();
+  }
+
+  double _measure(String t) {
+    final tp = TextPainter(text: TextSpan(text: t, style: _style), textDirection: TextDirection.ltr, maxLines: 1)..layout();
+    return tp.width;
+  }
+
+  @override
+  void dispose() { _ac.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 30, width: double.infinity,
+      color: const Color(0xFFF5C518),   // warning amber — deliberately unlike the normal chrome
+      child: ClipRect(
+        child: LayoutBuilder(builder: (ctx, cons) {
+          final w = cons.maxWidth;
+          final total = w + _textW;
+          return AnimatedBuilder(
+            animation: _ac,
+            builder: (_, __) {
+              final dx = w - _ac.value * total;   // starts just off the right edge, exits off the left
+              return Stack(children: [
+                Positioned(
+                  left: dx, top: 0, bottom: 0,
+                  child: Center(child: Text(widget.text, maxLines: 1, softWrap: false, style: _style)),
+                ),
+              ]);
+            },
+          );
+        }),
+      ),
+    );
+  }
+}
+
 class _Actions extends StatelessWidget {
-  final int likes, reposts, comments, views;
+  final int likes, reposts, replies, views;
   final double tipsXno, pending;
   final bool liked, reposted;
   final VoidCallback onLike, onRepost, onTip;
-  final VoidCallback? onComment, onQuote;
+  final VoidCallback? onReply, onQuote;
   const _Actions(
       {required this.likes,
       required this.reposts,
@@ -6187,9 +7456,9 @@ class _Actions extends StatelessWidget {
       required this.onLike,
       required this.onRepost,
       required this.onTip,
-      this.comments = 0,
+      this.replies = 0,
       this.views = 0,
-      this.onComment,
+      this.onReply,
       this.onQuote,
       this.pending = 0});
   @override
@@ -6197,7 +7466,7 @@ class _Actions extends StatelessWidget {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        _act(Icons.chat_bubble_outline, comments > 0 ? '$comments' : '', kDim, onComment),
+        _act(Icons.chat_bubble_outline, replies > 0 ? '$replies' : '', kDim, onReply),
         Builder(builder: (ctx) => _act(Icons.repeat, reposts > 0 ? '$reposts' : '',
             reposted ? const Color(0xFF4DD0A7) : kDim,
             onQuote == null ? onRepost : () => _repostMenu(ctx))),
@@ -6295,6 +7564,7 @@ class CommentsSheet extends StatefulWidget {
 
 class _CommentsSheetState extends State<CommentsSheet> {
   final Set<String> _viewedC = {}; // comment cids counted as viewed this session
+  final Set<String> _likedC = {};  // comment cids this device has liked (persisted, so it counts once)
   List<Map<String, dynamic>> _comments = [];
   Map<String, dynamic> _eng = {};
   final Map<String, double> _localTip = {}; // comment cid -> XNO bumped this session
@@ -6306,6 +7576,7 @@ class _CommentsSheetState extends State<CommentsSheet> {
   @override
   void initState() {
     super.initState();
+    EngageStore.likedComments().then((s) { if (mounted) setState(() => _likedC.addAll(s)); });
     _load();
   }
 
@@ -6314,6 +7585,26 @@ class _CommentsSheetState extends State<CommentsSheet> {
     _ctl.dispose();
     _focus.dispose();
     super.dispose();
+  }
+
+  // Like a comment — mirrors _toggleLike for posts: optimistic count bump, record on the relay keyed by
+  // the comment's cid (Api.like is generic over any id), persist so this device counts once, notify author.
+  void _toggleLikeComment(Map<String, dynamic> c) {
+    final cid = (c['cid'] ?? '') as String;
+    if (cid.isEmpty) return;
+    final liked = _likedC.contains(cid);
+    setState(() {
+      liked ? _likedC.remove(cid) : _likedC.add(cid);
+      final e = ((_eng[cid] as Map?)?.cast<String, dynamic>()) ?? <String, dynamic>{};
+      e['likes'] = ((e['likes'] ?? 0) as num) + (liked ? -1 : 1);
+      _eng[cid] = e;
+    });
+    Api.like(cid, liked ? -1 : 1);
+    EngageStore.saveLikedComments(_likedC);
+    final acct = (c['account'] ?? '') as String;
+    if (!liked && acct.isNotEmpty && acct != widget.myAccount) {
+      Api.notifyPush(acct, widget.myHandle, 'like', 'liked your comment');
+    }
   }
 
   Future<void> _load() async {
@@ -6455,6 +7746,8 @@ class _CommentsSheetState extends State<CommentsSheet> {
     final cid = (c['cid'] ?? '') as String;
     final tips = _tipsOf(cid);
     final views = ((_eng[cid]?['views'] ?? 0) as num).toInt();
+    final likes = ((_eng[cid]?['likes'] ?? 0) as num).toInt();
+    final liked = _likedC.contains(cid);
     if (cid.isNotEmpty && _viewedC.add(cid)) Api.view(cid); // this comment was rendered → an impression
     return Container(
       color: kBg,
@@ -6496,6 +7789,21 @@ class _CommentsSheetState extends State<CommentsSheet> {
                 child: const Padding(
                   padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                   child: Text('Reply', style: TextStyle(color: kDim, fontSize: 13, fontWeight: FontWeight.w600)),
+                ),
+              ),
+              const SizedBox(width: 12),
+              InkWell(
+                onTap: () => _toggleLikeComment(c),
+                borderRadius: BorderRadius.circular(20),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                  child: Row(children: [
+                    Icon(liked ? Icons.thumb_up : Icons.thumb_up_outlined, size: 14, color: liked ? kAccent : kDim),
+                    if (likes > 0) ...[
+                      const SizedBox(width: 4),
+                      Text('$likes', style: TextStyle(color: liked ? kAccent : kDim, fontSize: 12, fontWeight: FontWeight.w600)),
+                    ],
+                  ]),
                 ),
               ),
               const SizedBox(width: 12),
@@ -6591,19 +7899,23 @@ class ComposeResult {
   final List<String> pollOptions; // non-empty → a poll (segments.first is the question)
   final Uint8List? mediaBytes;    // an attached photo/GIF/video (goes on the first post)
   final String mediaKind;         // 'photo' or 'movie'
+  final String channel;           // publish under this channel identity (name); '' = as yourself
   ComposeResult(this.segments, this.quote,
-      {this.title = '', this.pollOptions = const [], this.mediaBytes, this.mediaKind = ''});
+      {this.title = '', this.pollOptions = const [], this.mediaBytes, this.mediaKind = '', this.channel = ''});
 }
 
 class ComposeSheet extends StatefulWidget {
   final String handle, account;
   final Post? quotedPost; // when set, this is a quote-post embedding that post
-  const ComposeSheet({super.key, required this.handle, required this.account, this.quotedPost});
+  final Post? replyToPost; // when set, this post is an X-style reply threaded under that post
+  final List<String> channels; // the author's channels — an article can be published under one
+  const ComposeSheet({super.key, required this.handle, required this.account, this.quotedPost, this.replyToPost, this.channels = const []});
   @override
   State<ComposeSheet> createState() => _ComposeSheetState();
 }
 
 class _ComposeSheetState extends State<ComposeSheet> {
+  String _asChannel = ''; // '' = publish as yourself; else the channel name
   final List<TextEditingController> _cs = [TextEditingController()];
   final _titleCtl = TextEditingController();
   final List<TextEditingController> _pollOpts = [TextEditingController(), TextEditingController()];
@@ -6613,19 +7925,48 @@ class _ComposeSheetState extends State<ComposeSheet> {
   final _picker = ImagePicker();
 
   bool get _isQuote => widget.quotedPost != null;
+  bool get _isReply => widget.replyToPost != null;
   bool get _isThread => _cs.length > 1;
   bool get _hasMedia => _mediaBytes != null;
+
+  bool _compressing = false;
 
   Future<void> _attach(bool video) async {
     final x = video
         ? await _picker.pickVideo(source: ImageSource.gallery)
         : await _picker.pickImage(source: ImageSource.gallery, imageQuality: 88, maxWidth: 1600);
     if (x == null) return;
-    final bytes = await x.readAsBytes();
-    // relay pin cap is ~6 MB — refuse larger so the blob actually survives
-    if (bytes.length > 6 * 1024 * 1024) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          backgroundColor: kCard, content: Text('too large — attachments cap at 6 MB (relay pin limit)')));
+
+    Uint8List bytes;
+    if (video) {
+      // On-device compression so more clips fit under the ~6 MB relay pin cap. Falls back to the
+      // original bytes if compression fails or isn't supported; the size check below is the backstop.
+      setState(() => _compressing = true);
+      try {
+        final info = await VideoCompress.compressVideo(
+            x.path, quality: VideoQuality.MediumQuality, deleteOrigin: false, includeAudio: true);
+        final f = info?.file;
+        bytes = (f != null) ? await f.readAsBytes() : await x.readAsBytes();
+      } catch (_) {
+        bytes = await x.readAsBytes();
+      } finally {
+        if (mounted) setState(() => _compressing = false);
+      }
+    } else {
+      bytes = await x.readAsBytes();
+    }
+
+    // relay pin cap is ~6 MB — refuse larger so the blob actually survives the relays
+    const capMb = 6;
+    if (bytes.length > capMb * 1024 * 1024) {
+      final mb = (bytes.length / (1024 * 1024)).toStringAsFixed(1);
+      final what = video ? 'Video' : 'Photo';
+      final tip = video
+          ? 'Even compressed it’s over $capMb MB — try a shorter clip.'
+          : 'Try a smaller image.';
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          backgroundColor: kCard,
+          content: Text('$what is $mb MB — the limit is $capMb MB. $tip')));
       return;
     }
     setState(() { _mediaBytes = bytes; _mediaKind = video ? 'movie' : 'photo'; });
@@ -6636,6 +7977,7 @@ class _ComposeSheetState extends State<ComposeSheet> {
     for (final c in _cs) { c.dispose(); }
     for (final c in _pollOpts) { c.dispose(); }
     _titleCtl.dispose();
+    VideoCompress.deleteAllCache();   // compressed clips are already read into memory; drop the disk cache
     super.dispose();
   }
 
@@ -6654,13 +7996,14 @@ class _ComposeSheetState extends State<ComposeSheet> {
         _article ? [segs.first] : segs, // an article is a single long-form post
         _isQuote ? widget.quotedPost!.id : '',
         title: _article ? _titleCtl.text.trim() : '',
-        mediaBytes: _mediaBytes, mediaKind: _mediaKind));
+        mediaBytes: _mediaBytes, mediaKind: _mediaKind,
+        channel: _article ? _asChannel : ''));   // articles can be published under a channel
   }
 
   @override
   Widget build(BuildContext context) {
     final bottom = MediaQuery.of(context).viewInsets.bottom;
-    final btnLabel = _isQuote ? 'Quote' : (_article ? 'Publish' : (_isThread ? 'Post all' : 'Post'));
+    final btnLabel = _isReply ? 'Reply' : (_isQuote ? 'Quote' : (_article ? 'Publish' : (_isThread ? 'Post all' : 'Post')));
     final segCount = (_article || _poll) ? 1 : _cs.length; // article/poll bodies are single
     return Padding(
       padding: EdgeInsets.only(bottom: bottom),
@@ -6675,19 +8018,50 @@ class _ComposeSheetState extends State<ComposeSheet> {
             // attach a photo/GIF or a video (not for article/poll)
             if (!_article && !_poll) ...[
               IconButton(
-                onPressed: () => _attach(false),
+                onPressed: _compressing ? null : () => _attach(false),
                 visualDensity: VisualDensity.compact,
                 icon: const Icon(Icons.image_outlined, size: 21, color: kAccent),
                 tooltip: 'Photo / GIF',
               ),
               IconButton(
-                onPressed: () => _attach(true),
+                onPressed: _compressing ? null : () => _attach(true),
                 visualDensity: VisualDensity.compact,
-                icon: const Icon(Icons.videocam_outlined, size: 21, color: kAccent),
-                tooltip: 'Video',
+                icon: _compressing
+                    ? const SizedBox(width: 18, height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: kAccent))
+                    : const Icon(Icons.videocam_outlined, size: 21, color: kAccent),
+                tooltip: _compressing ? 'Compressing…' : 'Video',
               ),
             ],
+            if (_article)
+              IconButton(
+                onPressed: () => _attach(false),      // cover reuses the media field (kind stays 'article')
+                visualDensity: VisualDensity.compact,
+                icon: Icon(_hasMedia ? Icons.image : Icons.add_photo_alternate_outlined, size: 21, color: kAccent),
+                tooltip: 'Cover image',
+              ),
             const Spacer(),
+            if (_article && widget.channels.isNotEmpty)
+              PopupMenuButton<String>(
+                initialValue: _asChannel,
+                onSelected: (v) => setState(() => _asChannel = v),
+                color: kCard,
+                itemBuilder: (_) => [
+                  const PopupMenuItem<String>(value: '', child: Text('You', style: TextStyle(color: kText))),
+                  for (final c in widget.channels)
+                    PopupMenuItem<String>(value: c, child: Text(c, style: const TextStyle(color: kText))),
+                ],
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    const Icon(Icons.person_outline, size: 15, color: kAccent),
+                    const SizedBox(width: 3),
+                    Text(_asChannel.isEmpty ? 'You' : _asChannel,
+                        style: const TextStyle(color: kAccent, fontSize: 12.5, fontWeight: FontWeight.w600)),
+                    const Icon(Icons.arrow_drop_down, size: 16, color: kAccent),
+                  ]),
+                ),
+              ),
             if (!_isQuote && !_isThread && !_poll)
               // toggle long-form article mode (adds a title)
               IconButton(
@@ -6724,6 +8098,13 @@ class _ComposeSheetState extends State<ComposeSheet> {
           Flexible(
             child: SingleChildScrollView(
               child: Column(mainAxisSize: MainAxisSize.min, children: [
+                if (_isReply) Padding(
+                  padding: const EdgeInsets.only(left: 52, bottom: 8),
+                  child: Row(children: [
+                    Text('Replying to @${widget.replyToPost!.handle}',
+                        style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
+                  ]),
+                ),
                 if (_article) Padding(
                   padding: const EdgeInsets.only(bottom: 6),
                   child: TextField(

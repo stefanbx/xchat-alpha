@@ -3,7 +3,8 @@
 # gossips relay membership (bootstrap + /relays), and expires stale heads (TTL). Independent
 # and swappable — run several; clients DISCOVER the set from a bootstrap, no hardcoding.
 # Usage: xc_relayd.py <port> <store.json> [bootstrap_url ...]
-import json, sys, os, time, threading, sqlite3, urllib.request
+import json, sys, os, time, threading, sqlite3, urllib.request, random, hashlib
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import importlib.util
@@ -26,7 +27,12 @@ SELF = os.environ.get('RELAY_PUBLIC_URL', f'http://127.0.0.1:{PORT}')
 # this relay's Nano account (for tip-split rewards). Env-first so a hosted relay (Fly.io / Linux)
 # needs no Mac-native key tool; falls back to deriving it locally.
 RELAY_ACCT = os.environ.get('RELAY_ACCT') or ''
-if not RELAY_ACCT and xc is not None:
+if not RELAY_ACCT and os.environ.get('XC_DEV') == '1' and xc is not None:
+    # DEV ONLY. acct() derives from a fixed repeated byte, so this address's private key is derivable
+    # by anyone with the repo — it is a fixture, not a wallet. It used to be the silent default, which
+    # meant every relay an outsider ran advertised a pay-to-pin address whose funds were free for the
+    # taking. Unset now means "this relay takes no payments" (see /relayacct and grant_pin), which is
+    # the only safe default for a relay run by someone we can't ask.
     try:
         RELAY_ACCT = xc.acct(0x50 + (PORT - 7401))
     except Exception:
@@ -48,7 +54,16 @@ dmkeys = {}                          # account -> signed X25519 DM public key re
 dms = []                             # list of encrypted direct messages (ciphertext only; relay can't read)
 pollvotes = {}                       # poll_id -> {account: signed vote record} (one vote per account)
 reports = {}                         # post_id -> {account: signed report} (community moderation signal)
-known = {SELF}                       # relays this relay knows about
+known = {SELF}                       # relays this relay knows about (flat URL set — the legacy wire format)
+# A relay's IDENTITY is its own keypair, not its URL. A relay behind a Cloudflare quick tunnel gets a
+# brand-new hostname on every restart, and a URL-keyed peer set treats each one as a new relay: the
+# dead hostnames pile up forever, get re-gossiped to everyone, and once KNOWN_MAX is hit the relay
+# stops learning REAL new relays. peers_by_acct maps the stable identity to that relay's CURRENT url,
+# so a restart REPLACES its entry instead of adding one. `known` stays the flat set every other code
+# path here — and every already-deployed relay — still reads.
+peers_by_acct = {}                   # relay account -> {'url', 'ts', 'pub', 'sig'} (signed, relayable)
+relay_health = {}                    # url -> {'fail': consecutive probe failures, 'ok': last success ts}
+_probe_cursor = 0                    # rotates the probe window through `known` across cycles
 
 def head_score(author, h):
     # A head's eviction rank, computed TRUSTLESSLY by the relay from the ledger — no supporter hint.
@@ -96,8 +111,26 @@ COMMENTS_PER_POST = int(os.environ.get('XC_COMMENTS_PER_POST', '1000'))
 ENGAGE_MAX      = int(os.environ.get('XC_ENGAGE_MAX', '200000'))     # distinct post_ids with engagement
 RESHARERS_MAX   = int(os.environ.get('XC_RESHARERS_MAX', '1000'))    # resharers stored per post
 KNOWN_MAX       = int(os.environ.get('XC_KNOWN_MAX', '10000'))       # distinct relay URLs gossiped
+WORK_URL        = os.environ.get('XC_WORK_URL', '').rstrip('/')      # xc_workd behind /work (empty = off)
+WORK_TIMEOUT    = int(os.environ.get('XC_WORK_TIMEOUT', '30'))       # cap a single work request
+BLOB_REPLICAS   = int(os.environ.get('XC_BLOB_REPLICAS', '3'))       # target copies of a blob network-wide
+SHARD_REPAIR_S  = int(os.environ.get('XC_SHARD_REPAIR_S', '900'))    # how often to pull our missing share
+SHARD_PULL_MAX  = int(os.environ.get('XC_SHARD_PULL_MAX', '40'))     # blobs fetched per repair cycle
+RELAY_PROBE_SEC = int(os.environ.get('XC_RELAY_PROBE_SEC', '300'))   # how often to re-check known relays
+RELAY_FAIL_MAX  = int(os.environ.get('XC_RELAY_FAIL_MAX', '5'))      # consecutive probe failures -> forget it
+ANNOUNCE_SKEW   = int(os.environ.get('XC_ANNOUNCE_SKEW', '3600'))    # reject announces dated this far ahead
+# Both of these are per-cycle BUDGETS, not "everything we know". Probing every known relay each cycle
+# is O(N) 4-second timeouts (a full pass over a large set would outrun the interval and pile up), and
+# announcing to all of them is O(N²) chatter across the network. Rotate through instead.
+PROBE_BATCH     = int(os.environ.get('XC_RELAY_PROBE_BATCH', '64'))  # relays re-checked per cycle
+ANNOUNCE_FANOUT = int(os.environ.get('XC_ANNOUNCE_FANOUT', '24'))    # peers we re-announce to per cycle
 FIELD_MAX       = int(os.environ.get('XC_FIELD_MAX', '8192'))        # bytes per free-text record field
 RELEASE_PUBS_MAX = int(os.environ.get('XC_RELEASE_PUBS_MAX', '8'))   # distinct release publishers stored
+# An APK is ~27 MB and a release is PINNED (never evicted). Keeping the last 24 records' BYTES pinned
+# meant a ~650 MB floor on a 1 GB disk that grows with every ship — the real scaling limit, not users.
+# So pin the bytes for only the newest N releases per publisher; older RECORDS (metadata/signatures)
+# are still kept and served, their bytes fetched from IPFS/peers on demand. 0 disables the trimming.
+RELEASE_PIN_KEEP = int(os.environ.get('XC_RELEASE_PIN_KEEP', '3'))   # newest releases whose bytes stay pinned
 
 def _cap_dict(d, maxn):
     # Distinct-key backstop: evict oldest-inserted keys until within maxn. Python dicts are
@@ -109,6 +142,42 @@ def engage_for(pid):
     e = engage.setdefault(pid, {'likes': 0, 'tips_raw': 0, 'reposts': 0})
     _cap_dict(engage, ENGAGE_MAX)                # bound distinct post_ids (was unbounded → OOM)
     return e
+
+_channels_cache = {'t': 0.0, 'json': '{"channels":[]}'}
+def channels_directory():
+    # Channel directory JSON, cached ~10s. ONE pass over `follows` builds per-account follower + online
+    # counts (online = a follower whose head is fresh within 150s), instead of rescanning `follows` for
+    # every channel (the old code was O(channels × follows × list) on the request thread → CPU-DoS). Each
+    # channel profile's signature is VERIFIED here (the relay stores profiles unsigned; verifying at read
+    # stops the directory listing a spoofed channel for an account the poster does not control). `type`
+    # itself is unsigned/advisory, but you can only claim it on a profile you can actually sign.
+    now = time.time()
+    if now - _channels_cache['t'] < 10:
+        return _channels_cache['json']
+    follower_ct, online_ct = {}, {}
+    for f, r in list(follows.items()):
+        if not isinstance(r, dict):
+            continue
+        fresh = now - float((heads.get(f) or {}).get('ts', 0) or 0) <= 150
+        for a in (r.get('follows') or []):
+            follower_ct[a] = follower_ct.get(a, 0) + 1
+            if fresh:
+                online_ct[a] = online_ct.get(a, 0) + 1
+    out = []
+    for acc, rec in list(profiles.items()):
+        if not isinstance(rec, dict) or rec.get('type') != 'channel':
+            continue
+        if xc is not None:
+            msg = xc.sig_canon('profile', acc, rec.get('ts', 0), rec.get('display', ''),
+                               rec.get('bio', ''), rec.get('avatar', ''), rec.get('banner', ''))
+            if not (xc.pub_to_addr(rec.get('pub', '')) == acc
+                    and xc.verify_msg(rec.get('pub', ''), msg, rec.get('sig', ''))):
+                continue                                        # unsigned/spoofed → not listed
+        out.append({'account': acc, 'display': rec.get('display', ''), 'bio': rec.get('bio', ''),
+                    'avatar': rec.get('avatar', ''),
+                    'followers': follower_ct.get(acc, 0), 'online': online_ct.get(acc, 0)})
+    _channels_cache['t'], _channels_cache['json'] = now, json.dumps({'channels': out})
+    return _channels_cache['json']
 
 _heads_lock = threading.Lock()                                # guards heads across prune + /push
 _dm_seen = set()                                              # (from, ts) O(1) dedup for the mailbox
@@ -161,6 +230,11 @@ def blob_score(m):                   # the universal value: tips earned minus th
 _DB = os.path.join(os.path.dirname(os.path.abspath(STORE)) or '.', 'blobs.db')
 _db = sqlite3.connect(_DB, check_same_thread=False)
 _db.execute('PRAGMA journal_mode=WAL')
+# A relay is a CACHE, not an archive. In WAL mode synchronous=NORMAL is CORRUPTION-SAFE (the db can't
+# be damaged by a crash); the only cost of a power-loss is possibly losing the last committed blob
+# write — harmless here, since blobs are content-addressed (re-fetchable from peers) and the head/JSON
+# state lives in a SEPARATE file. In return we drop an fsync off every put/evict. Worth it at scale.
+_db.execute('PRAGMA synchronous=NORMAL')
 _db.execute('CREATE TABLE IF NOT EXISTS blob (cid TEXT PRIMARY KEY, b64 TEXT NOT NULL, '
             'size INTEGER, last REAL, tips REAL)')
 _db.commit()
@@ -217,13 +291,51 @@ def blob_touch(cid):                 # a read counts as use; RAM-only (avoids a 
     if m:
         m['last'] = time.time()
 
+def _shard_relays():
+    # Identities eligible to hold a share: us, plus every peer that has proved an identity. URL-only
+    # (legacy) peers can't be placed against, so they simply don't participate in placement.
+    out = [ID_ACCT] if ID_ACCT else []
+    out.extend(peers_by_acct.keys())
+    return out
+
+def _responsible(cid, accts=None):
+    # RENDEZVOUS ("highest random weight") HASHING. Every relay independently computes the same
+    # ranking of relays for a given cid and keeps it only if it lands in the top BLOB_REPLICAS. No
+    # coordinator, no directory, no agreement protocol — just a hash — which is the only kind of
+    # placement that fits a network where anyone can join and nobody is in charge.
+    #
+    # This exists because the old policy was BOTH wasteful and lossy: the node pushes every blob to
+    # every relay, and eviction ranked by blob_score, which is identical everywhere — so all relays
+    # evicted the SAME victims at the same time. Popular media sat on N relays while unpopular media
+    # dropped to zero copies network-wide. Placement fixes both ends: ~BLOB_REPLICAS copies of
+    # everything instead of N copies of some things and none of the rest.
+    accts = accts if accts is not None else _shard_relays()
+    if not ID_ACCT or len(accts) <= BLOB_REPLICAS:
+        return True                                          # small network: everyone holds everything
+    def weight(a):
+        return hashlib.blake2b((cid + '|' + a).encode(), digest_size=8).digest()
+    mine = weight(ID_ACCT)
+    ahead = 0
+    for a in accts:
+        if a != ID_ACCT and weight(a) > mine:
+            ahead += 1
+            if ahead >= BLOB_REPLICAS:
+                return False
+    return True
+
 def _evict_locked():                 # called with _blob_lock held; drops least-valuable unpinned first
     total = _blob_total()
     if total <= BLOB_CAP:
         return
     now = time.time()
-    victims = sorted((blob_score(m), m['last'], c)          # lowest score first (reported + untipped)
+    accts = _shard_relays()
+    # Evict what we are NOT responsible for before anything we are: an opportunistic copy of a popular
+    # post is the cheapest thing in the cache to lose (several other relays hold it by construction),
+    # while our own share may be one of only BLOB_REPLICAS copies in existence. Nothing is deleted
+    # that the cap wasn't already going to delete — this only chooses better victims.
+    victims = sorted((1 if _responsible(c, accts) else 0, blob_score(m), m['last'], c)
                      for c, m in blob_meta.items() if pinned.get(c, 0) <= now)
+    victims = [(s, l, c) for _r, s, l, c in victims]
     for _score, _last, c in victims:
         if total <= BLOB_CAP:
             break
@@ -235,6 +347,26 @@ def blob_load_meta():                # startup: rebuild the small RAM index from
     with _blob_lock:
         for cid, size, last, tips in _db.execute('SELECT cid,size,last,tips FROM blob'):
             blob_meta[cid] = {'size': size, 'last': last, 'tips': tips or 0.0, 'reports': 0.0}
+
+# In WAL mode every put/evict appends frames to blobs.db-wal; SQLite only folds them back into the
+# main db on a checkpoint. Under steady write traffic the auto-checkpoint (default 1000 pages) can
+# lag, letting the -wal file grow into the tens of MB — bloating the disk footprint and slowing
+# restart recovery. A periodic TRUNCATE checkpoint folds the log back in and shrinks -wal to zero.
+# It runs under _blob_lock (the single serialiser for this connection) so it can't race a writer,
+# and every failure is swallowed: a checkpoint is best-effort housekeeping, never worth a crash.
+WAL_CHECKPOINT_S = float(os.environ.get('XC_WAL_CHECKPOINT_S', '300'))   # 0/negative disables the routine
+
+def _wal_checkpoint():
+    while True:
+        time.sleep(WAL_CHECKPOINT_S)
+        try:
+            with _blob_lock:
+                _db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        except Exception:
+            pass                         # busy/locked/etc — just try again next tick
+
+if WAL_CHECKPOINT_S > 0:
+    threading.Thread(target=_wal_checkpoint, daemon=True).start()
 
 def ensure_release_blob(cid):
     # A signed release (an app update) is CRITICAL INFRA — every relay must hold it, independent of tips
@@ -257,13 +389,45 @@ def ensure_release_blob(cid):
         except Exception:
             pass
 
+def _release_pin_cids():
+    # the cids whose BYTES we keep pinned: the newest RELEASE_PIN_KEEP records per publisher (the list is
+    # append-ordered, newest last). KEEP<=0 pins nothing extra (records/signatures are unaffected either way).
+    keep = set()
+    if RELEASE_PIN_KEEP <= 0:
+        return keep
+    for _pub, lst in releases.items():
+        if isinstance(lst, list):
+            for rec in lst[-RELEASE_PIN_KEEP:]:
+                c = (rec or {}).get('cid')
+                if c:
+                    keep.add(c)
+    return keep
+
+def reconcile_release_pins():
+    # Enforce the newest-N pin window: UNPIN any older release cid so its bytes become evictable under
+    # disk pressure (the record stays; the bytes are re-fetchable from IPFS/peers). Never touches a
+    # PAID pin (pins_paid) — a user who paid to keep a cid owns that pin regardless of release status.
+    keep = _release_pin_cids()
+    paid = set(pins_paid.values())
+    for _pub, lst in list(releases.items()):
+        if not isinstance(lst, list):
+            continue
+        for rec in lst:
+            c = (rec or {}).get('cid')
+            if c and c not in keep and c not in paid and pinned.get(c):
+                pinned.pop(c, None)          # release pin lifted; falls back to normal cache eviction
+    return keep
+
 def sync_release_blobs():
-    # on startup (and after gossip), make sure we hold every known release's bytes — catches a relay that
-    # was down when a release was published.
+    # on startup (and after gossip), make sure we hold the newest releases' bytes — catches a relay that
+    # was down when a release was published — while lifting stale pins on releases past the keep window.
     time.sleep(1.0)
+    keep = reconcile_release_pins()
+    mark_dirty()                                       # persist any pins we just lifted (pinned is in the store)
     for _pub, recs in list(releases.items()):
         for rec in recs:
-            ensure_release_blob(rec.get('cid'))
+            if (rec or {}).get('cid') in keep:
+                ensure_release_blob(rec.get('cid'))
 
 def _release_canon(m):
     return '%s|%s|%s|%s|%s|%s' % (m.get('publisher', ''), m.get('version', ''), m.get('cid', ''),
@@ -294,7 +458,8 @@ def accept_release(m):
     lst.append(m)
     releases[pub_acc] = lst[-24:]
     _cap_dict(releases, RELEASE_PUBS_MAX)
-    if m.get('cid'):
+    keep = reconcile_release_pins()                    # this release just became newest -> older one may drop out
+    if m.get('cid') and m['cid'] in keep:              # only pin+pull bytes if it's inside the keep window
         threading.Thread(target=ensure_release_blob, args=(m['cid'],), daemon=True).start()
     mark_dirty()
     return True
@@ -497,15 +662,234 @@ def post_json(url, obj):
     except Exception:
         pass
 
+def _relay_identity():
+    # The relay's own gossip keypair, generated once and kept next to the state file. This is a NODE
+    # identity, deliberately NOT the operator's payout account (RELAY_ACCT): it signs "I am at this
+    # url now" and holds no funds, so it can live unencrypted on a stranger's laptop.
+    p = STORE + '.id'
+    try:
+        k = open(p).read().strip()
+        if len(k) == 64:
+            bytes.fromhex(k)                                   # reject a truncated/garbage file
+            return k
+    except Exception:
+        pass
+    k = os.urandom(32).hex()
+    try:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.write(fd, k.encode()); os.close(fd)
+    except Exception:
+        pass
+    return k
+
+ID_KEY = _relay_identity() if xc is not None else ''
+try:
+    ID_ACCT, ID_PUB = xc.derive(ID_KEY) if ID_KEY else ('', '')
+except Exception:
+    ID_KEY, ID_ACCT, ID_PUB = '', '', ''
+
+def _announce_canon(acct, url, ts):
+    return xc.sig_canon('relay_announce', acct, url, str(ts))
+
+def announce_self():
+    # What this relay broadcasts about itself. Signed, so it can be passed on by any peer without that
+    # peer being able to alter the url — gossip stays verifiable however many hops it travels.
+    body = {'url': SELF}
+    if ID_KEY:
+        ts = int(time.time())
+        body.update({'account': ID_ACCT, 'pub': ID_PUB, 'ts': ts,
+                     'sig': dict(l.split(' ', 1) for l in
+                                 xc._sign_lines(ID_KEY, _announce_canon(ID_ACCT, SELF, ts)))['sig']})
+    return body
+
+def _forget(u):
+    # Unconditional: only the prober calls this, and only about a url that failed for real.
+    known.discard(u)
+    relay_health.pop(u, None)
+    for a, v in list(peers_by_acct.items()):
+        if v.get('url') == u:
+            peers_by_acct.pop(a, None)
+
+def _release_url(u, acct):
+    # `acct` has moved to a new address. Nothing stops a hostile relay from signing a record naming
+    # SOMEONE ELSE's url and then "moving away" from it, so a claim alone must never be able to evict
+    # a url — drop it only when no other identity still claims it. Reachability, not assertion,
+    # decides everything else (see probe_peers).
+    if any(a != acct and v.get('url') == u for a, v in list(peers_by_acct.items())):
+        return
+    known.discard(u)
+    relay_health.pop(u, None)
+
+def _evict_dead():
+    # Make room at the cap by dropping a relay we've proven unreachable, rather than refusing to learn
+    # a live one. Explicit bootstraps and ourselves are never candidates.
+    dead = [(v.get('fail', 0), u) for u, v in list(relay_health.items())
+            if v.get('fail', 0) >= RELAY_FAIL_MAX and u in known and u != SELF and u not in BOOTSTRAPS]
+    if not dead:
+        return False
+    _forget(max(dead)[1])
+    return True
+
+def _add_known(u):
+    if u in known:
+        return True
+    if len(known) >= KNOWN_MAX and not _evict_dead():
+        return False
+    known.add(u)
+    return True
+
+def learn_peer(m):
+    # Accept one gossip record. A SIGNED record binds a url to a relay account, so the same relay
+    # coming back on a new hostname replaces its old entry instead of leaving a corpse behind.
+    # Unsigned records still work exactly as before — relays already deployed only speak urls.
+    u = (m.get('url') or '').strip()
+    if not u or u == SELF or len(u) > FIELD_MAX:
+        return False
+    acct, pub, sig = m.get('account', ''), m.get('pub', ''), m.get('sig', '')
+    try:
+        ts = int(m.get('ts', 0) or 0)
+    except Exception:
+        ts = 0
+    signed = False
+    if acct and pub and sig and xc is not None and ts <= time.time() + ANNOUNCE_SKEW:
+        try:
+            signed = (xc.pub_to_addr(pub) == acct
+                      and xc.verify_msg(pub, _announce_canon(acct, u, ts), sig))
+        except Exception:
+            signed = False
+    if not signed:
+        return _add_known(u)                               # legacy/anonymous: a bare url, as before
+    cur = peers_by_acct.get(acct)
+    if cur and cur.get('ts', 0) >= ts:
+        return False                                       # stale or replayed announce — we hold newer
+    if cur and cur.get('url') != u and cur.get('url') not in BOOTSTRAPS:
+        _release_url(cur['url'], acct)                     # same relay, new address: drop the old one
+    if acct not in peers_by_acct and len(peers_by_acct) >= KNOWN_MAX:
+        return False
+    if not _add_known(u):
+        return False
+    peers_by_acct[acct] = {'url': u, 'ts': ts, 'pub': pub, 'sig': sig}
+    return True
+
+def signed_peers():
+    return [{'account': a, 'url': v['url'], 'ts': v['ts'], 'pub': v['pub'], 'sig': v['sig']}
+            for a, v in list(peers_by_acct.items())]
+
+def _pull_relays(url):
+    d = json.loads(urllib.request.urlopen(url + '/relays', timeout=3).read())
+    for rec in (d.get('peers') or []):                     # signed records (new relays)
+        if isinstance(rec, dict):
+            learn_peer(rec)
+    for u in (d.get('relays') or []):                      # bare urls (relays already deployed)
+        if isinstance(u, str):
+            learn_peer({'url': u})
+
+def gossip_out():
+    # Announce to the bootstraps plus a sample of peers. A quick-tunnel relay changes hostname on
+    # restart, so this is also how the network learns its new address — the sample is enough, because
+    # a signed record is relayable and spreads onward from whoever receives it.
+    me = announce_self()
+    others = [u for u in list(known) if u != SELF and u not in BOOTSTRAPS]
+    if len(others) > ANNOUNCE_FANOUT:
+        others = random.sample(others, ANNOUNCE_FANOUT)
+    for t in dict.fromkeys(list(BOOTSTRAPS) + others):
+        post_json(t + '/relay_announce', me)
+
 def bootstrap():
     time.sleep(0.4)
     for bp in BOOTSTRAPS:
-        known.add(bp)
-        post_json(bp + '/relay_announce', {'url': SELF})   # tell the bootstrap we exist
+        _add_known(bp)
+        post_json(bp + '/relay_announce', announce_self())  # tell the bootstrap we exist
         try:
-            d = json.loads(urllib.request.urlopen(bp + '/relays', timeout=3).read())
-            for u in d.get('relays', []):
-                known.add(u)
+            _pull_relays(bp)
+        except Exception:
+            pass
+
+def probe_peers():
+    # `known` used to be append-only, which is only survivable while every relay has a permanent url.
+    # It doesn't, so re-check what we hold: a relay that fails RELAY_FAIL_MAX probes in a row is
+    # forgotten, and re-learned the moment it announces again. Churn becomes self-healing instead of
+    # cumulative, and the cap stops being a lockout.
+    global _probe_cursor
+    while True:
+        time.sleep(RELAY_PROBE_SEC)
+        try:
+            allk = sorted(u for u in known if u != SELF and u not in BOOTSTRAPS)
+            if allk:                                       # rotate a fixed-size window through the set
+                _probe_cursor %= len(allk)
+                targets = (allk + allk)[_probe_cursor:_probe_cursor + PROBE_BATCH]
+                _probe_cursor += len(targets)
+            else:
+                targets = []
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                for u, alive in zip(targets, ex.map(_probe_one, targets)):
+                    h = relay_health.setdefault(u, {'fail': 0, 'ok': 0})
+                    if alive:
+                        h['fail'], h['ok'] = 0, int(time.time())
+                    else:
+                        h['fail'] += 1
+                        if h['fail'] >= RELAY_FAIL_MAX:
+                            _forget(u)
+            gossip_out()                                   # re-announce so peers keep (or re-learn) us
+            for bp in BOOTSTRAPS:                          # and pull whatever they've learned since
+                try:
+                    _pull_relays(bp)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+def _probe_one(u):
+    try:
+        urllib.request.urlopen(u + '/relays', timeout=4).read()
+        return True
+    except Exception:
+        return False
+
+def shard_repair():
+    # Placement only sheds copies; on its own it would let replication decay every time a relay left,
+    # filled up, or joined late — and a blob nobody is responsible for is a blob that disappears. This
+    # is the other half: ask peers what they hold, and pull the ones WE are supposed to be holding but
+    # don't. That makes the replication factor self-healing rather than a one-way ratchet downward.
+    while True:
+        time.sleep(SHARD_REPAIR_S)
+        try:
+            accts = _shard_relays()
+            if len(accts) <= BLOB_REPLICAS:
+                continue                                   # everyone holds everything; nothing to repair
+            peers = [u for u in list(known) if u != SELF and '127.0.0.1' not in u and 'localhost' not in u]
+            random.shuffle(peers)
+            pulled = 0
+            for peer in peers:
+                if pulled >= SHARD_PULL_MAX:
+                    break
+                after = ''
+                while pulled < SHARD_PULL_MAX:
+                    try:
+                        d = json.loads(urllib.request.urlopen(
+                            f'{peer}/bloblist?after={after}&limit=500', timeout=8).read())
+                    except Exception:
+                        break
+                    cids = d.get('cids') or []
+                    if not cids:
+                        break
+                    after = cids[-1]
+                    for cid in cids:
+                        if pulled >= SHARD_PULL_MAX:
+                            break
+                        if cid in blob_meta or not _responsible(cid, accts):
+                            continue
+                        try:
+                            b = json.loads(urllib.request.urlopen(
+                                f'{peer}/blob?cid={cid}', timeout=60).read())
+                            if b.get('b64') and blob_put(cid, b['b64']):
+                                pulled += 1
+                        except Exception:
+                            continue
+                    if not d.get('more'):
+                        break
+            if pulled:
+                print(f'shard repair: pulled {pulled} blob(s) we are responsible for', flush=True)
         except Exception:
             pass
 
@@ -525,25 +909,59 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(b)))
         self.end_headers()
         self.wfile.write(b)
+    def do_OPTIONS(self):
+        # See kt_server: a JSON POST from a browser is preflighted, and an unanswered preflight blocks
+        # the real request. The app POSTs straight to relays (pay-to-pin, announces), so the relay
+        # needs this too or the browser build can only ever read.
+        self.send_response(204)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Max-Age', '86400')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     def do_GET(self):
         if self.path.startswith('/heads'):
             self._send(200, json.dumps({'relay': PORT, 'heads': live_heads()}))
         elif self.path.startswith('/relays'):
-            self._send(200, json.dumps({'relay': PORT, 'relays': sorted(known)}))
+            # 'relays' stays the flat url list every deployed relay and the node already parse;
+            # 'peers' carries the signed identity records, ignored by anything that doesn't know them.
+            self._send(200, json.dumps({'relay': PORT, 'relays': sorted(known),
+                                        'account': ID_ACCT, 'peers': signed_peers()}))
         elif self.path.startswith('/notify'):
             h = qs(self.path).get('handle', '')
             self._send(200, json.dumps({'relay': PORT, 'notifs': notifs.get(h, [])}))
         elif self.path.startswith('/supporters'):
             self._send(200, json.dumps({'relay': PORT, 'count': len(supporters),
                                         'accounts': list(supporters.keys())}))
+        elif self.path.startswith('/bloblist'):
+            # MUST be tested before '/blob' — startswith('/blob') matches '/bloblist' too, so the
+            # order of these branches is load-bearing, not cosmetic.
+            # What we hold, paged and sorted, so a peer can work out which of these it is responsible
+            # for and pull its share (see shard_repair). Cids only — content-addressed public names,
+            # no bytes and nothing private.
+            q = qs(self.path)
+            after = q.get('after', '')
+            try:
+                lim = max(1, min(int(q.get('limit', '500')), 2000))
+            except ValueError:
+                lim = 500
+            with _blob_lock:
+                cids = [c for c in sorted(blob_meta.keys()) if c > after][:lim]
+            self._send(200, json.dumps({'relay': PORT, 'cids': cids, 'more': len(cids) == lim}))
         elif self.path.startswith('/blob'):
             cid = qs(self.path).get('cid', '')
             blob_touch(cid)                                             # a read is use → LRU keeps it longer
             self._send(200, json.dumps({'cid': cid, 'b64': blob_get(cid)}))   # serve cached content from disk
         elif self.path.startswith('/cache'):                           # cache health: size vs cap, pins
             now = time.time()
+            accts = _shard_relays()
+            mine = sum(1 for c in list(blob_meta) if _responsible(c, accts))
             self._send(200, json.dumps({'relay': PORT, 'blobs': len(blob_meta), 'bytes': _blob_total(),
-                                        'cap': BLOB_CAP, 'pinned': sum(1 for e in pinned.values() if e > now)}))
+                                        'cap': BLOB_CAP, 'pinned': sum(1 for e in pinned.values() if e > now),
+                                        'shard': mine, 'opportunistic': len(blob_meta) - mine,
+                                        'replicas': BLOB_REPLICAS, 'placement_relays': len(accts)}))
         elif self.path.startswith('/haveblob'):
             cid = qs(self.path).get('cid', '')
             self._send(200, json.dumps({'cid': cid, 'have': blob_has(cid),
@@ -561,6 +979,8 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/follows'):
             acc = qs(self.path).get('account', '')
             self._send(200, json.dumps({'account': acc, 'record': follows.get(acc)}))
+        elif self.path.startswith('/channels'):
+            self._send(200, channels_directory())
         elif self.path.startswith('/profile'):
             acc = qs(self.path).get('account', '')
             self._send(200, json.dumps({'account': acc, 'record': profiles.get(acc)}))
@@ -583,8 +1003,35 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps({'pub': pub, 'records': releases.get(pub, [])}))
         elif self.path.startswith('/engagement'):
             self._send(200, json.dumps({'relay': PORT, 'engage': engage}))
+        elif self.path.startswith('/work'):
+            # SELL THE ONE THING THAT IS SAFE TO BUY FROM A STRANGER. Proof-of-work authorises nothing
+            # and is verified by the consumer in a single hash, so a relay with a GPU can compute it for
+            # the whole network and the worst a bad relay achieves is wasting its own electricity. This
+            # is what turns "tip pending" into "tip settled": the alternative is free public work RPCs
+            # (0.9s–36s, rate-limited) or a datacenter CPU at about a minute a block.
+            # Backed by xc_workd (XC_WORK_URL); a relay without one simply doesn't advertise the service.
+            if not WORK_URL:
+                self._send(503, json.dumps({'error': 'this relay does not serve work'}))
+            else:
+                q = qs(self.path)
+                root = (q.get('hash') or '').strip().lower()
+                diff = (q.get('difficulty') or 'fffffff800000000').strip().lower()
+                if len(root) != 64:
+                    self._send(400, json.dumps({'error': 'hash must be a 64-character hex root'}))
+                else:
+                    try:
+                        d = json.loads(urllib.request.urlopen(
+                            f'{WORK_URL}/work?hash={root}&difficulty={diff}', timeout=WORK_TIMEOUT).read())
+                        self._send(200, json.dumps({'work': d.get('work'), 'relay': RELAY_ACCT}))
+                    except Exception as e:
+                        self._send(503, json.dumps({'error': 'work generation failed: %s' % e}))
         elif self.path.startswith('/relayacct'):
-            self._send(200, json.dumps({'port': PORT, 'account': RELAY_ACCT}))
+            # Capability advertisement. 'work' is what lets a node DISCOVER proof-of-work sources
+            # instead of being configured with them: a relay with a GPU says so here, nodes learn it
+            # by the same gossip walk they already do to find relays, and every answer is verified
+            # before use — so advertising costs nothing and lying gains nothing.
+            self._send(200, json.dumps({'port': PORT, 'account': RELAY_ACCT,
+                                        'work': bool(WORK_URL), 'identity': ID_ACCT}))
         else:
             self._send(404, '{"error":"not found"}')
     def do_POST(self):
@@ -625,6 +1072,10 @@ class H(BaseHTTPRequestHandler):
                 maxexp = now + HEAD_TTL + HEAD_SKEW
                 if float(h.get('expires', 0)) > maxexp:
                     h['expires'] = int(maxexp)
+                # Server-stamp the receive time as a PRESENCE heartbeat. The app republishes its head
+                # every ~45s while open, so a head whose ts is a couple minutes old ≈ that user is online.
+                # Not part of the signed preimage (account|seq|cid|expires), so this can't break the sig.
+                h['ts'] = int(now)
                 with _heads_lock:
                     cur = heads.get(h['author'])
                     if cur is None and len(heads) >= MAX_HEADS:
@@ -643,10 +1094,9 @@ class H(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/relay_announce'):
             try:
-                u = json.loads(raw).get('url', '')
-                if u and u != SELF and len(u) <= FIELD_MAX and len(known) < KNOWN_MAX:
-                    known.add(u)
-                self._send(200, json.dumps({'ok': True, 'relays': sorted(known)}))
+                learn_peer(json.loads(raw) or {})
+                self._send(200, json.dumps({'ok': True, 'relays': sorted(known),
+                                            'account': ID_ACCT, 'peers': signed_peers()}))
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/notify_push'):
@@ -690,6 +1140,10 @@ class H(BaseHTTPRequestHandler):
                 if exp:
                     self._send(200, json.dumps({'ok': True, 'cid': cid, 'pinned_until': int(exp),
                                                 'days': round((exp - time.time()) / 86400, 2)}))
+                elif not RELAY_ACCT:
+                    # Never answer with an empty pay_to: a client that sent to it would burn the tip.
+                    self._send(402, json.dumps({'ok': False, 'pay_to': '',
+                                                'error': 'this relay has no payout account set and takes no paid pins'}))
                 else:
                     self._send(402, json.dumps({'ok': False, 'pay_to': RELAY_ACCT,
                                                 'rate_days_per_xno': PIN_DAYS_PER_XNO,
@@ -781,8 +1235,13 @@ class H(BaseHTTPRequestHandler):
                 if xc is None or xc.pub_to_addr(pub) != acc \
                         or not xc.verify_msg(pub, 'report|%s|%s|%s' % (acc, pid, ts), sig):
                     self._send(400, json.dumps({'ok': False, 'error': 'bad report signature'})); return
+                # Bound distinct reported posts BEFORE inserting — the old `setdefault` then `pid in reports`
+                # check always saw the just-inserted key, so the cap never fired and a signed-report flood
+                # of fresh post_ids grew `reports` without limit (OOM a running relay).
+                if pid not in reports and len(reports) >= REPORT_POSTS:
+                    self._send(200, json.dumps({'ok': True, 'accepted': False, 'reason': 'report cap'})); return
                 recs = reports.setdefault(pid, {})
-                fresh = acc not in recs and (pid in reports or len(reports) <= REPORT_POSTS) and len(recs) < REPORT_PER_POST
+                fresh = acc not in recs and len(recs) < REPORT_PER_POST
                 if fresh:
                     rep = xc.account_rep(acc)                   # Sybil-resistant weight (0 for a throwaway)
                     recs[acc] = {'ts': ts, 'sig': sig, 'pub': pub, 'cid': m.get('cid', ''), 'rep': rep}
@@ -848,6 +1307,24 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({'ok': True, 'views': e['views']}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
+        elif self.path.startswith('/admin/reset_engage'):
+            # DESTRUCTIVE, PUBLISHER-ONLY: wipe every post's engagement (likes/views/reposts/tips_raw)
+            # for a clean slate. Gated exactly like a release/announcement — a FRESH, publisher-signed
+            # request — so no relay operator or user can zero the network's metrics. Nothing else is
+            # touched (heads, follows, comments, blobs, pins all remain). canon: sig_canon('admin_reset', ts).
+            try:
+                m = json.loads(raw)
+                ts, pub, sig = int(m.get('ts', 0)), m.get('pub', ''), m.get('sig', '')
+                if (xc is None or xc.pub_to_addr(pub) != PUBLISHER_ACCT
+                        or abs(time.time() - ts) > 300
+                        or not xc.verify_msg(pub, xc.sig_canon('admin_reset', ts), sig)):
+                    self._send(403, json.dumps({'ok': False, 'error': 'not authorized'})); return
+                n = len(engage)
+                engage.clear()
+                save()                                        # persist the cleared state atomically
+                self._send(200, json.dumps({'ok': True, 'cleared': n}))
+            except Exception as ex:
+                self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
         else:
             self._send(404, '{"error":"not found"}')
 
@@ -855,4 +1332,6 @@ if BOOTSTRAPS:
     threading.Thread(target=bootstrap, daemon=True).start()
     threading.Thread(target=backfill, daemon=True).start()         # pull peers' heads + releases so a joining relay mirrors the net
 threading.Thread(target=sync_release_blobs, daemon=True).start()   # catch up on any release bytes we're missing
+threading.Thread(target=probe_peers, daemon=True).start()          # forget dead relay urls; re-announce ours
+threading.Thread(target=shard_repair, daemon=True).start()         # pull the share of blobs we're placed on
 ThreadingHTTPServer((BIND, PORT), H).serve_forever()
