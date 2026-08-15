@@ -33,7 +33,10 @@ if ! ipfs repo stat >/dev/null 2>&1; then
     echo "WARNING: if the directory is non-empty but has no config, it is half-built; inspect it"
 fi
 ipfs config --json Addresses.Gateway '"/ip4/127.0.0.1/tcp/8081"' >/dev/null 2>&1 || true
-ipfs daemon --offline >/tmp/ipfs.log 2>&1 &
+# --migrate: this repo is fs-repo@15 and kubo v0.43 wants @18. Without the flag kubo asks at a
+# prompt, and there is no TTY here — the daemon would abort and every post would fail with the
+# only clue buried in /tmp/ipfs.log. Migrations are forward-only and kubo carries them in-binary.
+ipfs daemon --offline --migrate >/tmp/ipfs.log 2>&1 &
 sleep 5
 # Nothing checked that the daemon actually came up; `sleep 5` then exec'ing the node meant a dead
 # daemon looked exactly like a healthy start. pgrep is absent in this image, so ask ipfs itself.
