@@ -574,7 +574,9 @@ def route(path, query, body):
 
 
 MAX_JSON_BODY = int(os.environ.get('XC_MAX_JSON_BODY', str(512 * 1024)))        # non-blob request cap
-MAX_BLOB_BODY = int(os.environ.get('XC_MAX_BLOB_BODY', str(32 * 1024 * 1024)))  # blob/APK-sized cap
+MAX_BLOB_BODY = int(os.environ.get('XC_MAX_BLOB_BODY', str(48 * 1024 * 1024)))  # blob/APK-sized cap; must
+# stay >= the relay's MAX_BLOB (base64 is ~4/3 of raw, so 48 MB holds a ~36 MB APK). The node front door
+# proxies /blob to the embedded relay, so a cap tighter than the relay's silently drops the release pin.
 
 
 class H(BaseHTTPRequestHandler):
