@@ -17,13 +17,20 @@
 #
 # A quick tunnel's hostname changes on every restart. That costs the network nothing: the relay
 # generates its own keypair and signs "I am at this url now", so peers follow the same relay to its
-# new address instead of collecting dead ones. If you'd rather have a permanent address:
+# new address instead of collecting dead ones.
 #
+# It does cost you ONE thing: a hostname that changes can't be published on the XNO ledger, so people
+# who don't already have your URL can't find you. Announcing needs an address that is both permanent
+# and short (the on-chain link holds 32 bytes). Pick whichever suits you:
+#
+#   --setup-worker                           free Cloudflare workers.dev name, set up for you in one
+#                                            command — the node keeps its quick tunnel and the worker
+#                                            forwards to it, so the published address never changes
 #   --domain relay.example.com               you already route that name to this machine
 #   --domain relay.example.com --tunnel-token <token>   Cloudflare named tunnel (token from their
 #                                            dashboard: Networks -> Tunnels -> your tunnel)
 #
-#   sh install-relay.sh --status      what's running + the public URL
+#   sh install-relay.sh --status      what's running, the public URL, and whether you're announced
 #   sh install-relay.sh --uninstall   stop it and delete ~/.xchat-relay
 set -eu
 
@@ -41,6 +48,10 @@ WORKD_PORT="${XC_WORKD_PORT:-7503}"
 # is then done by this machine instead of a public RPC that is frequently down.
 NODE_PORT="${XC_NODE_PORT:-8790}"
 WITH_NODE="${XC_WITH_NODE:-0}"
+# Name of the Cloudflare Worker that fronts this node (see --setup-worker). SHORT on purpose: the
+# on-chain link holds 32 bytes of hostname, and the final host is <name>.<account>.workers.dev — so
+# every character here is one fewer available to the account subdomain, which the operator can't change.
+WORKER_NAME="${XC_WORKER_NAME:-xc}"
 # Files the node is made of. Keep in step with backend/*.py — a missing optional helper disables one
 # feature, but kt_server.py and xc_common.py are load-bearing and the install aborts without them.
 NODE_FILES="kt_server.py xc_announce.py xc_attest.py xc_blobput.py xc_blockproc.py xc_comments.py
@@ -103,6 +114,9 @@ while [ $# -gt 0 ]; do
         --stop)            ACTION=stop ;;
         --start)           ACTION=start ;;
         --uninstall)       ACTION=uninstall ;;
+        --setup-worker)    ACTION=setup-worker ;;
+        --worker-name)     shift; WORKER_NAME="${1:-}"; [ -n "$WORKER_NAME" ] || die "--worker-name needs a value" ;;
+        --worker-name=*)   WORKER_NAME="${1#*=}" ;;
         --help|-h)         ACTION=help ;;
         --with-node)       WITH_NODE=1 ;;
         --no-node)         WITH_NODE=0 ;;
@@ -120,8 +134,116 @@ case "$ACTION" in
         if pgrep -f "$XC_HOME/run.sh" >/dev/null 2>&1; then ok "relay is running"
         else warn "relay is not running"; fi
         [ -f "$XC_HOME/public-url.txt" ] && say "public URL: $(cat "$XC_HOME/public-url.txt")"
+        # Whether this node is DISCOVERABLE is the thing an operator most needs to know and the thing
+        # that used to be invisible: a failed self-announce only ever wrote a line to selfannounce.log,
+        # so a node could serve happily for hours while being unreachable to anyone who didn't already
+        # know its URL. Report it plainly, and say exactly what to run.
+        say ""
+        if [ -f "$XC_HOME/worker.conf" ]; then
+            WORKER_URL=''; . "$XC_HOME/worker.conf"
+            ok "stable address: ${WORKER_URL:-(worker.conf has no WORKER_URL)}"
+        else
+            warn "no stable address — this node is NOT announced on the XNO ledger"
+            say "  A quick tunnel gets a NEW hostname every restart, so it can't be announced: the"
+            say "  on-chain link holds 32 bytes and would go stale on each restart anyway. Others can"
+            say "  only reach you if you hand them the current URL by hand."
+            say "  Fix it once:  sh $XC_HOME/install-relay.sh --setup-worker"
+        fi
+        if [ -s "$XC_HOME/operator.seed" ]; then
+            ok "operator key present (announces are signed with it)"
+        else
+            warn "no operator key — self-announce is disabled (see --help)"
+        fi
+        if [ -s "$XC_HOME/selfannounce.log" ]; then
+            say "last announce: $(tail -n 1 "$XC_HOME/selfannounce.log")"
+        fi
+        say ""
         say "settings:   http://127.0.0.1:$ADMIN_PORT"
         say "logs:       $XC_HOME/relay.log"
+        exit 0 ;;
+    setup-worker)
+        # ONE-TIME: give this node a short, stable, free hostname that survives tunnel churn.
+        #
+        # Why this exists: the default install uses a Cloudflare QUICK tunnel, which mints a new
+        # hostname on every restart (8 different ones in a single day of ordinary use, measured) and
+        # whose host routinely exceeds the 32 bytes the on-chain link can hold. Announcing that would
+        # be both impossible and wrong. A workers.dev hostname is short, free and permanent; the worker
+        # reads the current tunnel from KV, so the address the ledger carries never has to change.
+        command -v npx >/dev/null 2>&1 || die "npx not found — install Node.js first (https://nodejs.org), then re-run"
+        [ -d "$XC_HOME" ] || die "$XC_HOME not found — install the relay first"
+        CFDIR="$XC_HOME/cf-worker"; mkdir -p "$CFDIR/src"
+        # Fetch the worker source rather than embedding a copy here: two copies of the same proxy would
+        # drift, and the one an operator deploys is the one that must match the repo.
+        fetch "$SRC/cf-worker/src/worker.js" "$CFDIR/src/worker.js" \
+            || die "could not download the worker source from $SRC/cf-worker/src/worker.js"
+        say ""
+        say "This opens a browser to sign in to Cloudflare (free account is enough), then creates a KV"
+        say "namespace and deploys a tiny worker. Nothing is charged and no card is asked for."
+        say ""
+        if ! npx --yes wrangler whoami >/dev/null 2>&1; then
+            say "Signing in to Cloudflare..."
+            npx --yes wrangler login || die "cloudflare login failed — re-run when you can complete it in a browser"
+        fi
+        ok "signed in to Cloudflare"
+
+        # Reuse an existing namespace when re-run, so this stays idempotent and never orphans one.
+        KV_ID=''
+        [ -f "$XC_HOME/worker.conf" ] && { KV_NAMESPACE_ID=''; . "$XC_HOME/worker.conf"; KV_ID="$KV_NAMESPACE_ID"; }
+        if [ -z "$KV_ID" ]; then
+            say "Creating the KV namespace..."
+            KV_OUT=$(cd "$CFDIR" && npx --yes wrangler kv namespace create BACKEND_KV 2>&1) || {
+                printf '%s\n' "$KV_OUT" >&2; die "could not create the KV namespace (output above)"; }
+            KV_ID=$(printf '%s' "$KV_OUT" | grep -oE '[0-9a-f]{32}' | head -1)
+            [ -n "$KV_ID" ] || { printf '%s\n' "$KV_OUT" >&2
+                die "created the namespace but could not read its id from wrangler's output (above).
+Put the id into $CFDIR/wrangler.toml by hand and re-run --setup-worker."; }
+        fi
+        ok "KV namespace: $KV_ID"
+
+        cat > "$CFDIR/wrangler.toml" <<TOML
+name = "$WORKER_NAME"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "BACKEND_KV"
+id = "$KV_ID"
+TOML
+        say "Deploying the worker..."
+        DEP_OUT=$(cd "$CFDIR" && npx --yes wrangler deploy 2>&1) || {
+            printf '%s\n' "$DEP_OUT" >&2; die "worker deploy failed (output above)"; }
+        WORKER_URL=$(printf '%s' "$DEP_OUT" | grep -oE 'https://[a-z0-9.-]+\.workers\.dev' | head -1)
+        [ -n "$WORKER_URL" ] || { printf '%s\n' "$DEP_OUT" >&2
+            die "deployed, but could not read the worker URL from wrangler's output (above)"; }
+
+        # The whole point is an address that FITS on-chain. Check before promising it works: the host
+        # is <name>.<account subdomain>.workers.dev and the operator can only shorten the name part.
+        HOST=${WORKER_URL#https://}
+        LEN=$(printf '%s' "$HOST" | wc -c | tr -d ' ')
+        if [ "$LEN" -gt 32 ]; then
+            warn "worker deployed at $WORKER_URL"
+            die "...but that host is $LEN bytes and the on-chain link holds 32.
+Your account subdomain is fixed, so shorten the worker name and re-run, e.g.:
+  sh $XC_HOME/install-relay.sh --setup-worker --worker-name x"
+        fi
+        ok "worker: $WORKER_URL  ($LEN of 32 bytes on-chain)"
+
+        cat > "$XC_HOME/worker.conf" <<CONF
+# Cloudflare Worker front for this node (stable short hostname → churning quick tunnel).
+WORKER_URL=$WORKER_URL
+KV_NAMESPACE_ID=$KV_ID
+CONF
+        # Point the worker at the tunnel that is live RIGHT NOW, so it works before any restart.
+        if [ -s "$XC_HOME/public-url.txt" ]; then
+            CUR=$(cat "$XC_HOME/public-url.txt")
+            npx --yes wrangler kv key put --remote --namespace-id="$KV_ID" backend "$CUR" >/dev/null 2>&1 \
+                && ok "worker now points at $CUR" || warn "could not push the current backend into KV (a restart will do it)"
+        fi
+        say ""
+        ok "Done. Restart so the node announces the worker URL on the ledger:"
+        say "  sh $XC_HOME/install-relay.sh --stop && sh $XC_HOME/install-relay.sh --start"
+        say "Then check it took:  sh $XC_HOME/install-relay.sh --status"
         exit 0 ;;
     stop)
         stop_service
@@ -156,7 +278,10 @@ case "$ACTION" in
         say "  (a PATH line marked 'added by xchat-relay' may remain in your shell profile)"
         exit 0 ;;
     help)
-        [ -f "$0" ] && sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' || say "see $XC_HOME/install-relay.sh"
+        # Print the header block up to the first non-comment line. This used to be a hard-coded line
+        # range, which silently truncated --help mid-sentence the moment the header grew.
+        [ -f "$0" ] && awk 'NR>1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0" \
+            || say "see $XC_HOME/install-relay.sh"
         exit 0 ;;
 esac
 
