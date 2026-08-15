@@ -908,7 +908,15 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Content-Length', str(len(b)))
         self.end_headers()
-        self.wfile.write(b)
+        # HEAD: identical headers, no body (see do_HEAD).
+        if not getattr(self, '_head_only', False):
+            self.wfile.write(b)
+
+    def do_HEAD(self):
+        # The node proxies non-/api paths here, so a HEAD to the node's public url lands on the relay.
+        # Without this it answers 501 and anything probing with HEAD sees a broken relay.
+        self._head_only = True
+        self.do_GET()
     def do_OPTIONS(self):
         # See kt_server: a JSON POST from a browser is preflighted, and an unanswered preflight blocks
         # the real request. The app POSTs straight to relays (pay-to-pin, announces), so the relay
