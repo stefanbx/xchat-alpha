@@ -33,10 +33,19 @@ import 'ledger_discovery.dart';
 const String kDefaultBase = 'https://xchat-alpha-node.fly.dev'; // hosted alpha node (run your own + repoint in Settings)
 String kBase = kDefaultBase;
 
+// SEVERAL independent default endpoints, across DIFFERENT providers, so a fresh install isn't single-homed
+// even before ledger discovery runs: if the primary's host is taken down, the app can still fail over to a
+// baked-in alternative on its very first launch. Today: the Fly node + a Cloudflare-Worker-fronted node
+// (distinct ingress + compute), with the XNO-ledger scan as the ultimate, unstoppable fallback beyond these.
+const List<String> kBootstrapEndpoints = [
+  kDefaultBase,                              // Fly ingress + Fly compute
+  'https://xc.butucea-stefan.workers.dev',   // Cloudflare Worker ingress -> independent home node
+];
+
 // Node endpoints tried in order, with FAILOVER. The app REMEMBERS the last-good one (persisted) and
 // uses it directly — no rescan every launch. It only re-probes the list when the current endpoint fails,
 // then switches to a healthy one. Seed extra endpoints here or via Settings; a 2nd node makes this real.
-List<String> kEndpoints = [kDefaultBase];
+List<String> kEndpoints = List.of(kBootstrapEndpoints);
 
 Future<void> _loadEndpoints() async {
   final sp = await SharedPreferences.getInstance();
@@ -45,7 +54,7 @@ Future<void> _loadEndpoints() async {
   for (final e in [
     sp.getString('xchat_endpoint') ?? '',            // legacy single-endpoint pref (last-good)
     ...?sp.getStringList('xchat_endpoints'),
-    kDefaultBase,
+    ...kBootstrapEndpoints,                           // baked-in defaults across providers (fall-through)
   ]) {
     if (e.isNotEmpty && seen.add(e)) list.add(e);
   }
@@ -127,7 +136,7 @@ Future<bool> healEndpointsFromLedger({bool switchBase = true}) async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.3.7'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.3.8'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -5231,9 +5240,11 @@ class _FeedScreenState extends State<FeedScreen> {
       if (mounted) setState(() {});
     } catch (_) {}
     // Seed a censorship-resistant fallback from the ledger while the current endpoint is healthy, so a
-    // later takedown of the default node can't strand this install. Only when we have no backup yet
-    // (stops after one is cached) — keeps the launch burst light and public RPCs unhammered.
-    if (kEndpoints.length <= 1) unawaited(healEndpointsFromLedger(switchBase: false));
+    // later takedown of the default nodes can't strand this install. Only until we've cached an endpoint
+    // BEYOND the baked-in defaults — keeps the launch burst light and public RPCs unhammered.
+    if (kEndpoints.length <= kBootstrapEndpoints.length) {
+      unawaited(healEndpointsFromLedger(switchBase: false));
+    }
     _refreshNotifs();    // notifications + raise Android alerts for new like/comment/tip
     _refreshDmBadge();   // mail-icon unread count + launcher badge (fire-and-forget)
     Api.announcement().then((a) { if (mounted) setState(() => _announcement = a); });  // coordinated-event banner

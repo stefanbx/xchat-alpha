@@ -54,11 +54,13 @@ android {
         release {
             signingConfig = signingConfigs.getByName(if (hasReleaseKey) "release" else "debug")
             // NOTE: a universal APK carries the native libs (libflutter.so + libapp.so) once PER ABI, so
-            // the default build ships arm64-v8a + armeabi-v7a + x86_64 — and x86_64 is emulator-only dead
-            // weight (~10 MB) that no real phone runs. `ndk.abiFilters` here is IGNORED by `flutter build
-            // apk` (Flutter injects -Ptarget-platform=all), so the distributed release MUST be built with:
-            //   flutter build apk --release --target-platform android-arm64,android-arm
-            // which drops x86_64 and cuts the download ~26.9 MB -> ~18 MB while excluding no real device.
+            // the default build ships arm64-v8a + armeabi-v7a + x86_64. `ndk.abiFilters` here is IGNORED by
+            // `flutter build apk` (Flutter injects -Ptarget-platform=all), so the distributed release MUST
+            // be built with an explicit target-platform. As of 2.3.8 we ship arm64-v8a ONLY:
+            //   flutter build apk --release --target-platform android-arm64
+            // ~26.9 MB (all ABIs) -> ~11 MB. arm64 is every phone shipped since ~2019 (Play has required
+            // 64-bit since Aug 2019); this drops x86_64 (emulator-only) AND armeabi-v7a (pre-2019 32-bit
+            // phones). To keep old 32-bit devices, use `--target-platform android-arm64,android-arm`.
         }
     }
 
