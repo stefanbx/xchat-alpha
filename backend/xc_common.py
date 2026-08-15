@@ -206,6 +206,55 @@ def sig_canon(msg_type, *fields):
         out += '|' + str(len(s.encode('utf-8'))) + ':' + s
     return out
 
+# ---- the four RELAY-VERIFIED signed types (issue #7) -------------------------------------------
+# These were left on the legacy '|'-joined preimage when everything else moved to sig_canon, because
+# they are verified by the separately-deployed relay as well as the node, so migrating them needs a
+# coordinated deploy rather than one release. Defined ONCE here and imported by both sides — two
+# copies of a signing preimage silently diverge, and the symptom is a valid signature being rejected.
+#
+# THE MIGRATION IS DELIBERATELY TWO-SIDED AND IN THIS ORDER:
+#   1. verifiers accept v2 OR legacy  (this change — safe to deploy alone)
+#   2. signers emit v2                (apps and tools; harmless once step 1 is everywhere)
+#   3. legacy acceptance is dropped   (a later release, once old clients are gone)
+# Doing it the other way round would break live traffic: every already-published release record is
+# legacy-signed, so a verifier that demanded v2 today would reject the running app's own update
+# record and take the self-update path down with it.
+
+def report_canon(acc, pid, ts):
+    return sig_canon('report', acc, pid, ts)
+
+def reshare_canon(acc, pid, ts):
+    return sig_canon('reshare', acc, pid, ts)
+
+def release_canon(m):
+    return sig_canon('release', m.get('publisher', ''), m.get('version', ''), m.get('cid', ''),
+                     m.get('sha256', ''), m.get('size', ''), m.get('changelog', ''))
+
+def attest_canon(a):
+    return sig_canon('attest', a.get('version', ''), a.get('commit', ''), a.get('sha256', ''),
+                     a.get('attestor', ''), a.get('type', ''))
+
+# Legacy preimages, kept only so step 1 can still accept signatures made before step 2.
+def report_canon_legacy(acc, pid, ts):
+    return 'report|%s|%s|%s' % (acc, pid, ts)
+
+def reshare_canon_legacy(acc, pid, ts):
+    return 'reshare|%s|%s|%s' % (acc, pid, ts)
+
+def release_canon_legacy(m):
+    return '%s|%s|%s|%s|%s|%s' % (m.get('publisher', ''), m.get('version', ''), m.get('cid', ''),
+                                  m.get('sha256', ''), m.get('size', ''), m.get('changelog', ''))
+
+def attest_canon_legacy(a):
+    return '%s|%s|%s|%s|%s' % (a.get('version', ''), a.get('commit', ''), a.get('sha256', ''),
+                               a.get('attestor', ''), a.get('type', ''))
+
+def verify_either(pub, sig, v2_msg, legacy_msg):
+    # Accept the v2 preimage, or the legacy one during the transition. v2 is tried FIRST so that once
+    # clients have moved the legacy path is dead weight rather than the common case.
+    return verify_msg(pub, v2_msg, sig) or verify_msg(pub, legacy_msg, sig)
+
+
 def keyof(seedbyte):
     return hashlib.blake2b(bytes([seedbyte] * 32) + bytes(4), digest_size=32).hexdigest()
 
@@ -340,7 +389,8 @@ def aggregate_reports(relays):
         for pid, recs in (d or {}).items():
             for acc, rec in (recs or {}).items():
                 pub, sig, ts = rec.get('pub', ''), rec.get('sig', ''), rec.get('ts', 0)
-                if pub_to_addr(pub) != acc or not verify_msg(pub, 'report|%s|%s|%s' % (acc, pid, ts), sig):
+                if pub_to_addr(pub) != acc or not verify_either(
+                        pub, sig, report_canon(acc, pid, ts), report_canon_legacy(acc, pid, ts)):
                     continue
                 e = per.setdefault(pid, {'accts': set(), 'cid': ''})
                 e['accts'].add(acc)                         # dedupe by account across relays

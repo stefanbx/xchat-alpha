@@ -429,9 +429,13 @@ def sync_release_blobs():
             if (rec or {}).get('cid') in keep:
                 ensure_release_blob(rec.get('cid'))
 
-def _release_canon(m):
-    return '%s|%s|%s|%s|%s|%s' % (m.get('publisher', ''), m.get('version', ''), m.get('cid', ''),
-                                  m.get('sha256', ''), m.get('size', ''), m.get('changelog', ''))
+# Release records are verified against BOTH preimages during the migration (issue #7). This one is
+# the load-bearing case: every release already published is legacy-signed, so a verifier that took
+# only v2 would reject the app's own update record and break self-delivery for existing installs.
+def _release_verify(m, pub, sig):
+    if xc is None:
+        return False
+    return xc.verify_either(pub, sig, xc.release_canon(m), xc.release_canon_legacy(m))
 
 def accept_release(m):
     # Ingest a signed release record — VERIFYING it, unlike other relay writes. Releases are app
@@ -448,7 +452,7 @@ def accept_release(m):
     if pub_acc != PUBLISHER_ACCT:                      # only the pinned publisher's channel is stored
         return False
     try:
-        if xc.pub_to_addr(pub) != PUBLISHER_ACCT or not xc.verify_msg(pub, _release_canon(m), sig):
+        if xc.pub_to_addr(pub) != PUBLISHER_ACCT or not _release_verify(m, pub, sig):
             return False
     except Exception:
         return False
@@ -1261,7 +1265,8 @@ class H(BaseHTTPRequestHandler):
                 m = json.loads(raw); pid = m['post_id']; acc = m['account']
                 pub, sig, ts = m.get('pub', ''), m.get('sig', ''), m.get('ts', 0)
                 if xc is None or xc.pub_to_addr(pub) != acc \
-                        or not xc.verify_msg(pub, 'report|%s|%s|%s' % (acc, pid, ts), sig):
+                        or not xc.verify_either(pub, sig, xc.report_canon(acc, pid, ts),
+                                       xc.report_canon_legacy(acc, pid, ts)):
                     self._send(400, json.dumps({'ok': False, 'error': 'bad report signature'})); return
                 # Bound distinct reported posts BEFORE inserting — the old `setdefault` then `pid in reports`
                 # check always saw the just-inserted key, so the cap never fired and a signed-report flood
@@ -1308,7 +1313,8 @@ class H(BaseHTTPRequestHandler):
                 m = json.loads(raw); pid = m['post_id']; acc = m.get('account')
                 ts, pub, sig = m.get('ts', 0), m.get('pub', ''), m.get('sig', '')
                 if not (acc and xc is not None and xc.pub_to_addr(pub) == acc
-                        and xc.verify_msg(pub, 'reshare|%s|%s|%s' % (acc, pid, ts), sig)):
+                        and xc.verify_either(pub, sig, xc.reshare_canon(acc, pid, ts),
+                                              xc.reshare_canon_legacy(acc, pid, ts))):
                     self._send(400, json.dumps({'ok': False, 'error': 'bad reshare signature'})); return
                 e = engage_for(pid); delta = int(m.get('delta', 1))
                 e['reposts'] = max(0, e.get('reposts', 0) + delta)

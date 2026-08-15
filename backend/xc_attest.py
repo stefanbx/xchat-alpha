@@ -16,7 +16,10 @@ MIN_DISTINCT = 2               # a release needs at least this many DIFFERENT de
 WEIGHT_MIN = 5 * XNO           # and this much total capped weight
 
 def canon(a):
-    return f"{a['version']}|{a['commit']}|{a['sha256']}|{a['attestor']}|{a['type']}"
+    return xc.attest_canon(a)          # v2 preimage (issue #7)
+
+def canon_legacy(a):
+    return xc.attest_canon_legacy(a)
 
 def make_attestation(reviewer_key, version, commit, sha256, atype='build'):
     addr, pub = xc.derive(reviewer_key)
@@ -37,7 +40,7 @@ def verify_release(version, commit, sha256, attestations,
     for a in attestations:
         why = None
         if not (xc.pub_to_addr(a.get('pub', '')) == a.get('attestor') and
-                xc.verify_msg(a['pub'], canon(a), a['sig'])):
+                xc.verify_either(a['pub'], a['sig'], canon(a), canon_legacy(a))):
             why = 'bad signature / key-account mismatch'
         elif (a['version'], a['commit'], a['sha256']) != (version, commit, sha256):
             why = 'attests a different release'

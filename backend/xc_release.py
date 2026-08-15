@@ -53,7 +53,13 @@ def vt(s):                                            # "1.2.0" -> (1,2,0) for o
         return (0,)
 
 def canon(rec):
-    return f"{rec['publisher']}|{rec['version']}|{rec['cid']}|{rec['sha256']}|{rec['size']}|{rec['changelog']}"
+    # SIGNS v2 (issue #7). Verifiers accept the legacy preimage too during the transition, so a record
+    # published from here is readable by relays that have not been redeployed yet, while every already
+    # published record stays verifiable.
+    return xc.release_canon(rec)
+
+def canon_legacy(rec):
+    return xc.release_canon_legacy(rec)
 
 def verify(pub, msg, sig):
     try:
@@ -175,7 +181,8 @@ else:                                                  # check: newest VALID sig
                 # trust check: key must bind to the pinned publisher AND the signature must hold.
                 # forged records simply fail here; the highest VALID version wins.
                 if rec.get('publisher') == PUBLISHER and xc.pub_to_addr(rec['pub']) == PUBLISHER \
-                   and verify(rec['pub'], canon(rec), rec['sig']):
+                   and (verify(rec['pub'], canon(rec), rec['sig'])
+                        or verify(rec['pub'], canon_legacy(rec), rec['sig'])):
                     if best is None or vt(rec['version']) > vt(best['version']):
                         best = rec
             if best is not None:                          # a responsive relay gave us a valid record — done
