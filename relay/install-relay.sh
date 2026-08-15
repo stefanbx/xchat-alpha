@@ -533,6 +533,11 @@ cat >> "$XC_HOME/run.sh" <<'EOF'
 # request, so each one re-tries the head of this list. A dead endpoint in front cost ~10.5s on the first
 # RPC of EVERY helper (measured) — it reads as random slowness, not as one bad endpoint.
 export XC_NANO_RPC="${XC_NANO_RPC:-https://nanoslo.0x.no/proxy,https://rainstorm.city/api,https://rpc.nano.to}"
+# launchd (and systemd --user) start this with a MINIMAL PATH — /usr/bin:/bin:/usr/sbin:/sbin — so
+# nothing installed by Homebrew is visible to the node or any helper it spawns. xc_common shells out to
+# `ipfs` by name, so under the service manager that lookup simply failed and every post died with a
+# FileNotFoundError, while the same command worked by hand in a terminal. Prepend the usual locations.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 # The node pins each thread to IPFS to get its CID. xc_common defaults IPFS_PATH to /tmp/ipfsB, which
 # macOS wipes on reboot — so the repo silently stops existing and every post falls back to the second
 # repo (or fails outright on a machine that has only the one). Point it at a persistent path instead.

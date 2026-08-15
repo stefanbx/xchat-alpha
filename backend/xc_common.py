@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Shared helpers for the ӾChat per-user-thread backend (dev Nano network + IPFS).
-import json, subprocess, urllib.request, urllib.parse, urllib.error, base64, hashlib, os, time, ipaddress, socket
+import json, subprocess, urllib.request, urllib.parse, urllib.error, base64, hashlib, os, time, ipaddress, shutil, socket
 import http.client
 from concurrent.futures import ThreadPoolExecutor
 # Nano RPC endpoint(s). XC_NANO_RPC may be ONE url or a comma-separated list; defaults to the local
@@ -168,6 +168,11 @@ def ipfs_add(path):
         if cid is None:
             cid = out
     if cid is None:
+        # Distinguish "the tool isn't there" from "the repo is bad". They need opposite fixes, and the
+        # first reads as the second when a service manager's minimal PATH hides a Homebrew install —
+        # which is exactly how "no usable IPFS repo" got reported for a perfectly good repo.
+        if not shutil.which('ipfs'):
+            raise RuntimeError('the `ipfs` binary is not on PATH (PATH=%s)' % os.environ.get('PATH', ''))
         raise RuntimeError('no usable IPFS repo (tried %s); last error: %s' % (', '.join(repos), last))
     return cid
 
