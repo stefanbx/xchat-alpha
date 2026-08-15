@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Shared helpers for the ӾChat per-user-thread backend (dev Nano network + IPFS).
-import json, subprocess, urllib.request, urllib.parse, base64, hashlib, os, time, ipaddress, socket
+import json, subprocess, urllib.request, urllib.parse, urllib.error, base64, hashlib, os, time, ipaddress, socket
+import http.client
 from concurrent.futures import ThreadPoolExecutor
 # Nano RPC endpoint(s). XC_NANO_RPC may be ONE url or a comma-separated list; defaults to the local
 # dev node. When a PUBLIC mainnet RPC is configured, known-good public fallbacks are appended —
@@ -544,6 +545,164 @@ def _ip_is_internal(ip):
     return (ip.is_private or ip.is_loopback or ip.is_link_local
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
+def resolve_safe(u):
+    # Resolve a URL to a SINGLE validated IP and hand it back with the host, so the caller can connect
+    # to that exact address (see safe_urlopen). Returns None if anything about it is unsafe.
+    try:
+        p = urllib.parse.urlparse(u)
+        host = p.hostname or ''
+        if p.scheme not in ('http', 'https') or not host:
+            return None
+        if host == 'localhost' or host.endswith('.local') or host.endswith('.internal'):
+            return None
+        port = p.port or (443 if p.scheme == 'https' else 80)
+        try:
+            ip = ipaddress.ip_address(host)
+            return None if _ip_is_internal(ip) else (host, str(ip), port, p.scheme)
+        except ValueError:
+            pass
+        addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        if not addrs:
+            return None
+        chosen = None
+        for _f, _t, _p, _c, sockaddr in addrs:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if _ip_is_internal(ip):
+                return None                 # ANY internal answer disqualifies the name entirely
+            if chosen is None:
+                chosen = str(ip)
+        return (host, chosen, port, p.scheme) if chosen else None
+    except Exception:
+        return None
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    # Connects to a PRE-VALIDATED ip while still presenting the original hostname.
+    def __init__(self, host, ip, **kw):
+        super().__init__(host, **kw)
+        self._pinned_ip = ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        if getattr(self, '_tunnel_host', None):
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, ip, **kw):
+        super().__init__(host, **kw)
+        self._pinned_ip = ip
+
+    def connect(self):
+        sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        if getattr(self, '_tunnel_host', None):
+            self.sock = sock
+            self._tunnel()
+            sock = self.sock
+        # server_hostname keeps SNI and certificate validation bound to the NAME, not the pinned ip —
+        # so pinning the address does not weaken TLS.
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+# ---- pinned connections, installed globally (issue #8) -----------------------------------------
+# is_safe_relay_url resolves a name and validates every address, but that is CHECK time: the fetch a
+# moment later resolves again, and a hostile resolver can answer public for the check and internal for
+# the fetch. Rather than rewrite ~55 call sites (each an opportunity to miss one or get a timeout
+# wrong), the validated address is remembered here and the connection layer uses it. Every existing
+# urlopen keeps working unchanged and simply lands on the address that was actually vetted.
+_PIN_TTL = float(os.environ.get('XC_PIN_TTL', '300'))
+_pins = {}                                   # host -> (ip, expiry)
+
+
+def _pin_remember(host, ip):
+    _pins[host] = (ip, time.time() + _PIN_TTL)
+
+
+def _pin_for(host):
+    got = _pins.get(host)
+    if not got:
+        return None
+    ip, exp = got
+    if time.time() > exp:
+        _pins.pop(host, None)
+        return None
+    return ip
+
+
+def _pin_drop(host):
+    # A pin that will not connect must not wedge a host permanently — an anycast address can go away,
+    # and a relay can legitimately move. Forget it and let the next attempt re-resolve and re-validate.
+    _pins.pop(host, None)
+
+
+def _pinned_connection(base):
+    class _Pinned(base):
+        def connect(self):
+            ip = _pin_for(self.host)
+            if not ip:
+                return super().connect()          # never validated: behave exactly as before
+            try:
+                sock = socket.create_connection((ip, self.port), self.timeout)
+            except OSError:
+                _pin_drop(self.host)
+                return super().connect()
+            if getattr(self, '_tunnel_host', None):
+                self.sock = sock
+                self._tunnel()
+                sock = self.sock
+            ctx = getattr(self, '_context', None)
+            # SNI and certificate validation stay bound to the NAME, so pinning cannot weaken TLS.
+            self.sock = ctx.wrap_socket(sock, server_hostname=self.host) if ctx else sock
+    return _Pinned
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_pinned_connection(http.client.HTTPConnection), req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_pinned_connection(http.client.HTTPSConnection), req,
+                            context=self._context)
+
+
+urllib.request.install_opener(urllib.request.build_opener(_PinnedHTTPHandler, _PinnedHTTPSHandler))
+
+
+def safe_urlopen(url, data=None, timeout=20, headers=None):
+    # CLOSES THE REBINDING TOCTOU (issue #8). is_safe_relay_url resolves and validates, but that is
+    # check-time only: a hostile resolver can answer with a public address for the check and an internal
+    # one for the fetch a moment later, and the fetch is what actually reaches the target. Here the
+    # address validated is the address connected to — resolution happens ONCE and the result is pinned
+    # for the connection, so there is no window to flip.
+    #
+    # Use for any URL learned from an untrusted source (on-chain announcements, peer gossip). Raises on
+    # an unsafe or unresolvable target, like a refused connection.
+    got = resolve_safe(url)
+    if not got:
+        raise ValueError('unsafe or unresolvable url: %s' % url)
+    host, ip, port, scheme = got
+    p = urllib.parse.urlparse(url)
+    path = p.path or '/'
+    if p.query:
+        path += '?' + p.query
+    hdr = {'Host': host, 'User-Agent': 'xchat-node/0.1', **(headers or {})}
+    if data is not None and 'Content-Type' not in hdr:
+        hdr['Content-Type'] = 'application/json'
+    cls = _PinnedHTTPSConnection if scheme == 'https' else _PinnedHTTPConnection
+    conn = cls(host, ip, port=port, timeout=timeout)
+    try:
+        conn.request('POST' if data is not None else 'GET', path, body=data, headers=hdr)
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status >= 400:
+            raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, None)
+        return body
+    finally:
+        conn.close()
+
+
 def is_safe_relay_url(u):
     # SSRF guard for relay URLs learned from UNTRUSTED sources (on-chain announcements + peer gossip).
     # Those become GET/POST targets for the node's helpers, so a hostile announcer could point discovery
@@ -574,10 +733,8 @@ def is_safe_relay_url(u):
         for _fam, _type, _proto, _canon, sockaddr in addrs:
             if _ip_is_internal(ipaddress.ip_address(sockaddr[0])):
                 return False
+        _pin_remember(host, addrs[0][4][0])   # the fetch will use THIS address, not a fresh lookup
         return True
-        # NOTE: this is check-time validation; a hostile resolver can still flip the record to an internal
-        # IP between this check and the actual fetch (TOCTOU rebinding). Fully closing that needs pinning
-        # the validated IP for the connection — a larger change tracked separately (issue #3 residual).
     except Exception:
         return False
 

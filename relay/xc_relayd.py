@@ -581,15 +581,27 @@ def blob_credit(cid, payhash):
         return 0.0
     if not dst or dst == src:                       # a self-send buys nothing
         return 0.0
+    # WEIGHTED BY THE SENDER'S ON-CHAIN REPUTATION (issue #11). Verification alone bounds the attack
+    # but does not price it: Nano is feeless, so two accounts you own can send to each other for free.
+    # account_rep is 0 for a fresh throwaway and rises with balance, chain height and recent activity —
+    # the same Sybil-resistant signal head_score and the report weighting already use. So self-dealing
+    # from disposable accounts credits ~nothing, while a tip from an established account counts fully.
+    try:
+        weight = float(xc.account_rep(src))
+    except Exception:
+        weight = 0.0
+    credited = amt * max(0.0, min(1.0, weight))
     tips_paid[payhash] = cid
+    if credited <= 0:
+        return 0.0                       # consumed (so it can't be retried) but worth nothing
     with _blob_lock:
         m = blob_meta.get(cid)
         if m is not None:
-            m['tips'] = float(m.get('tips', 0)) + amt
+            m['tips'] = float(m.get('tips', 0)) + credited
             _db.execute('UPDATE blob SET tips=? WHERE cid=?', (m['tips'], cid))
             _db.commit()
     mark_dirty()
-    return float(amt)
+    return float(credited)
 
 # --- persistence: the WHOLE relay state survives a restart, not just heads ---
 # (in-memory before this meant comments, uploaded media, likes, poll votes vanished on restart)

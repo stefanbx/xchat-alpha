@@ -65,7 +65,9 @@ try:
 except TypeError:
     check('blob_put refuses a caller-declared value', True)
 
-# 2) a confirmed on-chain send credits it, once
+# 2) a confirmed on-chain send credits it, once. Reputation is stubbed to 1.0 here so this case
+#    measures the payment path; the weighting itself is exercised below.
+r.xc.account_rep = lambda _a: 1.0
 r.xc.rpc = lambda *_a, **_k: ledger()
 first = r.blob_credit(CID, 'PAYHASH-1')
 check('a confirmed send credits the blob', near(first, AMT) and near(value_of(CID), AMT))
@@ -86,9 +88,24 @@ for i, (name, block) in enumerate(cases):
     r.blob_credit(CID, f'PAYHASH-BAD-{i}')
     check(name, value_of(CID) == before)
 
-# 4) and the value survives the bytes being re-stored (a peer re-pushing must not reset or raise it)
+# 4) reputation weighting (issue #11): a throwaway's self-dealt tip must be worth ~nothing
+base = value_of(CID)
+r.xc.account_rep = lambda _a: 0.0                      # fresh throwaway
+r.xc.rpc = lambda *_a, **_k: ledger()
+r.blob_credit(CID, 'PAYHASH-THROWAWAY')
+check('a throwaway account credits nothing', value_of(CID) == base)
+check('but its payment is still consumed', 'PAYHASH-THROWAWAY' in r.tips_paid)
+
+r.xc.account_rep = lambda _a: 0.5                      # established-ish account
+r.blob_credit(CID, 'PAYHASH-HALFREP')
+check('an established account credits in proportion to reputation',
+      near(value_of(CID) - base, AMT * 0.5))
+r.xc.account_rep = lambda _a: 1.0
+
+# 5) and the value survives the bytes being re-stored (a peer re-pushing must not reset or raise it)
+expected = value_of(CID)
 r.blob_put(CID, B64)
-check('re-storing the bytes preserves earned value', near(value_of(CID), AMT))
+check('re-storing the bytes preserves earned value', near(value_of(CID), expected))
 
 print(f'\n{sum(results)}/{len(results)} passed')
 sys.exit(0 if all(results) else 1)
