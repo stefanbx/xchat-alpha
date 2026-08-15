@@ -14,12 +14,16 @@ RPCS = [u.strip().rstrip('/') for u in _RPC_ENV.split(',') if u.strip()] or ['ht
 R = RPCS[0]                                                  # back-compat: some logs read R
 _PUBLIC_FALLBACKS = ['https://rpc.nano.to', 'https://nanoslo.0x.no/proxy',
                      'https://rainstorm.city/api', 'https://node.somenano.com/proxy']
-# PoW gets its OWN endpoint list. Public infra splits the two jobs: the node proxies serve ledger
-# reads + block broadcast but REFUSE work_generate, while rpc.nano.to does work_generate but not the
-# reads. Routing work through the shared rpc() fallthrough is slow and flaky (it eats a timeout on
-# every read-only proxy before reaching a work provider), so PoW is requested directly here.
-WORK_RPCS = [u.strip().rstrip('/') for u in
-             os.environ.get('XC_WORK_RPC', 'https://rpc.nano.to').split(',') if u.strip()]
+# PoW endpoints. Subtlety learned the hard way: rpc.nano.to's free work_generate returns work BELOW the
+# mainnet threshold (work_validate: valid_all=0, valid_receive=0) and IGNORES a requested difficulty — so
+# every block built with it is silently dropped by the network. The node proxies (nanoslo/rainstorm/
+# somenano), by contrast, DO produce valid mainnet work when you pass the explicit difficulty below. So
+# work goes to the proxies with MAINNET_WORK_DIFF, and work_generate() validates before returning.
+WORK_RPCS = [u.strip().rstrip('/') for u in os.environ.get(
+    'XC_WORK_RPC',
+    'https://nanoslo.0x.no/proxy,https://rainstorm.city/api,https://node.somenano.com/proxy').split(',')
+    if u.strip()]
+MAINNET_WORK_DIFF = 'fffffff800000000'   # epoch-2 SEND threshold; valid for send AND receive/open blocks
 GEN = '34F0A37AAD20F4A260F0A5B3CB3D7FB50673212263E58A380BC10474BB039CE4'
 GPUB = 'b0311ea55708d6a53c75cdbf88300259c6d018522fe3d4d0a242e431f9e8b6d0'
 NANO_ALPH = "13456789abcdefghijkmnopqrstuwxyz"
@@ -90,21 +94,32 @@ def rpc(o):
         return r
     raise last if last is not None else RuntimeError('no Nano RPC endpoint reachable')
 
+def _work_valid(root, work):
+    # Confirm the PoW clears the mainnet threshold before we build a block on it — a work provider that
+    # silently returns sub-threshold work would otherwise get every block dropped by the network.
+    try:
+        v = rpc({'action': 'work_validate', 'hash': root, 'work': work})
+        return str(v.get('valid_all')) in ('1', 'True') or v.get('valid_all') is True
+    except Exception:
+        return True                                        # can't validate → let `process` be the judge
+
+
 def work_generate(root):
-    # Delegated PoW over `root` (the frontier hash, or the account pubkey for an open). Tries the
-    # dedicated WORK_RPCS first (mainnet-difficulty), then falls back to the ledger RPCs in case the
-    # operator runs their own full node that can also do work. Raises if nothing produced work.
+    # Delegated PoW over `root` (the frontier hash, or the account pubkey for an open). Requests the
+    # explicit mainnet difficulty and VALIDATES the result — only returns work the network will accept.
+    # Falls back to the ledger RPCs (a self-hosted full node) if the work endpoints don't deliver.
     last = None
     for ep in list(WORK_RPCS) + [None]:
         try:
-            r = _post_json(ep, {'action': 'work_generate', 'hash': root}, timeout=30) if ep \
-                else rpc({'action': 'work_generate', 'hash': root})
-            if isinstance(r, dict) and r.get('work'):
-                return r['work']
-            last = r
+            o = {'action': 'work_generate', 'hash': root, 'difficulty': MAINNET_WORK_DIFF}
+            r = _post_json(ep, o, timeout=45) if ep else rpc(o)
+            work = r.get('work') if isinstance(r, dict) else None
+            if work and _work_valid(root, work):
+                return work
+            last = ('sub-threshold work from ' + str(ep)) if work else r
         except Exception as e:
             last = e
-    raise RuntimeError(f'no work endpoint produced PoW for {root[:12]}… (last: {str(last)[:120]})')
+    raise RuntimeError(f'no endpoint produced VALID mainnet PoW for {root[:12]}… (last: {str(last)[:140]})')
 
 
 _rpc_cache = {}
@@ -543,9 +558,11 @@ def _self_send(key, link_hex):  # append a send on the account's own chain with 
     addr, pub = derive(key)
     ai = rpc({'action': 'account_info', 'account': addr}); prev = ai['frontier']; nb = str(int(ai['balance']) - 1)
     d = sign(key, prev, pub, nb, link_hex); wk = work_generate(prev)
-    rpc({'action': 'process', 'json_block': 'true', 'subtype': 'send',
-         'block': {'type': 'state', 'account': d['account'], 'previous': prev, 'representative': d['rep'],
-                   'balance': nb, 'link': link_hex, 'signature': d['sig'], 'work': wk}})
+    r = rpc({'action': 'process', 'json_block': 'true', 'subtype': 'send',
+             'block': {'type': 'state', 'account': d['account'], 'previous': prev, 'representative': d['rep'],
+                       'balance': nb, 'link': link_hex, 'signature': d['sig'], 'work': wk}})
+    if not (isinstance(r, dict) and r.get('hash')):        # broadcast must land — never fail silently
+        raise RuntimeError(f'send not accepted: {(r or {}).get("error", r)}')
 
 
 def _receive_all(key):  # MAINNET: bank every confirmed pending send so a freshly-funded account can spend.
@@ -574,8 +591,8 @@ def _receive_all(key):  # MAINNET: bank every confirmed pending send so a freshl
         r = rpc({'action': 'process', 'json_block': 'true', 'subtype': 'receive' if opened else 'open',
                  'block': {'type': 'state', 'account': addr, 'previous': prev, 'representative': d['rep'],
                            'balance': str(nb), 'link': h, 'signature': d['sig'], 'work': wk}})
-        if 'hash' not in r:                                 # a ledger error (fork/gap) — stop, don't loop
-            break
+        if not (isinstance(r, dict) and r.get('hash')):    # open/receive must land — surface the real error
+            raise RuntimeError(f'open/receive not accepted: {(r or {}).get("error", r)}')
         prev = d['hash']; bal = nb; opened = True
     return bal
 
