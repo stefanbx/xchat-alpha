@@ -1,0 +1,72 @@
+name: tests
+
+# Runs test/run_tests.py — the whole suite, including the cross-language signing tests.
+#
+# Those are the ones worth paying CI minutes for. The app signs in Dart and the node verifies in
+# Python, and when those two drifted apart the symptom was NOT a crash: signatures stayed perfectly
+# valid, they just verified against nothing. e2e_test.py sat red for that reason while its own refusal
+# checks passed, because "a tampered post is refused" is trivially true when nothing is accepted.
+# A suite that skipped the Dart half would have gone green through all of it.
+#
+# So the toolchain is installed for real rather than stubbed, and pinned so a runner-image change
+# can't silently alter what is being tested. Flutter and IPFS are fetched from their own upstreams
+# instead of via third-party marketplace actions, matching reproduce.yml's habit of using only
+# official actions/* plus pinned toolchains.
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: '3.44.9'   # keep in step with the SDK releases are built with
+  KUBO_VERSION: 'v0.43.0'
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r backend/requirements.txt
+
+      - name: Install Flutter (pinned)
+        # app/pubspec.yaml depends on the flutter SDK, so `dart pub get` needs Flutter even though
+        # the signer entrypoint itself is pure Dart. Shallow clone of the official repo at a tag.
+        run: |
+          git clone --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve Dart packages
+        working-directory: app
+        run: flutter pub get
+
+      - name: Install IPFS (kubo, pinned)
+        # xc_post.py pins each thread to IPFS to get its CID. `ipfs add` works offline against an
+        # initialised repo, so no daemon is needed — but the repo must exist, or every post path fails.
+        run: |
+          curl -fsSL "https://dist.ipfs.tech/kubo/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz" -o kubo.tar.gz
+          tar -xzf kubo.tar.gz
+          sudo install kubo/ipfs /usr/local/bin/ipfs
+          ipfs --version
+          ipfs init --profile=test
+
+      - name: Run the suite
+        # IPFS_PATH is where xc_common.ipfs_add looks FIRST. Point it at the repo just initialised
+        # rather than leaning on the ~/.ipfs fallback, so a real breakage in the primary path still
+        # fails here instead of being quietly papered over. Exported in the shell, not via `env:` —
+        # $HOME is not available in the workflow `env` context.
+        run: |
+          export IPFS_PATH="$HOME/.ipfs"
+          python3 test/run_tests.py
