@@ -474,6 +474,8 @@ if c.get('bootstrap'):
     print('BOOTSTRAP=%s' % shlex.quote(' '.join(str(c['bootstrap']).split())))
 if c.get('blob_replicas'):
     print('export XC_BLOB_REPLICAS=%s' % shlex.quote(str(c['blob_replicas'])))
+# open federation is ON unless the operator explicitly set it to false
+print('export XC_OPEN_ANNOUNCE=%s' % ('0' if c.get('open_announce') is False else '1'))
 print('KEEP_AWAKE=%s' % ('0' if c.get('keep_awake') is False else '1'))
 PYCFG
 )"

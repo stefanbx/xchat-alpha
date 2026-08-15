@@ -777,7 +777,17 @@ def relay_self_announce(url):  # a relay announces ITSELF: commit its URL on its
             _self_send(key, nano_to_pub(rv))
         except Exception:
             pass
-    fd, p = tempfile.mkstemp(suffix='.json')            # commit the URL LAST so the frontier link holds the CID
+    # Commit the URL LAST so the frontier link resolves it in one read. PREFER the ASCII-LINK form — the
+    # host packed straight into the 32-byte link, readable by ANY client with a plain block_info RPC and
+    # NO IPFS. That is what lets the phone app bootstrap from the ledger alone (a public IPFS gateway
+    # would just reintroduce a chokepoint). Fall back to an IPFS CID only for a URL too long to pack.
+    try:
+        link = url_to_link(url)                        # raises ValueError if the normalized host > 32 bytes
+        _self_send(key, link)
+        return derive(key)[0], url
+    except ValueError:
+        pass
+    fd, p = tempfile.mkstemp(suffix='.json')            # legacy: commit the URL as an IPFS CID
     os.write(fd, json.dumps({'url': url, 'v': 1}, separators=(',', ':'), sort_keys=True).encode()); os.close(fd)
     try:
         cid = ipfs_add(p)
