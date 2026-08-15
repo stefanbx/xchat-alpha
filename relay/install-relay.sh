@@ -193,7 +193,14 @@ case "$ACTION" in
             say "Creating the KV namespace..."
             KV_OUT=$(cd "$CFDIR" && npx --yes wrangler kv namespace create BACKEND_KV 2>&1) || {
                 printf '%s\n' "$KV_OUT" >&2; die "could not create the KV namespace (output above)"; }
-            KV_ID=$(printf '%s' "$KV_OUT" | grep -oE '[0-9a-f]{32}' | head -1)
+            # Prefer an explicitly LABELLED id — wrangler renders it as `id = "..."` (toml snippet) or
+            # `"id": "..."` (json), and both forms are covered. Falling straight to "first 32-hex run"
+            # would be wrong the moment wrangler prints the ACCOUNT id first: those are 32 hex too, and
+            # we'd silently bind the worker to a namespace that doesn't exist.
+            KV_ID=$(printf '%s' "$KV_OUT" \
+                | grep -oE '"?id"?[[:space:]]*[:=][[:space:]]*"?[0-9a-f]{32}' \
+                | grep -oE '[0-9a-f]{32}' | head -1)
+            [ -n "$KV_ID" ] || KV_ID=$(printf '%s' "$KV_OUT" | grep -oE '[0-9a-f]{32}' | head -1)
             [ -n "$KV_ID" ] || { printf '%s\n' "$KV_OUT" >&2
                 die "created the namespace but could not read its id from wrangler's output (above).
 Put the id into $CFDIR/wrangler.toml by hand and re-run --setup-worker."; }
