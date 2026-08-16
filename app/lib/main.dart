@@ -478,9 +478,33 @@ class DmStore {
   static String? get(String ct) => _mem[ct]?['t'] as String?;
   static int get count => _mem.length;
 
-  static void put(String ct, String text, int ts) {
+  /// Newest message we hold. The incremental fetch asks the node for everything at or after this,
+  /// minus an overlap — see Api.dmInbox for why the overlap is not optional.
+  static int get newestTs {
+    var t = 0;
+    for (final v in _mem.values) {
+      final s = (v['s'] ?? 0) as int;
+      if (s > t) t = s;
+    }
+    return t;
+  }
+
+  /// Every message we hold, as the conversation-shaped records dmInbox returns. The store is the
+  /// source of truth for history now: an incremental response carries only what is NEW, so threads
+  /// have to be rebuilt from here or they would shrink to the last few messages on every poll.
+  static List<Map<String, dynamic>> all() => [
+        for (final v in _mem.values)
+          if (v['p'] != null)
+            {
+              'from': v['f'], 'outgoing': v['o'] == true, 'text': v['t'],
+              'ts': v['s'], 'peer': v['p'], 'peer_pk': v['k'],
+            }
+      ];
+
+  static void put(String ct, String text, int ts,
+      {required String from, required bool outgoing, required String peer, required String peerPk}) {
     if (_mem.containsKey(ct)) return;
-    _mem[ct] = {'t': text, 's': ts};
+    _mem[ct] = {'t': text, 's': ts, 'f': from, 'o': outgoing, 'p': peer, 'k': peerPk};
     _dirty = true;
   }
 
@@ -1854,12 +1878,26 @@ class Api {
   }
 
   // encrypted DMs: fetch RAW ciphertext records, DECRYPT ON-DEVICE, group into conversations
+  static int _dmPoll = 0;   // drives the periodic full sweep in dmInbox
   static Future<List<Map<String, dynamic>>> dmInbox() async {
     final w = gWallet;
     if (w == null) return [];
     try {
       await DmStore.load(w);          // decrypt-once cache; no-op after the first call
-      final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'));
+      // INCREMENTAL FETCH. The store holds everything already read, so a poll only needs ciphertext
+      // that is NEW. Two safeguards, because `since` on its own is not correct:
+      //
+      //   OVERLAP — relays gossip, so a message can reach the node AFTER one with a later timestamp.
+      //   Asking from exactly our newest ts would skip it permanently. We ask from newest minus 10min.
+      //
+      //   FULL SWEEP every 10th poll (~1 min in an open thread) — the backstop for anything later
+      //   than the overlap, and for a message evicted and re-gossiped. The feed poll does the same
+      //   thing for the same reason: a missing message is worse than a wasted request.
+      final newest = DmStore.newestTs;
+      final full = (_dmPoll++ % 10 == 0) || newest == 0;
+      final since = full ? 0 : (newest - 600).clamp(0, newest);
+      final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'
+          '${since > 0 ? '&since=$since' : ''}'));
       final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
       final convos = <String, List<Map<String, dynamic>>>{};
       // The peer's DM key, kept per conversation: attachments are sealed to this same box, so the
@@ -1874,14 +1912,20 @@ class Api {
         // already established the message is addressed to us — a ciphertext that is not ours never
         // reaches put(), so it can never be served from get().
         final ct = '${m['ct']}';
-        var plain = DmStore.get(ct);
-        if (plain == null) {
-          plain = w.dmOpen(peerPk, ct);                   // decrypts locally; null if not ours
-          if (plain == null) continue;
-          DmStore.put(ct, plain, (m['ts'] ?? 0) as int);
-        }
-        peerKeys[peerAcc] = peerPk;                        // only from messages that actually opened
-        (convos[peerAcc] ??= []).add({'from': m['from'], 'outgoing': outgoing, 'text': plain, 'ts': m['ts']});
+        if (DmStore.get(ct) != null) continue;            // already held — nothing to decrypt
+        final plain = w.dmOpen(peerPk, ct);               // decrypts locally; null if not ours
+        if (plain == null) continue;
+        DmStore.put(ct, plain, (m['ts'] ?? 0) as int,
+            from: '${m['from']}', outgoing: outgoing, peer: peerAcc, peerPk: peerPk);
+      }
+      await DmStore.flush(w);           // persist what was new, sealed to our own key
+
+      // Threads are rebuilt from the STORE, not from the response. An incremental response carries
+      // only NEW messages, so building from it would shrink every conversation to the last few.
+      for (final m in DmStore.all()) {
+        final peerAcc = '${m['peer']}';
+        peerKeys[peerAcc] = '${m['peer_pk']}';
+        (convos[peerAcc] ??= []).add(m);
       }
       for (final lst in convos.values) {
         lst.sort((a, b) => (a['ts'] as int).compareTo(b['ts'] as int));
@@ -1891,7 +1935,6 @@ class Api {
                        'peer_pk': peerKeys[e.key] ?? ''})
           .toList();
       out.sort((a, b) => (b['last_ts'] as int).compareTo(a['last_ts'] as int));
-      await DmStore.flush(w);         // persist anything newly decrypted, sealed to our own key
       return out.cast<Map<String, dynamic>>();
     } catch (_) {
       return [];

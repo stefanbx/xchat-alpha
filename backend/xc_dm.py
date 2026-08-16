@@ -78,6 +78,18 @@ elif mode == 'send':
 
 else:                                                      # inbox: return RAW ciphertext records (app decrypts)
     acc = rd('/tmp/xc_dm_acct.txt')
+    # INCREMENTAL: with ?since=<unix>, return only ciphertext at or after it. The app keeps every
+    # message it has already decrypted, so re-sending the whole history on every 5s poll is pure
+    # transfer for nothing — and it grows forever.
+    #
+    # The app deliberately asks with an OVERLAP rather than its exact newest timestamp, and does a
+    # full sweep periodically, because `since` is not safe on its own: relays gossip, so a message can
+    # arrive here AFTER one with a later ts, and a strict cutoff would skip it permanently. Filtering
+    # is cheap and correctness lives on the client, which is the only side that knows what it holds.
+    try:
+        since = int(rd('/tmp/xc_dm_since.txt', '0') or 0)
+    except ValueError:
+        since = 0
     seen = set(); dms = []
     for r in RELAYS:
         try:
@@ -86,7 +98,10 @@ else:                                                      # inbox: return RAW c
                 if k in seen:
                     continue
                 seen.add(k)
+                if since and int(m.get('ts') or 0) < since:
+                    continue
                 dms.append(m)
         except Exception:
             pass
-    json.dump({'ok': True, 'account': acc, 'dms': dms}, open('/tmp/xc_dm_result.json', 'w'))
+    json.dump({'ok': True, 'account': acc, 'since': since, 'dms': dms},
+              open('/tmp/xc_dm_result.json', 'w'))

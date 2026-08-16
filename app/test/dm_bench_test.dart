@@ -19,7 +19,10 @@ void main() {
     final cold = Stopwatch()..start();
     for (var i = 0; i < n; i++) {
       final ct = sealed[i];
-      if (DmStore.get(ct) == null) DmStore.put(ct, b.dmOpen(a.dmPub, ct)!, i);
+      if (DmStore.get(ct) == null) {
+        DmStore.put(ct, b.dmOpen(a.dmPub, ct)!, i,
+            from: a.account, outgoing: false, peer: a.account, peerPk: a.dmPub);
+      }
     }
     cold.stop();
     await DmStore.flush(b);

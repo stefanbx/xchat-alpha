@@ -601,7 +601,9 @@ def route(path, query, body):
             put('/tmp/xc_dm_msg.json', json.dumps(body)); spawn('xc_dm.py','send');    return read('/tmp/xc_dm_result.json','{}')
     if path.startswith('/api/dm_inbox'):
         with ipc_lock('dm'):
-            put('/tmp/xc_dm_acct.txt', q('account')); spawn('xc_dm.py','inbox');       return read('/tmp/xc_dm_result.json','{}')
+            put('/tmp/xc_dm_acct.txt', q('account'))
+            put('/tmp/xc_dm_since.txt', q('since') or '0')   # incremental: only ciphertext at/after
+            spawn('xc_dm.py','inbox');       return read('/tmp/xc_dm_result.json','{}')
 
     if path.startswith('/api/blob_put'):
         with ipc_lock('blob'):

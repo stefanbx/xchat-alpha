@@ -45,7 +45,8 @@ void main() {
   test('what reaches disk is ciphertext — the message is not in preferences', () async {
     SharedPreferences.setMockInitialValues({});
     await DmStore.load(alice);
-    DmStore.put('ct-1', _secret, 1000);
+    DmStore.put('ct-1', _secret, 1000,
+        from: alice.account, outgoing: false, peer: mallory.account, peerPk: mallory.dmPub);
     await DmStore.flush(alice);
 
     final dump = await prefsDump();
@@ -61,7 +62,8 @@ void main() {
   test('the owning wallet can read it back', () async {
     SharedPreferences.setMockInitialValues({});
     await DmStore.load(alice);
-    DmStore.put('ct-1', _secret, 1000);
+    DmStore.put('ct-1', _secret, 1000,
+        from: alice.account, outgoing: false, peer: mallory.account, peerPk: mallory.dmPub);
     await DmStore.flush(alice);
 
     // Simulate a fresh app start: same wallet, memory cleared by loading someone else first.
@@ -73,7 +75,8 @@ void main() {
   test('a DIFFERENT seed cannot read the blob, and does not crash on it', () async {
     SharedPreferences.setMockInitialValues({});
     await DmStore.load(alice);
-    DmStore.put('ct-1', _secret, 1000);
+    DmStore.put('ct-1', _secret, 1000,
+        from: alice.account, outgoing: false, peer: mallory.account, peerPk: mallory.dmPub);
     await DmStore.flush(alice);
     final onDisk = await prefsDump();
 
@@ -100,7 +103,8 @@ void main() {
   test('clear() removes the messages from disk, not just from memory', () async {
     SharedPreferences.setMockInitialValues({});
     await DmStore.load(alice);
-    DmStore.put('ct-1', _secret, 1000);
+    DmStore.put('ct-1', _secret, 1000,
+        from: alice.account, outgoing: false, peer: mallory.account, peerPk: mallory.dmPub);
     await DmStore.flush(alice);
     expect((await prefsDump()).keys.any((k) => k.contains(alice.account)), isTrue);
 
@@ -115,8 +119,10 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     await DmStore.clear(alice.account);
     await DmStore.load(alice);
-    DmStore.put('ct-1', _secret, 1000);
-    DmStore.put('ct-1', 'tampered', 2000);      // same ciphertext can only mean one plaintext
+    DmStore.put('ct-1', _secret, 1000,
+        from: alice.account, outgoing: false, peer: mallory.account, peerPk: mallory.dmPub);
+    DmStore.put('ct-1', 'tampered', 2000,
+        from: alice.account, outgoing: false, peer: mallory.account, peerPk: mallory.dmPub);      // same ciphertext can only mean one plaintext
     expect(DmStore.get('ct-1'), _secret);
     expect(DmStore.count, 1);
   });
