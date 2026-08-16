@@ -914,8 +914,27 @@ def relay_announce_operator(url, opkey):
             _chain_send(nano_to_pub(rv))
         except Exception:
             pass
-    _chain_send(link)                                   # commit the URL LAST (frontier link = URL)
-    return addr, url
+    # Commit the URL LAST (frontier link = URL), and RETRY it. The three check-ins above are wrapped in
+    # try/except and swallow failures, so the URL commit inherits whatever mess they left AND is the one
+    # send whose failure loses the entire announce — the relay stays undiscoverable until the next
+    # restart, which repeats the same three throwaway check-ins. That asymmetry is backwards: the block
+    # that carries the payload got the least resilience. On a retry, resync `prev`/`bal` from the ledger
+    # first: local chaining is right in the happy path (ac9b4b6 — re-reading a lagging proxy mid-run
+    # forked the sequence), but once a send HAS failed the local state is exactly what's suspect.
+    last = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2 * attempt)
+            ai = rpc({'action': 'account_info', 'account': addr})
+            if 'error' in ai:
+                raise RuntimeError(f'operator account {addr} unreadable on retry: {ai["error"]}')
+            st['prev'], st['bal'] = ai['frontier'], int(ai['balance'])
+        try:
+            _chain_send(link)
+            return addr, url
+        except Exception as e:
+            last = e
+    raise RuntimeError(f'could not commit the relay URL on-chain after 3 attempts: {last}')
 
 
 def relay_self_announce(url):  # a relay announces ITSELF: commit its URL on its own chain + check in at each RV
@@ -952,7 +971,12 @@ def _relay_url(account):  # a relay account -> the URL it announced on its own c
         return None
     rv_links = {nano_to_pub(rv).upper() for rv in rendezvous_accts()}   # skip check-in blocks (link = a rendezvous)
     hashes = [ai['frontier']]                            # URL is announced LAST, so the frontier usually wins on try 1
-    for x in (rpc({'action': 'account_history', 'account': account, 'count': '4'}).get('history', []) or []):
+    # Look back 30, not 4. Every announce writes three rendezvous check-ins BEFORE the URL, so each
+    # attempt that fails after the check-ins buries an older, perfectly good URL commit three blocks
+    # deeper. Past four blocks it became unreadable, ensure() concluded "not announced", and announced
+    # again — three more check-ins, burying it further. That is a one-way ratchet into ledger spam, and
+    # a chain with twelve check-ins and no readable URL is what it looks like from outside.
+    for x in (rpc({'action': 'account_history', 'account': account, 'count': '30'}).get('history', []) or []):
         if x.get('hash'):
             hashes.append(x['hash'])
     for h in dict.fromkeys(hashes):

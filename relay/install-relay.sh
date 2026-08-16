@@ -939,10 +939,19 @@ PYCFG
     # operator seed in operator.seed. Backgrounded + non-fatal: it never blocks serving.
     # NOT gated on WITH_NODE any more. It was, because xc_reldir.py only existed under node/ — so a
     # relay-only install never even attempted an announce, and its operator had no way to discover why.
+    # XC_WORK: the announce signs FOUR blocks (three rendezvous check-ins, then the URL commit), each
+    # needing its own proof-of-work. Without this it was the ONLY path here that ignored the local work
+    # server this same script starts, so all four PoWs went to the public endpoints — measured at 5-20s
+    # each and intermittently erroring. The check-ins are best-effort and swallow failures; the URL
+    # commit is not, so a single public-endpoint hiccup on the last block loses the whole announce and
+    # the relay stays invisible with only a line in selfannounce.log to say so. Observed on a real
+    # operator's chain: twelve check-ins across four restarts, not one URL commit. Same GPU the node
+    # uses, same XC_WORK_LOCAL=1 CPU fallback so an announce can never be blocked outright.
     RELDIR="$XC_HOME/node/xc_reldir.py"; [ -f "$RELDIR" ] || RELDIR="$XC_HOME/xc_reldir.py"
     if [ -s "$XC_HOME/operator.seed" ] && [ -f "$RELDIR" ]; then
         ( sleep 25
           XC_RELAY_OPERATOR_SEED="$(cat "$XC_HOME/operator.seed")" NODE_PUBLIC_URL="$ANNOUNCE_URL" \
+          XC_WORK="http://127.0.0.1:$WORKD_PORT" XC_WORK_LOCAL=1 \
             "$PY" "$RELDIR" ensure "$ANNOUNCE_URL" >>"$XC_HOME/selfannounce.log" 2>&1
         ) &
     fi
