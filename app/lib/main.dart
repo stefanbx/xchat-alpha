@@ -278,6 +278,7 @@ class Settings {
   int relaySplit;    // % of a tip that rewards the relay serving the media
   int reposterSplit; // % of a tip that rewards whoever reposted it
   bool notifyLike, notifyComment, notifyTip, notifyDm;
+  bool readReceipts;   // tell the other side when you have read their messages
   bool autoReceive;   // claim incoming XNO without being asked — what every Nano wallet does
   int forYouFreshness;      // For You ranking: 0 = popular, 1 = balanced, 2 = latest
   bool forYouBoostFollows;  // boost posts from people you follow
@@ -292,6 +293,7 @@ class Settings {
     this.notifyTip = true,
     this.notifyDm = true,
     this.autoReceive = true,
+    this.readReceipts = true,
     this.forYouFreshness = 1,
     this.forYouBoostFollows = true,
     this.autoSweep = false,
@@ -316,6 +318,7 @@ class SettingsStore {
         notifyTip: m['notifyTip'] ?? true,
         notifyDm: m['notifyDm'] ?? true,
         autoReceive: m['autoReceive'] ?? true,
+        readReceipts: m['readReceipts'] ?? true,
         forYouFreshness: (m['forYouFreshness'] as num?)?.toInt() ?? 1,
         forYouBoostFollows: m['forYouBoostFollows'] ?? true,
         autoSweep: m['autoSweep'] ?? false,
@@ -338,6 +341,7 @@ class SettingsStore {
           'notifyTip': s.notifyTip,
           'notifyDm': s.notifyDm,
           'autoReceive': s.autoReceive,
+          'readReceipts': s.readReceipts,
           'forYouFreshness': s.forYouFreshness,
           'forYouBoostFollows': s.forYouBoostFollows,
           'autoSweep': s.autoSweep,
@@ -5122,6 +5126,8 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
               toggle('Messages', 'Android alert when a DM arrives', _settings.notifyDm, (v) => _settings.notifyDm = v),
               toggle('Auto-receive', 'pocket incoming XNO without asking (what other Nano wallets do)',
                   _settings.autoReceive, (v) => _settings.autoReceive = v),
+              toggle('Read receipts', 'let people see when you have read their messages',
+                  _settings.readReceipts, (v) => _settings.readReceipts = v),
 
               section('Privacy'),
               ListTile(
@@ -6965,6 +6971,9 @@ class _DmChatScreenState extends State<DmChatScreen> {
   void initState() {
     super.initState();
     _load();
+    SettingsStore.get().then((s) { if (mounted) setState(() => _readReceiptsOn = s.readReceipts); });
+    SharedPreferences.getInstance()
+        .then((p) => _sentReadUpTo = p.getInt(_readKey) ?? 0);   // resume the high-water mark
     // A conversation that only loads once is a mailbox, not a chat: a reply landed on the relay and
     // you had to back out of the thread and re-open it to see it. Poll while the thread is on screen.
     _poll = Timer.periodic(const Duration(seconds: 5), (_) => _load(quiet: true));
@@ -6990,6 +6999,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
     // under the reader and fights a long-press selection.
     if (quiet && next.length == _msgs.length && _pending.length == before && !_loading) return;
     setState(() { _msgs = next; _loading = false; });
+    _sendReadReceipt();   // no-op unless the high-water mark actually moved
   }
 
   Future<void> _send() async {
@@ -7179,6 +7189,15 @@ class _DmChatScreenState extends State<DmChatScreen> {
     }
     const groupWindow = 300;                    // 5 min: past that, a message starts a new block
     final reacts = _reactions();
+    // The newest thing WE sent that they have read. Computed once here rather than per bubble.
+    final peerRead = _peerReadUpTo();
+    Map<String, dynamic>? readMark;
+    if (peerRead > 0) {
+      for (final m in all) {
+        if (m['outgoing'] != true) continue;
+        if (((m['ts'] ?? 0) as int) <= peerRead) readMark = m;
+      }
+    }
     final rows = <Widget>[];
     for (var i = 0; i < all.length; i++) {
       final m = all[i];
@@ -7193,6 +7212,17 @@ class _DmChatScreenState extends State<DmChatScreen> {
       final endsBlock = next == null || next['outgoing'] != m['outgoing'] ||
           !_sameDay(ts, nextTs) || (nextTs - ts).abs() >= groupWindow;
       rows.add(_bubble(m, cont: cont, showTime: endsBlock, reacts: reacts['${m['id'] ?? ''}']));
+      // "Read" goes under the LAST message they have acknowledged, not every one of them. A column
+      // of ticks tells you nothing more than a single mark at the high-water line.
+      if (readMark != null && identical(m, readMark)) {
+        rows.add(Padding(
+          padding: const EdgeInsets.only(top: 1, right: 4, bottom: 2),
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: Text('Read', style: TextStyle(color: kDim.withValues(alpha: 0.9), fontSize: 10.5)),
+          ),
+        ));
+      }
     }
     return rows;
   }
@@ -7240,6 +7270,60 @@ class _DmChatScreenState extends State<DmChatScreen> {
   }
 
   final Map<String, String> _pendingReacts = {};      // targetId -> emoji I just chose
+
+  // READ RECEIPTS — one per conversation, never one per message.
+  //
+  // The receipt says "I have read everything up to <ts>", so opening a thread with twenty unread
+  // costs ONE control message instead of twenty. That is not just tidiness: a client older than the
+  // envelope renders each control message as a raw line, so a receipt per message would flood the
+  // other side's thread with machine text. Batching is what makes the feature safe to ship at all.
+  //
+  // It is sent only when the high-water mark ADVANCES, so re-opening a thread you have already read
+  // sends nothing.
+  // PERSISTED per conversation, not held on this screen. As a plain field it reset every time the
+  // thread was closed and reopened, so each visit re-sent a receipt for messages already
+  // acknowledged — measured: 16 sent, reopen, 17. Over a day of dipping in and out that is precisely
+  // the accumulation batching exists to prevent, and every one of them is a raw line in an older
+  // client's thread.
+  int _sentReadUpTo = 0;
+  String get _readKey => 'xchat_read_upto_${widget.peer}';
+  bool _readReceiptsOn = true;   // loaded in initState; the DM screen has no Settings of its own
+
+  /// How far the PEER says they have read. Only incoming receipts count — our own say nothing about
+  /// them, and trusting an outgoing one would show "Read" the moment we opened our own thread.
+  int _peerReadUpTo() {
+    var t = 0;
+    for (final m in _msgs) {
+      if (m['outgoing'] == true) continue;
+      final c = DmCtl.parse('${m['text']}');
+      if (c == null || c.type != 'read') continue;
+      final u = (c.data['u'] is int) ? c.data['u'] as int : int.tryParse('${c.data['u']}') ?? 0;
+      if (u > t) t = u;
+    }
+    return t;
+  }
+
+  Future<void> _sendReadReceipt() async {
+    if (!_readReceiptsOn) return;
+    // Only ever acknowledge messages THEY sent; our own timestamps are not news to them.
+    var newest = 0;
+    for (final m in _msgs) {
+      if (m['outgoing'] == true) continue;
+      if (DmCtl.isControl('${m['text']}')) continue;   // do not acknowledge acknowledgements
+      final ts = (m['ts'] ?? 0) as int;
+      if (ts > newest) newest = ts;
+    }
+    if (newest == 0 || newest <= _sentReadUpTo) return;   // nothing new to report
+    _sentReadUpTo = newest;
+    final r = await Api.dmSend(widget.peer, DmCtl.encode('read', {'u': newest}));
+    // Only remember it once it actually went. Recording a mark for a receipt that failed to send
+    // would tell the peer nothing and stop us ever retrying.
+    if (r != null && r['ok'] == true) {
+      (await SharedPreferences.getInstance()).setInt(_readKey, newest);
+    } else {
+      _sentReadUpTo = 0;
+    }
+  }
 
   Future<void> _react(String targetId, String emoji) async {
     // Tapping the reaction you already have removes it — the empty string is how that travels.

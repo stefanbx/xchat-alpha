@@ -73,6 +73,29 @@ void main() {
     });
   });
 
+  group('read receipts', () {
+    test('a receipt names a HIGH-WATER MARK, not a message', () {
+      // This is what makes one-per-conversation possible: "I have read up to <ts>" acknowledges
+      // twenty unread messages in one control message. A per-message receipt would be twenty, and an
+      // older client renders each one as a raw line — a flood in the other side's thread.
+      final line = DmCtl.encode('read', {'u': 1786880000});
+      expect(line, 'xchat:ctl/1 read {"u":1786880000}');
+      final p = DmCtl.parse(line)!;
+      expect(p.type, 'read');
+      expect(p.data['u'], 1786880000);
+    });
+
+    test('a receipt is control, so it never renders as a message', () {
+      expect(DmCtl.isControl(DmCtl.encode('read', {'u': 1})), isTrue);
+    });
+
+    test('receipts and reactions are distinguishable', () {
+      // Both ride the same envelope; a client must never apply one as the other.
+      expect(DmCtl.parse(DmCtl.encode('read', {'u': 1}))!.type, 'read');
+      expect(DmCtl.parse(DmCtl.encode('react', {'m': 'a', 'e': '👍'}))!.type, 'react');
+    });
+  });
+
   group('message ids', () {
     test('both sides derive the SAME id from the ciphertext they each hold', () {
       // Neither side can invent an id and no relay may assign one, so it comes from the one thing
