@@ -586,7 +586,12 @@ class DmStore {
       final plain = w.dmOpen(w.dmPub, blob);
       if (plain == null) return;
       for (final e in (jsonDecode(plain) as Map<String, dynamic>).entries) {
-        _mem[e.key] = (e.value as Map).cast<String, dynamic>();
+        final rec = (e.value as Map).cast<String, dynamic>();
+        // Backfill the message id for anything stored before ids existed. The map KEY is the
+        // ciphertext, so it can be derived rather than migrated — without this, every message
+        // already on the device would be unreactable, which is not a state a user could diagnose.
+        rec['i'] ??= DmCtl.keyOf(e.key);
+        _mem[e.key] = rec;
       }
     } catch (_) {
       _mem.clear();                      // corrupt or unreadable: start clean, never break a poll
@@ -7173,6 +7178,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
       }
     }
     const groupWindow = 300;                    // 5 min: past that, a message starts a new block
+    final reacts = _reactions();
     final rows = <Widget>[];
     for (var i = 0; i < all.length; i++) {
       final m = all[i];
@@ -7186,7 +7192,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
       final cont = !newDay && prev['outgoing'] == m['outgoing'] && (ts - prevTs).abs() < groupWindow;
       final endsBlock = next == null || next['outgoing'] != m['outgoing'] ||
           !_sameDay(ts, nextTs) || (nextTs - ts).abs() >= groupWindow;
-      rows.add(_bubble(m, cont: cont, showTime: endsBlock));
+      rows.add(_bubble(m, cont: cont, showTime: endsBlock, reacts: reacts['${m['id'] ?? ''}']));
     }
     return rows;
   }
@@ -7203,6 +7209,77 @@ class _DmChatScreenState extends State<DmChatScreen> {
           ),
         ),
       );
+
+  // REACTIONS, folded out of the control messages already in the thread.
+  //
+  // One reaction per person per message, last-write-wins. That is Messenger's model rather than
+  // Slack's, and it is chosen for the wire as much as the UI: a sender's latest `react` states their
+  // CURRENT reaction, so removing one is sending an empty string. No separate remove op, no way for
+  // an add and a remove to arrive out of order and leave a reaction nobody made.
+  Map<String, Map<String, String>> _reactions() {
+    final out = <String, Map<String, String>>{};      // targetId -> {reactor account: emoji}
+    final all = [..._msgs]..sort((a, b) => ((a['ts'] ?? 0) as int).compareTo((b['ts'] ?? 0) as int));
+    for (final m in all) {
+      final c = DmCtl.parse('${m['text']}');
+      if (c == null || c.type != 'react') continue;
+      final target = '${c.data['m'] ?? ''}';
+      final emoji = '${c.data['e'] ?? ''}';
+      if (target.isEmpty) continue;
+      // Attribute to the SENDER of the control message. A reaction cannot be forged onto someone
+      // else because the only way it reaches us is sealed to our key by its author.
+      final who = m['outgoing'] == true ? (widget.myAccount) : '${m['from']}';
+      final map = out[target] ??= <String, String>{};
+      if (emoji.isEmpty) { map.remove(who); } else { map[who] = emoji; }
+    }
+    // Local overlay so a tap is immediate rather than waiting for the round trip and the next poll.
+    for (final e in _pendingReacts.entries) {
+      final map = out[e.key] ??= <String, String>{};
+      if (e.value.isEmpty) { map.remove(widget.myAccount); } else { map[widget.myAccount] = e.value; }
+    }
+    return out;
+  }
+
+  final Map<String, String> _pendingReacts = {};      // targetId -> emoji I just chose
+
+  Future<void> _react(String targetId, String emoji) async {
+    // Tapping the reaction you already have removes it — the empty string is how that travels.
+    final mine = _reactions()[targetId]?[widget.myAccount] ?? '';
+    final next = mine == emoji ? '' : emoji;
+    setState(() => _pendingReacts[targetId] = next);
+    await Api.dmSend(widget.peer, DmCtl.encode('react', {'m': targetId, 'e': next}));
+    await _load();
+    if (mounted) setState(() => _pendingReacts.remove(targetId));
+  }
+
+  /// The chips under a bubble. Grouped by emoji with a count, so three thumbs read as one 👍 3.
+  Widget _reactionChips(Map<String, String> byWho, bool out) {
+    final counts = <String, int>{};
+    for (final e in byWho.values) {
+      counts[e] = (counts[e] ?? 0) + 1;
+    }
+    final mine = byWho[widget.myAccount];
+    return Padding(
+      padding: EdgeInsets.only(top: 3, left: out ? 0 : 6, right: out ? 6 : 0, bottom: 2),
+      child: Wrap(
+        spacing: 4,
+        alignment: out ? WrapAlignment.end : WrapAlignment.start,
+        children: [
+          for (final e in counts.entries)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+              decoration: BoxDecoration(
+                color: kCard,
+                borderRadius: BorderRadius.circular(11),
+                // Your own reaction is outlined, so you can see at a glance whether the 👍 is yours.
+                border: Border.all(color: e.key == mine ? kAccent : kLine),
+              ),
+              child: Text('${e.key}${e.value > 1 ? ' ${e.value}' : ''}',
+                  style: const TextStyle(fontSize: 12.5, color: kText)),
+            ),
+        ],
+      ),
+    );
+  }
 
   /// Split an attachment marker off a message body → (cid, caption). Runs AFTER the quote split, so a
   /// reply that carries a photo works: quote lines, then the marker, then the caption.
@@ -7269,6 +7346,23 @@ class _DmChatScreenState extends State<DmChatScreen> {
           borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
       builder: (ctx) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // A quick row first: reacting is the most common thing you want from this menu, and making
+          // it one tap rather than a submenu is the difference between using it and not.
+          if ('${m['id'] ?? ''}'.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+              child: Row(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+                for (final e in const ['👍', '❤️', '😂', '😮', '😢', '🙏'])
+                  InkWell(
+                    borderRadius: BorderRadius.circular(24),
+                    onTap: () { Navigator.pop(ctx); _react('${m['id']}', e); },
+                    child: Padding(
+                      padding: const EdgeInsets.all(6),
+                      child: Text(e, style: const TextStyle(fontSize: 26)),
+                    ),
+                  ),
+              ]),
+            ),
           ListTile(
             leading: const Icon(Icons.reply, color: kAccent),
             title: const Text('Reply', style: TextStyle(color: kText)),
@@ -7348,13 +7442,17 @@ class _DmChatScreenState extends State<DmChatScreen> {
     );
   }
 
-  Widget _bubble(Map<String, dynamic> m, {bool cont = false, bool showTime = true}) {
+  Widget _bubble(Map<String, dynamic> m,
+      {bool cont = false, bool showTime = true, Map<String, String>? reacts}) {
     final out = m['outgoing'] == true;
     final pending = m['pending'] == true;
     final (quote, rest) = _splitQuote('${m['text']}');
     final (imgCid, body) = _splitImg(rest);
     const r16 = Radius.circular(16), r5 = Radius.circular(5);
-    return Align(
+    return Column(
+      crossAxisAlignment: out ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+      children: [
+        Align(
       alignment: out ? Alignment.centerRight : Alignment.centerLeft,
       child: Opacity(
         opacity: pending ? 0.6 : 1,             // "on its way" without a second widget
@@ -7403,6 +7501,11 @@ class _DmChatScreenState extends State<DmChatScreen> {
           ),
         ),
       ),
+        ),
+        // Chips sit UNDER the bubble, not inside it: a reaction is a separate act by someone else,
+        // and putting it in the bubble would make it look like part of the message.
+        if (reacts != null && reacts.isNotEmpty) _reactionChips(reacts, out),
+      ],
     );
   }
 
