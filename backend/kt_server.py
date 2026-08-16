@@ -26,6 +26,7 @@ DM_PY = os.environ.get('XC_DM_PYTHON', PY)                  # kept as an overrid
 sys.path.insert(0, HERE)
 import xc_common as xc                                       # for api_me + wallet paths
 import xc_engage                                             # hot engagement path, called IN-PROCESS (no spawn)
+import xc_unfurl                                             # link previews — network+parse, no seed, no /tmp
 
 # Human landing / download page, served on the node's PUBLIC url (/, /download, /get, /app). The node
 # is the app's front door AND its own relay, so hosting the page here means ӾChat's own censorship-
@@ -526,6 +527,36 @@ def api_status():
     except Exception:
         return '{"online":false}'
 
+# Link previews. The node fetches, so a reader's phone never touches a stranger's server just for
+# scrolling past their link — see the long note at the top of xc_unfurl.py for why that is the only
+# one of the three possible designs that is honest. All the SSRF guarding lives there.
+#
+# The one thing that belongs HERE is the concurrency cap. This is the only endpoint that makes an
+# outbound request to an address a caller chose, so without a ceiling it is a free fan-out engine:
+# a few hundred concurrent /api/unfurl calls naming the same victim turn the node into an
+# amplifier pointed at them. Excess callers are told to come back rather than queued, because a
+# queue behind a 5s fetch is just a slower way to exhaust the same threads.
+_UNFURL_MAX = int(os.environ.get('XC_UNFURL_CONCURRENCY', '4'))
+_unfurl_slots = threading.Semaphore(_UNFURL_MAX)
+
+def api_unfurl(url):
+    if not url:
+        return '{"ok":false,"error":"no url"}'
+    # A cached answer costs nothing and must not be rationed — otherwise a busy feed of ALREADY
+    # known links starts failing for no reason.
+    try:
+        c = json.load(open(xc_unfurl._cache_path(url)))
+        if time.time() - c.get('cached_at', 0) < (xc_unfurl.OK_TTL if c.get('ok') else xc_unfurl.FAIL_TTL):
+            return json.dumps(c)
+    except Exception:
+        pass
+    if not _unfurl_slots.acquire(blocking=False):
+        return '{"ok":false,"error":"busy","retry":true}'
+    try:
+        return json.dumps(xc_unfurl.unfurl(url))
+    finally:
+        _unfurl_slots.release()
+
 # ---- dispatch: path -> handler(query, body) -> response string ----
 def route(path, query, body):
     q = lambda k: (query.get(k, [''])[0])
@@ -544,6 +575,7 @@ def route(path, query, body):
     if path.startswith('/api/status'):       return api_status()
     if path.startswith('/api/announcement'):  return api_announcement()
     if path.startswith('/api/labels'):       return api_labels()
+    if path.startswith('/api/unfurl'):       return api_unfurl(q('url'))
 
     # on-device posting: two-step round-trip. These are prefixes of /api/post, so match them FIRST.
     if path.startswith('/api/post_prepare'):

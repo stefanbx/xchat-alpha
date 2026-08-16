@@ -8443,6 +8443,122 @@ Future<void> openLink(String url) async {
   }
 }
 
+/// The card under a post that shows what its link actually leads to.
+///
+/// The NODE fetches the page, not this phone. If each reader unfurled for themselves, every host
+/// anyone linked to would collect the IP and the read-time of everyone who scrolled past — anyone
+/// could post a link and harvest a list of who read their post. The full argument is at the top of
+/// backend/xc_unfurl.py.
+///
+/// FEED ONLY. A DM is end-to-end encrypted, so asking the node to preview a link inside one would
+/// hand the node a URL out of a conversation it is specifically not able to read. Nothing wires this
+/// into the DM path, and nothing should.
+///
+/// No image yet, deliberately. An og:image is a URL on the linked site, so painting it here would
+/// reintroduce the very IP leak the node-side fetch exists to avoid — the picture has to be proxied
+/// through the node before it can be shown, which is its own piece of work.
+class LinkPreview extends StatefulWidget {
+  const LinkPreview({super.key, required this.url});
+  final String url;
+
+  // Process-wide, because the same link appears in a post, in its thread view and again after a
+  // refresh, and each of those is a fresh widget. Null means "asked, nothing to show" — cached just
+  // as firmly as a hit, so a bad link is not re-requested on every scroll past it.
+  static final Map<String, Map<String, dynamic>?> _cache = {};
+  static final Map<String, Future<Map<String, dynamic>?>> _inflight = {};
+
+  static Future<Map<String, dynamic>?> lookup(String url) {
+    if (_cache.containsKey(url)) return Future.value(_cache[url]);
+    // Single-flight: a feed page can hold the same link several times and they all build at once.
+    return _inflight.putIfAbsent(url, () async {
+      try {
+        final r = await http
+            .get(Uri.parse('$kBase/api/unfurl?url=${Uri.encodeQueryComponent(url)}'))
+            .timeout(const Duration(seconds: 12));
+        final d = jsonDecode(r.body) as Map<String, dynamic>;
+        // `busy` is the node shedding load, not a verdict on the link — don't cache it as one.
+        if (d['retry'] == true) return null;
+        final ok = d['ok'] == true && '${d['title'] ?? ''}'.isNotEmpty;
+        _cache[url] = ok ? d : null;
+        return _cache[url];
+      } catch (_) {
+        return null;                      // offline or slow: no card, and try again next build
+      } finally {
+        _inflight.remove(url);
+      }
+    });
+  }
+
+  @override
+  State<LinkPreview> createState() => _LinkPreviewState();
+}
+
+class _LinkPreviewState extends State<LinkPreview> {
+  Map<String, dynamic>? _d;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(LinkPreview old) {
+    super.didUpdateWidget(old);
+    if (old.url != widget.url) _load();
+  }
+
+  Future<void> _load() async {
+    final d = await LinkPreview.lookup(widget.url);
+    if (mounted) setState(() => _d = d);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final d = _d;
+    // Nothing while it loads and nothing when it fails. A placeholder that later vanishes reflows the
+    // whole feed under the reader's thumb, and a post with no card looks exactly like it did before
+    // previews existed — which is the correct fallback.
+    if (d == null) return const SizedBox.shrink();
+    final title = '${d['title'] ?? ''}';
+    final desc = '${d['desc'] ?? ''}';
+    final site = '${d['site'] ?? ''}';
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: InkWell(
+        onTap: () => openLink(widget.url),
+        borderRadius: BorderRadius.circular(14),
+        child: Container(
+          padding: const EdgeInsets.all(11),
+          decoration: BoxDecoration(
+            border: Border.all(color: kLine),
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            if (site.isNotEmpty)
+              Text(site.toLowerCase(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: kDim, fontSize: 12)),
+            Text(title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                    color: kText, fontSize: 14.5, fontWeight: FontWeight.w700, height: 1.25)),
+            if (desc.isNotEmpty) ...[
+              const SizedBox(height: 2),
+              Text(desc,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: kDim, fontSize: 13, height: 1.25)),
+            ],
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
 class _PostCardState extends State<PostCard> {
   // TapGestureRecognizers in a TextSpan are NOT owned by the span: they leak unless disposed. Held
   // here and cleared on every rebuild, which is the whole reason this lives in a StatefulWidget.
@@ -8625,6 +8741,15 @@ class _PostCardState extends State<PostCard> {
                       style: TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
                 ),
               ),
+            // A card for the first link, when the post has nothing else to show. Skipped when the
+            // post already carries its own media — two rectangles competing under one sentence, and
+            // the author's photo is the one they chose. Skipped while collapsed too: the card would
+            // preview a link the reader cannot yet see in the truncated text.
+            if (p.media == null && !(longText && !_expanded))
+              Builder(builder: (_) {
+                final link = firstLink(p.text);
+                return link == null ? const SizedBox.shrink() : LinkPreview(url: link);
+              }),
             // photo / GIF attachment (Image.memory animates GIFs)
             if (p.kind == 'photo' && p.media != null)
               Padding(

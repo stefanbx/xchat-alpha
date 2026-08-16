@@ -55,6 +55,8 @@ Missing, in the order they are worth having:
    without it there is no way to pull someone into a thread.
 2. **Hashtags** — not parsed, not tappable, not searchable. The other half of discovery.
 3. **Link previews** — a URL is bare text. Cheap to add, and it is most of what a timeline looks like.
+   *(Turned out not to be cheap: linkifying is, but a preview means somebody fetches a stranger's URL,
+   and choosing WHO is the whole design. See the note in `backend/xc_unfurl.py`.)*
 4. **Accessibility** — zero `Semantics()` in the app, and no image alt text. This is a correctness
    gap, not a feature gap: a screen reader currently gets very little.
 5. **Drafts and edit** — neither exists. Edit is genuinely hard here (a post is a signed head; an
@@ -62,6 +64,33 @@ Missing, in the order they are worth having:
    than assuming.
 
 ---
+
+## Progress
+
+Done, each verified before the next was started.
+
+| # | item | what actually changed | evidence |
+|---|---|---|---|
+| S1 | feed pagination | `?limit=`/`?before=`/`more`; client pages at 40 | walked every page: 33 posts, 33 unique, no overlap, each page strictly older |
+| S2 | `FEED_TTL` 5 → 12 | aligned to the 12 s client poll | 5 → 2 aggregations in the same 26 s window |
+| G1+2 | @mentions, #hashtags | linked and tappable; mention → profile (search fallback), tag → Discover | on device: `@jiovan` and `#nano` linked, `bob@example.com` and `C#` plain; tapping `#nano` found 1 post |
+| G3a | links in a body | `body.dart`, one scanner, imported by the tests; tap → system browser | 29 tests; on device the fragment stayed inside the URL, both trailing marks outside, ACTION_VIEW dispatched |
+| G3b | link preview cards | node-side unfurl + SSRF guards, card under the post | 54 checks; live: 0.58 s cold / 0.22 s cached, and metadata/localhost/file: all refused on the real host |
+
+**S2 is an operator-cost fix, not a user-latency one.** Nothing got faster on the phone; the node
+stopped re-running an aggregation nobody consumed, ~1 s of CPU a time. That matters because operators
+run this on laptops — but it is not the thing that makes the app feel quick, and the table should not
+be read as if it were.
+
+Two things the preview work deliberately did NOT do, both worth their own entry rather than a
+footnote:
+
+- **No preview image.** An `og:image` is a URL on the linked site, so painting it puts every reader's
+  IP in that site's logs — the exact leak the node-side fetch exists to prevent. The image has to be
+  proxied and size-capped through the node first.
+- **The node learns which links a reader loads.** Small next to what it already knows (it served the
+  feed those links came from), but not nothing. Serving previews as part of the feed aggregation
+  would remove even that.
 
 ## Method
 
