@@ -2,6 +2,7 @@
 // signs every event/block locally with nanodart (ed25519-blake2b), byte-compatible with the node's
 // verifier. The node only relays already-signed payloads and reads the ledger — it holds no seed.
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:nanodart/nanodart.dart';
 import 'package:pinenacl/x25519.dart' as pnacl;
@@ -199,4 +200,63 @@ class NanoWallet {
       return null;
     }
   }
+
+  // ---- GROUP messages ----
+  //
+  // A group message is sealed ONCE under a fresh random key and stored as a single blob; that key is
+  // then delivered to each member inside an ORDINARY 1:1 DM. So a photo sent to thirty people is one
+  // photo on the relays plus thirty envelopes of a few hundred bytes.
+  //
+  // Delivering the key this way rather than as a wrap map attached to a shared record is what makes
+  // the whole feature small: the per-member envelope IS the existing DM path, so groups inherit
+  // delivery, push, the encrypted on-device store, ordering, attachments and the control envelope
+  // without any of them learning that groups exist.
+  //
+  // IT IS ALSO WHAT MAKES IT SOUND, and that is the part worth spelling out. An earlier design put
+  // the content key in a wrap map beside a shared ciphertext. Every member necessarily learns that
+  // key — so any of them could keep the wraps they cannot forge, swap the ciphertext for something
+  // else sealed under the same key, and have every recipient decrypt an attacker's words under the
+  // real sender's name. Fixing that needs a signature over the ciphertext. Here the key and the
+  // content id travel INSIDE a crypto_box from sender to member, which nobody else can produce, so
+  // authorship is settled by the same MAC that already protects a 1:1 DM. No extra signature, and
+  // one less thing to get wrong. See app/test/group_crypto_test.dart.
+  static final math.Random _rng = math.Random.secure();
+
+  /// Seal group content under a fresh key. Returns the sealed bytes and the key as hex, for the
+  /// caller to deliver to each member privately.
+  ({Uint8List ct, String key}) groupContentSeal(Uint8List bytes) {
+    final k = Uint8List.fromList(List<int>.generate(32, (_) => _rng.nextInt(256)));
+    return (ct: Uint8List.fromList(pnacl.SecretBox(k).encrypt(bytes)), key: _hexOfBytes(k));
+  }
+
+  /// Open group content given the key from our own envelope. Null rather than throwing: a corrupt
+  /// blob must not break a poll.
+  Uint8List? groupContentOpen(String keyHex, Uint8List ct) {
+    try {
+      return Uint8List.fromList(
+          pnacl.SecretBox(_bytesOfHex(keyHex)).decrypt(pnacl.EncryptedMessage.fromList(ct)));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Text convenience over the same two calls.
+  ({String ct, String key}) groupTextSeal(String text) {
+    final s = groupContentSeal(Uint8List.fromList(utf8.encode(text)));
+    return (ct: base64.encode(s.ct), key: s.key);
+  }
+
+  String? groupTextOpen(String keyHex, String ctB64) {
+    try {
+      final b = groupContentOpen(keyHex, base64.decode(ctB64));
+      return b == null ? null : utf8.decode(b);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// A group's id: derived, so anyone can recompute it and nobody can claim someone else's.
+  static String groupId(String creator, String name, int createdTs) => _hexOfBytes(Blake2b.digest256([
+        Uint8List.fromList(utf8.encode('xchat-group:$creator:${name.trim()}:$createdTs')),
+      ])).substring(0, 32);
 }

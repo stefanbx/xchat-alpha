@@ -576,6 +576,84 @@ class DmCtl {
   static bool isControl(String text) => parse(text) != null;
 }
 
+/// A group message, as it travels.
+///
+/// GROUPS RIDE THE 1:1 PATH. The content is sealed once under a fresh key and stored as a single
+/// blob; each member then receives an ordinary DM carrying the group id, the blob's cid and that
+/// key. So a photo sent to thirty people is one photo on the relays plus thirty envelopes of a few
+/// hundred bytes — and delivery, push, the encrypted on-device store, ordering, attachments and the
+/// control envelope all work already, without any of them learning that groups exist.
+///
+/// It is also what settles authorship. The key travels inside a crypto_box from sender to member,
+/// which nobody else can produce, so the MAC that already protects a 1:1 DM protects this too. The
+/// design this replaced shared one ciphertext with a wrap map, and there every member necessarily
+/// learned the content key — enough to re-seal different words under wraps they could copy but not
+/// forge, and have everyone read an attacker's message under the real sender's name. That needed a
+/// separate signature over the ciphertext. This needs nothing.
+///
+/// MEMBERSHIP IS LAST-WRITER-WINS and rides in every message. There is no shared group record and no
+/// consensus: each message names the group and lists who the sender believes is in it, and a client
+/// takes the newest list it has seen. Two people adding different members at the same moment is
+/// resolved by whoever sent last, which is a real limitation and the honest cost of having no
+/// coordinator. Removal is not retroactive — it only means the next message's key is not sent to
+/// them.
+/// Hidden from a 1:1 thread: true for anything delivered as a DM that is not part of THIS
+/// conversation — control messages and group envelopes alike. One predicate, because every place
+/// that filters one must filter the other, and the inbox already proved that remembering to do it
+/// twice does not work.
+bool hiddenInDm(String text) => DmCtl.isControl(text) || GroupMsg.isGroup(text);
+
+class GroupMsg {
+  static const tag = 'xchat:grp/1 ';
+
+  final String gid, name, cid, key;
+  final List<String> members;         // accounts, including the sender
+  const GroupMsg(
+      {required this.gid,
+      required this.name,
+      required this.cid,
+      required this.key,
+      required this.members});
+
+  String encode() => '$tag${jsonEncode({
+        'g': gid,
+        'n': name,
+        'c': cid,
+        'k': key,
+        'm': members,
+      })}';
+
+  static GroupMsg? parse(String text) {
+    final t = text.trim();
+    if (!t.startsWith(tag) || t.contains('\n')) return null;
+    try {
+      final j = jsonDecode(t.substring(tag.length));
+      if (j is! Map) return null;
+      final gid = '${j['g'] ?? ''}';
+      final cid = '${j['c'] ?? ''}';
+      final key = '${j['k'] ?? ''}';
+      // A group message with no id, no content or no key is not a group message we can act on, and
+      // showing the raw JSON at the reader would be the worst of both.
+      if (gid.isEmpty || cid.isEmpty || key.isEmpty) return null;
+      return GroupMsg(
+        gid: gid,
+        name: '${j['n'] ?? ''}',
+        cid: cid,
+        key: key,
+        members: ((j['m'] as List?) ?? const []).map((e) => '$e').toList(),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Hidden from a 1:1 thread the same way control messages are: a group message happens to be
+  /// delivered as a DM, but it belongs to the group, not to the conversation with the sender. Older
+  /// builds print the raw line — the same cost the control envelope already carries, and the reason
+  /// both tags are checked in one place.
+  static bool isGroup(String text) => parse(text) != null;
+}
+
 // ON-DEVICE MESSAGE STORE — decrypt each DM once, ever.
 //
 // A poll opens EVERY ciphertext in the inbox and throws the plaintext away, so cost grows linearly
@@ -2005,6 +2083,63 @@ class Api {
       final b64 = jsonDecode(r.body)['b64'];
       if (b64 == null) return null;
       return w.dmOpenBytes(peerPk, base64Decode(b64));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ---- groups ----
+  // Seal the text ONCE, park the sealed bytes in an ordinary blob, then send each member a normal DM
+  // carrying the group id, that blob's cid and the key. The relay stores one blob it cannot read and
+  // N tiny messages it cannot read; nothing in the delivery path knows groups exist.
+  //
+  // Sends to each member INDEPENDENTLY and reports how many landed, rather than failing the whole
+  // send on one bad recipient. A group where one person has not enabled DMs must still work for
+  // everyone else — the alternative is a group that silently cannot be used and does not say why.
+  static Future<Map<String, dynamic>> groupSend(
+      String gid, String name, List<String> members, String text) async {
+    final w = gWallet;
+    if (w == null) return {'ok': false, 'error': 'no wallet'};
+    final sealed = w.groupContentSeal(Uint8List.fromList(utf8.encode(text)));
+    final cid = await blobPut(sealed.ct);
+    if (cid == null || cid.isEmpty) {
+      return {'ok': false, 'error': 'could not store the message (${lastBlobErr ?? "no cid"})'};
+    }
+    final env = GroupMsg(gid: gid, name: name, cid: cid, key: sealed.key, members: members).encode();
+    var sent = 0;
+    final failed = <String>[];
+    // Everyone including ourselves: the sender re-reads their own history off a relay like anyone
+    // else, so skipping self loses your own messages on a reinstall.
+    for (final m in members) {
+      final r = await dmSend(m, env);
+      if (r != null && r['ok'] == true) {
+        sent++;
+      } else {
+        failed.add(m);
+      }
+    }
+    return {
+      'ok': sent > 0,
+      'sent': sent,
+      'of': members.length,
+      'failed': failed,
+      'ts': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      'error': sent == 0 ? 'nobody in this group could be reached' : null,
+    };
+  }
+
+  /// Fetch and open a group message's content. The key came in our own envelope, so this needs no
+  /// peer key and works identically for messages we sent and messages we received.
+  static Future<String?> groupText(String cid, String key) async {
+    final w = gWallet;
+    if (w == null) return null;
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/media?cid=$cid'))
+          .timeout(const Duration(seconds: 30));
+      final b64 = jsonDecode(r.body)['b64'];
+      if (b64 == null) return null;
+      final b = w.groupContentOpen(key, base64Decode(b64));
+      return b == null ? null : utf8.decode(b);
     } catch (_) {
       return null;
     }
@@ -7050,7 +7185,7 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
                       // surface, not just the one it was written for.
                       final visible = msgs
                           .cast<Map<String, dynamic>>()
-                          .where((m) => !DmCtl.isControl('${m['text']}'))
+                          .where((m) => !hiddenInDm('${m['text']}'))
                           .toList();
                       final last = visible.isEmpty ? null : visible.last;
                       return ListTile(
@@ -7222,7 +7357,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
   int? _rowIndexOf(String id) {
     var i = 0;
     for (final m in [..._msgs, ..._pending]) {
-      if (DmCtl.isControl('${m['text']}')) continue;
+      if (hiddenInDm('${m['text']}')) continue;
       if ('${m['id'] ?? ''}' == id) return i;
       i++;
     }
@@ -7412,7 +7547,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
     // between two messages that belong together. Unknown types are suppressed too: see DmCtl.
     var all = [
       for (final m in [..._msgs, ..._pending])
-        if (!DmCtl.isControl('${m['text']}')) m
+        if (!hiddenInDm('${m['text']}')) m
     ];
     if (_query.isNotEmpty) {
       // Search the BODY, not the raw text: a hit inside the "> " quote of a reply would otherwise
@@ -7557,7 +7692,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
     var newest = 0;
     for (final m in _msgs) {
       if (m['outgoing'] == true) continue;
-      if (DmCtl.isControl('${m['text']}')) continue;   // do not acknowledge acknowledgements
+      if (hiddenInDm('${m['text']}')) continue;   // do not acknowledge acknowledgements
       final ts = (m['ts'] ?? 0) as int;
       if (ts > newest) newest = ts;
     }
