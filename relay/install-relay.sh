@@ -170,6 +170,52 @@ done
 
 # The installed code's fingerprint. A hash of the installer itself rather than a version string:
 # nothing to remember to bump, and it changes exactly when the shipped code changes.
+# Point the worker's KV at the tunnel we are actually serving on, and MAKE A FAILURE VISIBLE.
+#
+# This is the bug that took a node off the air for a day without anyone noticing. The push ran in a
+# background subshell, its output went to kv-update.log, and NOTHING checked whether it worked. When
+# the Cloudflare OAuth token expired, every push after that failed with "Authentication error [code:
+# 10000]"; the tunnel went on churning, so KV kept pointing at a hostname that no longer resolved;
+# the worker faithfully proxied to it and Cloudflare answered 530. Meanwhile --status printed a green
+# tick next to the worker URL, because it only ever read worker.conf.
+#
+# Same shape as the tunnel bug fixed earlier in this file: a LIVE tunnel is not a WORKING tunnel, and
+# a CONFIGURED worker address is not a WORKING one. Anything that can silently stop being true has to
+# be probed, not assumed.
+#
+# Leaves kv-failed behind on failure with a one-line reason; --status reads it and clears when a push
+# later succeeds.
+kv_push() {  # kv_push <namespace-id> <url>
+    _ns="$1"; _u="$2"
+    if ! command -v npx >/dev/null 2>&1; then
+        echo "npx not found — cannot update the worker's backend URL" > "$XC_HOME/kv-failed"
+        return 1
+    fi
+    # Capture THIS run's output on its own before appending it. kv-update.log is append-only across
+    # every restart the machine has ever had, so classifying by grepping the whole file means a
+    # months-old auth error relabels today's unrelated network failure as an expired login — sending
+    # the operator to re-authenticate something that was never the problem. Diagnose from what just
+    # happened, not from the history.
+    _out=$(mktemp 2>/dev/null || echo "/tmp/xckv.$$")
+    if npx wrangler kv key put --remote --namespace-id="$_ns" backend "$_u" >"$_out" 2>&1; then
+        cat "$_out" >> "$XC_HOME/kv-update.log"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] backend -> $_u" >> "$XC_HOME/kv-update.log"
+        rm -f "$_out" "$XC_HOME/kv-failed"
+        return 0
+    fi
+    cat "$_out" >> "$XC_HOME/kv-update.log"
+    # Name the likely cause rather than "it failed". An expired OAuth token is by far the common one,
+    # and the remedy is a single command the operator would otherwise have to go and find.
+    if grep -qiE 'Authentication error|code: 10000|Unauthorized|401' "$_out" 2>/dev/null; then
+        echo "Cloudflare login expired — run: cd $XC_HOME/cf-worker && npx wrangler login" \
+            > "$XC_HOME/kv-failed"
+    else
+        echo "could not write the backend URL to KV — see $XC_HOME/kv-update.log" > "$XC_HOME/kv-failed"
+    fi
+    rm -f "$_out"
+    return 1
+}
+
 installed_fp() { [ -f "$XC_HOME/installed.fp" ] && cat "$XC_HOME/installed.fp" || echo ''; }
 remote_fp() {
     t=$(mktemp 2>/dev/null || echo /tmp/xcfp.$$)
@@ -211,7 +257,24 @@ case "$ACTION" in
         say ""
         if [ -f "$XC_HOME/worker.conf" ]; then
             WORKER_URL=''; . "$XC_HOME/worker.conf"
-            ok "stable address: ${WORKER_URL:-(worker.conf has no WORKER_URL)}"
+            # PROBE it. Reading the address out of a config file only proves the file exists. This
+            # line printed a green tick for a day while the address answered 530 to everybody,
+            # because the worker's KV still pointed at a tunnel that had since churned away.
+            if [ -z "$WORKER_URL" ]; then
+                warn "worker.conf has no WORKER_URL"
+            elif curl -fsS -m 12 -o /dev/null "$WORKER_URL/heads" 2>/dev/null; then
+                ok "stable address: $WORKER_URL (answering)"
+            else
+                warn "stable address $WORKER_URL is NOT answering — this node is announced but unreachable"
+                say "  The worker is a front: it forwards to whatever URL is stored in its KV. If that"
+                say "  URL is stale, every client gets a Cloudflare 530 while the relay looks healthy."
+                if [ -s "$XC_HOME/kv-failed" ]; then
+                    say "  Cause: $(cat "$XC_HOME/kv-failed")"
+                else
+                    say "  Re-point it:  cd $XC_HOME/cf-worker && npx wrangler kv key put --remote \\"
+                    say "                  --namespace-id=$KV_NAMESPACE_ID backend \"\$(cat $XC_HOME/public-url.txt)\""
+                fi
+            fi
         else
             warn "no stable address — this node is NOT announced on the XNO ledger"
             say "  A quick tunnel gets a NEW hostname every restart, so it can't be announced: the"
@@ -1029,9 +1092,7 @@ except Exception:
         if [ -n "$KV_NAMESPACE_ID" ]; then
             ( sleep 8
               PATH="/opt/homebrew/bin:/usr/local/bin:$PATH:/usr/bin:/bin"   # find node/npx in a service env
-              command -v npx >/dev/null 2>&1 &&
-                npx wrangler kv key put --remote --namespace-id="$KV_NAMESPACE_ID" backend "$URL" \
-                  >>"$XC_HOME/kv-update.log" 2>&1
+              kv_push "$KV_NAMESPACE_ID" "$URL"
             ) &
         fi
     fi
@@ -1086,6 +1147,21 @@ except Exception:
                 HB=0
                 if curl -fsS -m 10 -o /dev/null "$URL" 2>/dev/null; then
                     DEAD=0
+                    # The tunnel answers. Now check the address we actually ANNOUNCED, which is the
+                    # one every client uses — a worker front pointing at a stale tunnel is invisible
+                    # from here otherwise, and that is exactly how this node spent a day serving 530s.
+                    #
+                    # Only ever re-push and log. Never rebuild the tunnel on this branch: the tunnel
+                    # is demonstrably fine, and minting a new one would churn the hostname forever
+                    # while the actual fault (an expired Cloudflare login) went on being the fault.
+                    if [ -n "$ANNOUNCE_URL" ] && [ "$ANNOUNCE_URL" != "$URL" ]; then
+                        if ! curl -fsS -m 10 -o /dev/null "$ANNOUNCE_URL/heads" 2>/dev/null; then
+                            log "announced address not answering ($ANNOUNCE_URL) — re-pointing it at $URL"
+                            kv_push "$KV_NAMESPACE_ID" "$URL" \
+                                && log "worker backend re-pointed" \
+                                || log "re-point FAILED: $(cat "$XC_HOME/kv-failed" 2>/dev/null)"
+                        fi
+                    fi
                 else
                     DEAD=$((DEAD + 1))
                     log "public URL not answering ($DEAD/3): $URL"
