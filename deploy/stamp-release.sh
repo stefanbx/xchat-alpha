@@ -7,8 +7,14 @@
 # tampered download, and it trains people to shrug off a failed check. So derive all three here and
 # never type them again. deploy.sh runs this during staging, so the page cannot ship stale.
 #
-#   ./deploy/stamp-release.sh            # rewrite backend/download.html in place
-#   ./deploy/stamp-release.sh --check    # verify only; non-zero if the page is stale (for CI)
+# It ALSO stamps the in-app announcement banner, for the same reason. That banner is a separate
+# publisher-signed record, and because nothing tied it to a release it went stale exactly the way the
+# page used to: it advertised "ӾChat 2.3.9 is live — tap to update" through three releases while the
+# update check correctly offered 2.4.3. One release, one place that decides what version we claim.
+#
+#   ./deploy/stamp-release.sh              # rewrite backend/download.html + sign announcement.json
+#   ./deploy/stamp-release.sh --check      # verify only; non-zero if either is stale (for CI)
+#   ./deploy/stamp-release.sh --no-announce  # page only (a release nobody needs telling about)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,7 +33,8 @@ SHA=$(shasum -a 256 "$APK" | cut -d' ' -f1)
 # every number that disagrees with the user's own screen costs trust.
 MB=$(python3 -c "import os;print(f'{os.path.getsize('$APK')/1e6:.1f}')")
 
-python3 - "$PAGE" "$VER" "$MB" "$SHA" "${1:-}" <<'PY'
+MODE="${1:-}"
+python3 - "$PAGE" "$VER" "$MB" "$SHA" "$MODE" <<'PY'
 import re, sys
 page, ver, mb, sha, mode = sys.argv[1:6]
 src = open(page).read()
@@ -52,3 +59,8 @@ else:
         open(page, 'w').write(out)
         print(f'stamp-release: {page} updated -> v{ver} · {mb} MB · {sha[:16]}…')
 PY
+
+# The banner is signed by the same run that stamps the page, so the two can no longer disagree.
+if [ "$MODE" != "--no-announce" ]; then
+    python3 deploy/sign-announcement.py "$VER" $MODE
+fi

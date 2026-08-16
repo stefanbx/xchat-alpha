@@ -44,6 +44,10 @@ fi
 rm -rf deploy/app && mkdir -p deploy/app
 cp backend/*.py deploy/app/
 cp backend/*.html deploy/app/ 2>/dev/null || true   # download/landing page served by the node front door
+# announcement.json — the publisher-signed in-app banner, written by stamp-release.sh. Without this
+# line the file is generated on every release and then silently left behind, so the banner would keep
+# showing whatever was last set by hand. That is the failure this automation exists to end.
+cp backend/*.json deploy/app/ 2>/dev/null || true
 cp relay/xc_relayd.py deploy/app/
 cp relay/install-relay.sh deploy/app/          # served at <node>/relay.sh — the landing page's one-liner
 cp relay/xc_admin.py deploy/app/               # the relay operator's settings page (loopback only)
