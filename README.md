@@ -183,13 +183,36 @@ needs `dart` on PATH and an `ipfs` daemon.)
   It isn't in readable preferences, but a rooted/compromised device running the app can still have it
   decrypted, so treat the phone as the weak point. **Recovery is *only* your seed** — a wallet is a
   random seed, so if you don't save it and the app is reinstalled, its funds are unrecoverable; backup
-  is now **mandatory and verified**, and receiving XNO is gated on it (see whitepaper §11).
+  is **mandatory and verified** before a fresh wallet can be used (see whitepaper §11). Note that
+  *claiming* incoming XNO is deliberately **not** gated on it: the funds are already assigned to your
+  account on the ledger, so refusing to pocket them protects nothing and only hides money you already
+  own. The backup nag sits where you hand out your address instead.
 - **In-app updates need a pinned publisher.** The update-signing key lives outside this repo
   (`xc_release.py keygen` → `~/.xchat/publisher.key`, 0600). With no publisher account pinned, the
   app refuses in-app updates rather than trusting an unknown signer.
 - Network metadata is not private: no onion routing yet, so treat your IP as visible.
 - The only layer that isn't censorship-free is the OS install gate (Android allows sideload/
   self-update; iOS does not) — the app tells you so.
+
+## Roadmap
+
+Honest list of what's known-missing, not a wish list. Each line says why it isn't done.
+
+- **Camera QR scan.** The wallet can *show* a QR to be paid, but can't *read* one — so sending still
+  means pasting a 65-character address. Needs a camera permission and a scanner dependency, and the
+  permission prompt is worth designing rather than bolting on.
+- **Instant receive.** Incoming XNO is claimed automatically, but an external send is only noticed by
+  a 12s poll (in-app tips are event-driven and land immediately). The fix is either folding the
+  receivable total into the feed response the app already fetches, or a websocket — the latter would
+  mean pointing the app at a third-party Nano node, leaking your account to it and reintroducing the
+  chokepoint this design avoids.
+- **DM parity.** No read receipts, typing indicator, reactions, in-conversation search, voice notes
+  or forwarding.
+- **Tor relay-to-relay transport.** Prototyped and reverted. A v3 onion is 62 bytes and the on-chain
+  link holds 32, phones have no Tor client, and a cold onion circuit measured >90s against ~1.2s warm
+  — so it can never sit in a hot path. Worth revisiting if censorship becomes real rather than
+  hypothetical.
+- **P2P media between phones.** Parked: peers won't be paid for serving what relays already give away.
 
 ## License
 

@@ -277,6 +277,7 @@ class Settings {
   int relaySplit;    // % of a tip that rewards the relay serving the media
   int reposterSplit; // % of a tip that rewards whoever reposted it
   bool notifyLike, notifyComment, notifyTip, notifyDm;
+  bool autoReceive;   // claim incoming XNO without being asked — what every Nano wallet does
   int forYouFreshness;      // For You ranking: 0 = popular, 1 = balanced, 2 = latest
   bool forYouBoostFollows;  // boost posts from people you follow
   bool autoSweep;           // auto-forward balance above the safety cap to a savings address
@@ -289,6 +290,7 @@ class Settings {
     this.notifyComment = true,
     this.notifyTip = true,
     this.notifyDm = true,
+    this.autoReceive = true,
     this.forYouFreshness = 1,
     this.forYouBoostFollows = true,
     this.autoSweep = false,
@@ -312,6 +314,7 @@ class SettingsStore {
         notifyComment: m['notifyComment'] ?? true,
         notifyTip: m['notifyTip'] ?? true,
         notifyDm: m['notifyDm'] ?? true,
+        autoReceive: m['autoReceive'] ?? true,
         forYouFreshness: (m['forYouFreshness'] as num?)?.toInt() ?? 1,
         forYouBoostFollows: m['forYouBoostFollows'] ?? true,
         autoSweep: m['autoSweep'] ?? false,
@@ -333,6 +336,7 @@ class SettingsStore {
           'notifyComment': s.notifyComment,
           'notifyTip': s.notifyTip,
           'notifyDm': s.notifyDm,
+          'autoReceive': s.autoReceive,
           'forYouFreshness': s.forYouFreshness,
           'forYouBoostFollows': s.forYouBoostFollows,
           'autoSweep': s.autoSweep,
@@ -1547,16 +1551,34 @@ class Api {
 
   // wallet: claim any pending receivable blocks into the account.
   // ON-DEVICE SIGNED: each receive/open block is built + signed locally, sequentially.
+  // Auto-receive is how every real Nano wallet behaves — Nault ships "Receive Method: automatic" as
+  // the default and keeps manual mode mainly for hardware wallets, where each claim needs an on-device
+  // confirmation. Nano's receivable model is an implementation detail; a user should not have to learn
+  // it to see their own money.
+  //
+  // MIN RECEIVE exists for the same reason Nault has it: Nano gets dusted. Auto-claiming every 1-raw
+  // spam send would mint a receive block — and burn real proof-of-work on our node — for each one.
+  // The floor sits far below a real tip (the default tip is 0.01 XNO) so nothing a person sends is
+  // ever ignored.
+  static final BigInt minReceiveRaw = BigInt.from(10).pow(24);   // 0.000001 XNO, as Nault defaults
+  static bool _receiving = false;                                // no two claims over one frontier
+
   static Future<Map<String, dynamic>?> receive() async {
     final w = gWallet;
     if (w == null) return null;
-    int received = 0;
+    // Overlapping claims build on the SAME frontier, so the second one forks and is rejected. That is
+    // reachable by hand today: the button stays live for the whole ~7s round trip, so a double tap
+    // starts a second pass over the same list.
+    if (_receiving) return {'ok': false, 'busy': true, 'received': 0};
+    _receiving = true;
+    int received = 0, skipped = 0;
     try {
       final rc = await http.get(Uri.parse('$kBase/api/receivables?account=${w.account}'));
       final list = ((jsonDecode(rc.body)['receivables'] as List?) ?? []).cast<Map<String, dynamic>>();
       for (final item in list) {
         final srcHash = '${item['hash']}';                 // the send block we're receiving
         final amt = BigInt.parse('${item['amount']}');
+        if (amt < minReceiveRaw) { skipped++; continue; }  // dust: not worth a block and its PoW
         final st = await accountState(w.account);
         if (st == null) break;
         final opened = st['opened'] == true;
@@ -1567,9 +1589,34 @@ class Api {
         final r = await blockProcess(block, opened ? 'receive' : 'open');
         if (r?['ok'] == true) received++;
       }
-    } catch (_) {}
+    } catch (_) {
+      // fall through: report what DID land rather than losing the count on a late failure
+    } finally {
+      _receiving = false;
+    }
     final st = await accountState(w.account);
-    return {'ok': true, 'received': received, 'balance': st?['balance'] ?? '0'};
+    return {'ok': true, 'received': received, 'skipped': skipped,
+            'balance': st?['balance'] ?? '0'};
+  }
+
+  /// How much is claimable right now, ignoring dust. Drives the "incoming" hint in the wallet, so a
+  /// balance can never silently understate what is already yours.
+  static Future<BigInt> receivableTotal() async {
+    final w = gWallet;
+    if (w == null) return BigInt.zero;
+    try {
+      final rc = await http.get(Uri.parse('$kBase/api/receivables?account=${w.account}'))
+          .timeout(const Duration(seconds: 12));
+      final list = ((jsonDecode(rc.body)['receivables'] as List?) ?? []).cast<Map<String, dynamic>>();
+      var t = BigInt.zero;
+      for (final i in list) {
+        final a = BigInt.tryParse('${i['amount']}') ?? BigInt.zero;
+        if (a >= minReceiveRaw) t += a;
+      }
+      return t;
+    } catch (_) {
+      return BigInt.zero;
+    }
   }
 
   // wallet: read the account's current Nano representative (public RPC read)
@@ -2167,7 +2214,7 @@ class FeedScreen extends StatefulWidget {
   State<FeedScreen> createState() => _FeedScreenState();
 }
 
-class _FeedScreenState extends State<FeedScreen> {
+class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   NanoWallet? _wallet; // on-device signer, built from the local seed — never sent to the node
   List<Post> _posts = [];
   final List<Post> _newPosts = [];        // fetched but held BACK — surfaced via a "new posts" pill,
@@ -2215,6 +2262,7 @@ class _FeedScreenState extends State<FeedScreen> {
   bool _flushing = false;                  // guards _flushOutbox against re-entrancy
   Map<String, dynamic>? _update;           // a newer signed release found by the launch auto-check
   bool _needsBackup = false;               // this wallet's seed isn't confirmed backed up (footgun guard)
+  BigInt _incomingRaw = BigInt.zero;       // claimable right now, shown while it lands
   Set<String> _follows = {};
   Settings _settings = Settings();
   Map<String, dynamic> _engage = {}; // post_id -> {likes, reposts, tips_raw}
@@ -2271,6 +2319,7 @@ class _FeedScreenState extends State<FeedScreen> {
     });
     _loadChannels();
     // keep our own head alive on the relays (republish < TTL); also backfills new relays
+    WidgetsBinding.instance.addObserver(this);   // resume -> claim immediately (see below)
     _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) => Api.republish());
     // quietly poll the feed so posts from OTHER devices appear on their own (no manual refresh)
     _feedTimer = Timer.periodic(const Duration(seconds: 12), (_) => _refreshFeedQuiet());
@@ -2286,8 +2335,21 @@ class _FeedScreenState extends State<FeedScreen> {
     _updateTimer = Timer.periodic(const Duration(minutes: 30), (_) => _autoCheckUpdate());
   }
 
+  // THE trigger that matters. Until now the app did not observe lifecycle at all, so a phone that sat
+  // in a pocket for an hour came back showing a balance that had been wrong the whole time and stayed
+  // wrong until a timer happened to fire. Money that arrived while you were away should be there the
+  // instant you look — that is the moment a person actually checks.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _autoReceive();
+      _refreshDmBadge();
+    }
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _batSub?.cancel();
     _connSub?.cancel();
     _republishTimer?.cancel();
@@ -2316,6 +2378,7 @@ class _FeedScreenState extends State<FeedScreen> {
     // so we can also DROP posts whose head expired / was removed — the incremental slice can't show that.
     final reconcile = (++_pollTick % 5 == 0);
     _refreshDmBadge();   // keep the mail-icon unread count live between full loads
+    _autoReceive();   // 12s backstop; the real triggers are resume, a tip alert, and opening the wallet
     if (_pollTick % 2 == 0) _refreshNotifs();   // ~every 24s: pull notifs + raise Android alerts for new ones
     if (_pollTick % 10 == 0) {   // ~every 2 min: pick up a newly-activated announcement without a relaunch
       Api.announcement().then((a) { if (mounted && a != _announcement) setState(() => _announcement = a); });
@@ -3493,6 +3556,43 @@ class _FeedScreenState extends State<FeedScreen> {
   // Count conversations whose newest INCOMING message is newer than the last time DMs were opened.
   // Runs on launch and on the same quiet cadence as the feed, so a DM that arrives while you're in the
   // app lights the mail icon on its own (matching the bell). Best-effort: a failed poll leaves it as-is.
+  // AUTO-RECEIVE. Nano credits you by leaving a "receivable" block that the recipient must claim; the
+  // balance reads low until they do. Every real wallet hides this — Nault defaults to
+  // "Receive Method: automatic" and keeps manual mainly for hardware wallets. We had only a button,
+  // and a user watched 13.3 XNO sit unclaimed because nothing said it was there or that pressing
+  // anything would help.
+  //
+  // Note this is NOT gated on _needsBackup, unlike the manual button. That gate reads as "don't put
+  // funds into an unrecoverable wallet", but the funds are ALREADY assigned to this account on-chain:
+  // claiming them changes nothing about whether losing the seed loses the money. Blocking the claim
+  // protects nothing and just hides value the user already owns. The backup nag stays; the money
+  // arrives either way.
+  bool _autoReceiving = false;
+  Future<void> _autoReceive() async {
+    if (_autoReceiving || gWallet == null || !_settings.autoReceive) return;
+    _autoReceiving = true;
+    try {
+      final waiting = await Api.receivableTotal();
+      if (waiting == BigInt.zero) return;               // nothing above the dust floor
+      if (mounted) setState(() => _incomingRaw = waiting);
+      final r = await Api.receive();
+      final n = (r?['received'] ?? 0) as int;
+      if (n > 0) {
+        await _load();
+        if (mounted) {
+          setState(() => _incomingRaw = BigInt.zero);
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+              backgroundColor: kCard,
+              content: Text('⬇ received ${(waiting / BigInt.from(10).pow(30)).toStringAsFixed(5)} XNO')));
+        }
+      }
+    } catch (_) {
+    } finally {
+      _autoReceiving = false;
+      if (mounted) setState(() => _incomingRaw = BigInt.zero);
+    }
+  }
+
   Future<void> _refreshDmBadge() async {
     if (gWallet == null) return;
     try {
@@ -4008,6 +4108,7 @@ class _FeedScreenState extends State<FeedScreen> {
       Api.headKeepUntil = await HeadKeep.get(w.account);   // resume any active keep-alive (issuer pin)
       final backed = await BackupStore.get(w.account);     // seed confirmed backed up? (footgun guard)
       if (mounted) setState(() => _needsBackup = !backed);
+      _autoReceive();                                     // claim anything waiting, at launch
     }
     Api.dmKeyRegister();   // publish our signed DM public key so peers can encrypt to us
     _initFollows();
@@ -4202,6 +4303,7 @@ class _FeedScreenState extends State<FeedScreen> {
     String seed = '';
     String? rep; // current representative (fetched lazily)
     bool repFetching = false;
+    _autoReceive();   // you are about to read the balance — make sure it is the true one
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -4232,6 +4334,25 @@ class _FeedScreenState extends State<FeedScreen> {
                           style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
                     ),
                     Text('@$_handle · ${xno.toStringAsFixed(5)} XNO', style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
+                    // Money that is already yours on-chain but not yet pocketed. Auto-receive claims
+                    // it within seconds, so this is usually a blink — but while it IS showing, the
+                    // balance above is understating what you own, and saying nothing is what made
+                    // 13.3 XNO look lost.
+                    if (_incomingRaw > BigInt.zero)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 2),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          const SizedBox(
+                              width: 10, height: 10,
+                              child: CircularProgressIndicator(strokeWidth: 1.6, color: Color(0xFF4DD0A7))),
+                          const SizedBox(width: 6),
+                          Text(
+                            '+${(_incomingRaw / BigInt.from(10).pow(30)).toStringAsFixed(5)} XNO incoming',
+                            style: const TextStyle(
+                                color: Color(0xFF4DD0A7), fontSize: 12, fontWeight: FontWeight.w700),
+                          ),
+                        ]),
+                      ),
                   ]),
                 ),
                 const Icon(Icons.chevron_right, color: kDim),
@@ -4284,26 +4405,11 @@ class _FeedScreenState extends State<FeedScreen> {
                   ]),
                 ),
               )
-            else Center(
-              child: Column(children: [
-                Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
-                  child: QrImageView(
-                    data: _account,
-                    version: QrVersions.auto,
-                    size: 176,
-                    backgroundColor: Colors.white,
-                    eyeStyle: const QrEyeStyle(eyeShape: QrEyeShape.square, color: Colors.black),
-                    dataModuleStyle: const QrDataModuleStyle(
-                        dataModuleShape: QrDataModuleShape.square, color: Colors.black),
-                  ),
-                ),
-                const SizedBox(height: 6),
-                const Text('Scan to send XNO to this account · mainnet',
-                    style: TextStyle(color: kDim, fontSize: 11)),
-              ]),
-            ),
+            else
+              const SizedBox.shrink(),
+            // The QR used to sit inline HERE as well as behind Request — the same code twice, and a
+            // 176px scan target competing with a full-screen one. It lives in the Request sheet now:
+            // one place, big enough to actually scan across a table.
             const SizedBox(height: 14),
             // representative row
             Container(
@@ -4361,27 +4467,17 @@ class _FeedScreenState extends State<FeedScreen> {
               ),
               const SizedBox(width: 10),
               Expanded(
+                // REQUEST, not "receive". Claiming is automatic now, so a button that ran it was
+                // exposing Nano's receivable model as a chore: it read as "fetch my money", did
+                // nothing visible for ~7s, and stayed tappable the whole time so a second press
+                // forked the frontier. What a person actually wants here is to BE PAID — show them
+                // the address to hand over.
                 child: OutlinedButton.icon(
-                  onPressed: () async {
-                    if (_needsBackup) {   // don't claim funds into an unrecoverable wallet — back up first
-                      Navigator.pop(ctx); _showBackupSheet(); return;
-                    }
-                    final r = await Api.receive();
-                    await _load();
-                    if (mounted) setSheet(() {});
-                    if (!mounted) return;
-                    final n = (r?['received'] ?? 0) as int;
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                        backgroundColor: kCard,
-                        content: Text(n > 0
-                            ? '⬇ claimed $n incoming block${n == 1 ? '' : 's'}'
-                            : 'nothing to receive right now')));
-                  },
-                  style: OutlinedButton.styleFrom(
-                      foregroundColor: _needsBackup ? kDim : kText,
-                      side: BorderSide(color: _needsBackup ? const Color(0xFFE0A63A).withOpacity(0.5) : kLine)),
-                  icon: Icon(_needsBackup ? Icons.lock_outline : Icons.arrow_downward, size: 18),
-                  label: const Text('Receive', style: TextStyle(fontWeight: FontWeight.w800)),
+                  onPressed: () { Navigator.pop(ctx); _showRequest(); },
+                  style: OutlinedButton.styleFrom(foregroundColor: kText,
+                      side: const BorderSide(color: kLine)),
+                  icon: const Icon(Icons.qr_code_2, size: 18),
+                  label: const Text('Request', style: TextStyle(fontWeight: FontWeight.w800)),
                 ),
               ),
             ]),
@@ -4806,6 +4902,8 @@ class _FeedScreenState extends State<FeedScreen> {
               toggle('Comments', 'Android alert when someone comments', _settings.notifyComment, (v) => _settings.notifyComment = v),
               toggle('Tips', 'Android alert when someone tips you', _settings.notifyTip, (v) => _settings.notifyTip = v),
               toggle('Messages', 'Android alert when a DM arrives', _settings.notifyDm, (v) => _settings.notifyDm = v),
+              toggle('Auto-receive', 'pocket incoming XNO without asking (what other Nano wallets do)',
+                  _settings.autoReceive, (v) => _settings.autoReceive = v),
 
               section('Privacy'),
               ListTile(
@@ -5495,6 +5593,9 @@ class _FeedScreenState extends State<FeedScreen> {
           : kind == 'tip' ? _settings.notifyTip
           : false;                                     // only the 3 user-activatable types
       if (!on) continue;
+      // A tip alert is not a hint that money MIGHT be waiting — it is the sender telling us they paid.
+      // Treat it as the trigger it is; the 12s backstop then has nothing left to find.
+      if (kind == 'tip') _autoReceive();
       final title = kind == 'tip' ? '◈ New tip' : kind == 'like' ? '❤ New like' : '💬 New comment';
       Notifs.show('${n['from']}$ts'.hashCode & 0x7fffffff, title, '${n['text']}');
     }
@@ -5949,6 +6050,92 @@ class _FeedScreenState extends State<FeedScreen> {
   }
 
   // Show-seed → verify flow for an EXISTING wallet that never confirmed a backup (the footgun guard).
+  // REQUEST FUNDS: the address someone needs in order to pay you, as a QR and as text. This is what
+  // "Receive" means in a wallet people already know how to use — not a button that claims blocks.
+  // Anything sent here is pocketed automatically (see _autoReceive), so there is no follow-up step
+  // and nothing for the user to remember.
+  void _showRequest() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: kBg,
+      builder: (ctx) => SafeArea(
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 28),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const Text('Request XNO',
+                  style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 18)),
+              const SizedBox(height: 6),
+              const Text('Scan or copy. It arrives on its own — nothing to tap afterwards.',
+                  textAlign: TextAlign.center, style: TextStyle(color: kDim, fontSize: 12.5)),
+              const SizedBox(height: 18),
+              // A white quiet-zone is part of the QR spec, not decoration: scanners need the contrast,
+              // and on this app's black background a bare QR is unreadable by most phone cameras.
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
+                child: QrImageView(
+                  data: 'nano:$_account',            // the nano: URI other wallets already parse
+                  version: QrVersions.auto,
+                  size: 220,
+                  backgroundColor: Colors.white,
+                  errorCorrectionLevel: QrErrorCorrectLevel.M,
+                ),
+              ),
+              const SizedBox(height: 18),
+              // Plain Text, not SelectableText: the latter painted NOTHING here under Impeller on the
+              // emulator — no exception, just an empty gap where a 65-char address should be. Selection
+              // buys nothing anyway when there is a Copy button right below it, so this trades a widget
+              // that can silently fail to render for one that cannot.
+              Text(_account,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: kText, fontSize: 12.5, fontFamily: 'monospace', height: 1.45)),
+              const SizedBox(height: 16),
+              Row(children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: () { _copy(_account, 'Address'); Navigator.pop(ctx); },
+                    style: FilledButton.styleFrom(backgroundColor: kAccent, foregroundColor: Colors.black),
+                    icon: const Icon(Icons.copy, size: 18),
+                    label: const Text('Copy address', style: TextStyle(fontWeight: FontWeight.w800)),
+                  ),
+                ),
+              ]),
+              // The backup nag belongs HERE — at the moment you invite money in — rather than in front
+              // of a claim. Blocking a claim never protected anything: the funds are already assigned
+              // to this account on-chain, so losing the seed loses them whether or not they were
+              // pocketed. What actually helps is saying so before more arrives.
+              if (_needsBackup) ...[
+                const SizedBox(height: 14),
+                InkWell(
+                  onTap: () { Navigator.pop(ctx); _showBackupSheet(); },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    decoration: BoxDecoration(
+                        color: const Color(0xFFE0A63A).withValues(alpha: 0.10),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0xFFE0A63A).withValues(alpha: 0.45))),
+                    child: Row(children: [
+                      const Icon(Icons.warning_amber_rounded, size: 18, color: Color(0xFFE0A63A)),
+                      const SizedBox(width: 10),
+                      const Expanded(
+                        child: Text('Back up your seed first — without it this wallet cannot be recovered.',
+                            style: TextStyle(color: Color(0xFFE0A63A), fontSize: 12.5)),
+                      ),
+                      const Icon(Icons.chevron_right, size: 18, color: Color(0xFFE0A63A)),
+                    ]),
+                  ),
+                ),
+              ],
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+
   void _showBackupSheet() {
     final w = _wallet;
     if (w == null) return;
