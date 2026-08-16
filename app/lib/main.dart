@@ -26,6 +26,8 @@ import 'package:nanodart/nanodart.dart' show Blake2b, NanoHelpers;   // Blake2b 
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:crypto/crypto.dart' show sha256;
+import 'package:url_launcher/url_launcher.dart';
+import 'body.dart';
 import 'wallet.dart';
 import 'ledger_discovery.dart';
 
@@ -8425,14 +8427,21 @@ class PostCard extends StatefulWidget {
   State<PostCard> createState() => _PostCardState();
 }
 
-// @mentions and #hashtags — the two things a timeline is made of on X, and neither existed here:
-// a mention was grey text you could not tap, so there was no way to pull someone into a thread, and a
-// tag was not a thing at all.
-//
-// Deliberately conservative about what counts. A trailing '.' or ',' is punctuation, not part of the
-// name; an email address is not a mention; a bare '#' is not a tag. Over-matching is worse than
-// under-matching here, because every false positive turns ordinary prose into a wrong link.
-final RegExp _entityRe = RegExp(r'(?<![\w@])@([A-Za-z0-9_.-]{2,32})|(?<![\w#])#([A-Za-z0-9_]{1,48})');
+/// Hand a URL to the system browser. EXTERNAL, deliberately: an in-app webview would put our chrome
+/// around somebody else's page, which is exactly the shape a phishing page wants, and it would carry
+/// our cookies and our process into content we did not write.
+Future<void> openLink(String url) async {
+  final u = Uri.tryParse(url);
+  // Belt and braces. scanBody's grammar cannot emit anything but http/https, so this can only fire if
+  // a future caller passes a URL from somewhere else — and `javascript:`/`intent:` handed to the OS
+  // launcher is the one mistake here worth making structurally impossible.
+  if (u == null || (u.scheme != 'http' && u.scheme != 'https')) return;
+  try {
+    await launchUrl(u, mode: LaunchMode.externalApplication);
+  } catch (_) {
+    // No browser installed, or the OS refused. Nothing useful to say to the reader.
+  }
+}
 
 class _PostCardState extends State<PostCard> {
   // TapGestureRecognizers in a TextSpan are NOT owned by the span: they leak unless disposed. Held
@@ -8447,38 +8456,43 @@ class _PostCardState extends State<PostCard> {
     super.dispose();
   }
 
-  /// Post body with mentions and tags marked and tappable. Plain text when neither appears, so the
+  /// Post body with links, mentions and tags marked and tappable. Plain text when none appears, so the
   /// common post pays nothing.
   Widget _richBody(String text, TextStyle base) {
-    final matches = _entityRe.allMatches(text).toList();
-    if (matches.isEmpty) return Text(text, style: base, maxLines: null);
+    final tokens = scanBody(text);
+    if (!tokens.any((t) => t.kind != BodyKind.text)) return Text(text, style: base, maxLines: null);
     for (final t in _taps) {
       t.dispose();
     }
     _taps.clear();
     final spans = <TextSpan>[];
-    var i = 0;
-    for (final m in matches) {
-      if (m.start > i) spans.add(TextSpan(text: text.substring(i, m.start)));
-      final handle = m.group(1);
-      final tag = m.group(2);
+    for (final t in tokens) {
+      if (t.kind == BodyKind.text) {
+        spans.add(TextSpan(text: t.text));
+        continue;
+      }
       final rec = TapGestureRecognizer()
         ..onTap = () {
-          if (handle != null) {
-            widget.onTapHandle?.call(handle);
-          } else if (tag != null) {
-            widget.onTapTag?.call(tag);
+          switch (t.kind) {
+            case BodyKind.link:
+              openLink(t.value);
+            case BodyKind.mention:
+              widget.onTapHandle?.call(t.value);
+            case BodyKind.tag:
+              widget.onTapTag?.call(t.value);
+            case BodyKind.text:
+              break;
           }
         };
       _taps.add(rec);
       spans.add(TextSpan(
-        text: text.substring(m.start, m.end),
+        // The text shown is the text WRITTEN. A link never displays one destination and opens
+        // another — the reader's only defence against a hostile post is that the URL is the URL.
+        text: t.text,
         style: const TextStyle(color: kAccent, fontWeight: FontWeight.w600),
         recognizer: rec,
       ));
-      i = m.end;
     }
-    if (i < text.length) spans.add(TextSpan(text: text.substring(i)));
     return RichText(text: TextSpan(style: base, children: spans));
   }
 
