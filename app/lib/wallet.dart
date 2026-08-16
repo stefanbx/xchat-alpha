@@ -145,17 +145,35 @@ class NanoWallet {
   /// This device's DM public key (published in a signed record so peers can encrypt to us).
   String get dmPub => _hexOfBytes(_dmKey.publicKey);
 
+  // A Box's shared secret is an X25519 scalar multiplication over (our key, their key), and it is
+  // CONSTANT for the life of a conversation. Every seal/open built a fresh one, so a poll over 32
+  // messages did 32 scalar multiplications — every 5 seconds in an open thread, plus again every 12s
+  // for the home-screen badge, with the results discarded each time.
+  //
+  // Safe to cache because it is keyed BY PEER and skips no verification: opening with the wrong
+  // peer's Box still fails the Poly1305 MAC and returns null. That distinction matters — caching the
+  // decrypted PLAINTEXT in here instead, keyed by ciphertext alone, broke "a DM opens for its
+  // recipient and nobody else" by handing the message to any caller. Plaintext caching belongs in the
+  // layer that already knows which peer a ciphertext came from, not in the primitive.
+  //
+  // INSTANCE field, not static. A static map is keyed by the PEER only, so it silently hands one
+  // wallet the Box built from a DIFFERENT wallet's private key — the second NanoWallet in a process
+  // would decrypt with the first one's identity. wallet_test.dart caught it on the first run, same as
+  // it caught the plaintext-cache attempt. Per instance, the key is unambiguous.
+  final Map<String, pnacl.Box> _boxes = {};
+  pnacl.Box _boxFor(String peerPkHex) => _boxes.putIfAbsent(
+      peerPkHex,
+      () => pnacl.Box(myPrivateKey: _dmKey, theirPublicKey: pnacl.PublicKey(_bytesOfHex(peerPkHex))));
+
   /// Seal a plaintext for a peer's DM public key → base64(nonce+ciphertext). The seed never leaves.
   String dmSeal(String peerPkHex, String text) {
-    final box = pnacl.Box(myPrivateKey: _dmKey, theirPublicKey: pnacl.PublicKey(_bytesOfHex(peerPkHex)));
-    return base64.encode(box.encrypt(Uint8List.fromList(utf8.encode(text))));
+    return base64.encode(_boxFor(peerPkHex).encrypt(Uint8List.fromList(utf8.encode(text))));
   }
 
   /// Open a base64(nonce+ciphertext) from/for a peer's DM public key → plaintext, or null if not ours.
   String? dmOpen(String peerPkHex, String b64) {
     try {
-      final box = pnacl.Box(myPrivateKey: _dmKey, theirPublicKey: pnacl.PublicKey(_bytesOfHex(peerPkHex)));
-      return utf8.decode(box.decrypt(pnacl.EncryptedMessage.fromList(base64.decode(b64))));
+      return utf8.decode(_boxFor(peerPkHex).decrypt(pnacl.EncryptedMessage.fromList(base64.decode(b64))));
     } catch (_) {
       return null;
     }
@@ -170,15 +188,13 @@ class NanoWallet {
 
   /// Seal raw bytes for a peer → raw (nonce+ciphertext) bytes, ready to store as a blob.
   Uint8List dmSealBytes(String peerPkHex, Uint8List bytes) {
-    final box = pnacl.Box(myPrivateKey: _dmKey, theirPublicKey: pnacl.PublicKey(_bytesOfHex(peerPkHex)));
-    return Uint8List.fromList(box.encrypt(bytes));
+    return Uint8List.fromList(_boxFor(peerPkHex).encrypt(bytes));
   }
 
   /// Open raw (nonce+ciphertext) bytes from/for a peer → the original bytes, or null if not ours.
   Uint8List? dmOpenBytes(String peerPkHex, Uint8List sealed) {
     try {
-      final box = pnacl.Box(myPrivateKey: _dmKey, theirPublicKey: pnacl.PublicKey(_bytesOfHex(peerPkHex)));
-      return Uint8List.fromList(box.decrypt(pnacl.EncryptedMessage.fromList(sealed)));
+      return Uint8List.fromList(_boxFor(peerPkHex).decrypt(pnacl.EncryptedMessage.fromList(sealed)));
     } catch (_) {
       return null;
     }

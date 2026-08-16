@@ -6,6 +6,7 @@
 // from its own side, so a stray space here is a rejected post there), and a DM only opens for the
 // peer it was sealed to.
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xchat/wallet.dart';
 
@@ -74,5 +75,41 @@ void main() {
     // the DM keypair is separate from the Nano one, and a third party cannot open the box
     expect(a.dmPub, isNot(a.pub));
     expect(NanoWallet('99' * 32).dmOpen(a.dmPub, sealed), isNull);
+  });
+
+  // The Box (X25519 shared secret) is cached per peer so a poll does not redo a scalar
+  // multiplication per message. Two attempts at that caching broke this file, so the cached PATH gets
+  // its own test rather than relying on another case happening to touch it first:
+  //   - caching the decrypted PLAINTEXT keyed by ciphertext handed the message to any caller;
+  //   - caching the Box in a STATIC map handed one wallet the Box built from another's private key.
+  test('caching the DM box does not leak across wallets or repeated opens', () {
+    final a = NanoWallet(seedA), b = NanoWallet(seedB), c = NanoWallet('77' * 32);
+    final sealed = a.dmSeal(b.dmPub, 'meet at six');
+
+    // warm the cache on both sides, then repeat — a second open must still be correct
+    expect(b.dmOpen(a.dmPub, sealed), 'meet at six');
+    expect(b.dmOpen(a.dmPub, sealed), 'meet at six');
+
+    // c asks about the SAME ciphertext and the same peer key, after the cache is warm. It must get
+    // nothing: c is not the recipient, and no cache may shortcut that.
+    expect(c.dmOpen(a.dmPub, sealed), isNull);
+    expect(c.dmOpen(b.dmPub, sealed), isNull);
+
+    // and b, having now been asked about other peers, still opens its own message
+    expect(b.dmOpen(a.dmPub, sealed), 'meet at six');
+
+    // a sealed message to c is unreadable by b even once b's cache holds a box for that peer
+    final forC = a.dmSeal(c.dmPub, 'not for you');
+    expect(c.dmOpen(a.dmPub, forC), 'not for you');
+    expect(b.dmOpen(a.dmPub, forC), isNull);
+  });
+
+  test('byte attachments seal and open through the same cached box', () {
+    final a = NanoWallet(seedA), b = NanoWallet(seedB);
+    final bytes = Uint8List.fromList(List<int>.generate(2048, (i) => i % 256));
+    final sealed = a.dmSealBytes(b.dmPub, bytes);
+    expect(b.dmOpenBytes(a.dmPub, sealed), bytes);
+    expect(b.dmOpenBytes(a.dmPub, sealed), bytes);          // repeat: cache path
+    expect(NanoWallet('55' * 32).dmOpenBytes(a.dmPub, sealed), isNull);
   });
 }
