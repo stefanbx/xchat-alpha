@@ -7137,12 +7137,111 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
     _load();
   }
 
+  List<GroupChat> _groups = [];
+
   Future<void> _load() async {
     final c = await Api.dmInbox();
     if (mounted) setState(() {
       _convos = c.where((x) => !widget.isBlocked('${x['peer']}')).toList();
+      // Groups are derived from the SAME messages, before the block filter — a group you are in is
+      // not dissolved because you blocked one of its members; their envelopes simply stop arriving.
+      _groups = GroupChat.extract(c);
       _loading = false;
     });
+  }
+
+  /// The name this person is shown under everywhere else in the app.
+  ///
+  /// NOT the posting handle: most accounts still carry the default 'you.xno', so a member picker
+  /// built on handles lists three different people as "you.xno" while the conversation right above
+  /// it says "Jiován". Same source as the inbox rows, plus the account discriminator so two people
+  /// who chose the same display name are still distinguishable — which in a member picker is the
+  /// difference between messaging your friend and messaging a stranger.
+  String _handleOf(String account) {
+    final h = widget.handleOf(account);
+    final n = ProfileCache.I.displayName(account, h);
+    return n.isNotEmpty && n != 'you.xno' ? n : '${h.isEmpty ? "account" : h} ·${acctTag(account)}';
+  }
+
+  Future<void> _newGroup() async {
+    final peers = _convos.map((c) => '${c['peer']}').toList();
+    if (peers.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Message someone first — a group is built from people you can already '
+              'reach.')));
+      return;
+    }
+    final nameCtl = TextEditingController();
+    final picked = <String>{};
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          backgroundColor: kCard,
+          title: const Text('New group', style: TextStyle(color: kText)),
+          content: SizedBox(
+            width: 320,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              TextField(
+                controller: nameCtl,
+                style: const TextStyle(color: kText),
+                decoration: const InputDecoration(
+                    hintText: 'Group name', hintStyle: TextStyle(color: kDim)),
+              ),
+              const SizedBox(height: 8),
+              Flexible(
+                child: ListView(
+                  shrinkWrap: true,
+                  children: [
+                    for (final p in peers)
+                      CheckboxListTile(
+                        dense: true,
+                        value: picked.contains(p),
+                        onChanged: (v) => setD(() =>
+                            v == true ? picked.add(p) : picked.remove(p)),
+                        title: Text(_handleOf(p),
+                            style: const TextStyle(color: kText, fontSize: 14)),
+                      ),
+                  ],
+                ),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel', style: TextStyle(color: kDim))),
+            TextButton(onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Create', style: TextStyle(color: kAccent))),
+          ],
+        ),
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final name = nameCtl.text.trim();
+    if (name.isEmpty || picked.isEmpty) return;
+    final me = gWallet?.account;
+    if (me == null) return;
+    // The creator is always a member. Not a courtesy — the sender re-reads their own history off a
+    // relay like everyone else, so a group you cannot address yourself is one you cannot re-read.
+    final members = <String>{me, ...picked}.toList()..sort();
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final gid = NanoWallet.groupId(me, name, ts);
+    // A group only exists once a message announces it: there is no group record to publish, so the
+    // first message IS the creation. Sending it here means the others see the group immediately
+    // rather than when you first happen to speak.
+    final r = await Api.groupSend(gid, name, members, 'created the group');
+    if (!mounted) return;
+    if (r['ok'] != true) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${r['error'] ?? 'could not create the group'}')));
+      return;
+    }
+    await _load();
+    if (!mounted) return;
+    final g = _groups.firstWhere((x) => x.gid == gid,
+        orElse: () => GroupChat(gid, name, members, [], ts));
+    Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => GroupChatScreen(group: g, handleOf: _handleOf)));
   }
 
   @override
@@ -7152,6 +7251,13 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
       appBar: AppBar(
         backgroundColor: kBg, elevation: 0, iconTheme: const IconThemeData(color: kText),
         title: const Text('Messages', style: TextStyle(color: kText, fontWeight: FontWeight.w800)),
+        actions: [
+          IconButton(
+            onPressed: _newGroup,
+            tooltip: 'New group',
+            icon: const Icon(Icons.group_add_outlined, color: kText),
+          ),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(24),
           child: Container(width: double.infinity, color: const Color(0xFF07130E),
@@ -7162,16 +7268,44 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
       ),
       body: _loading
           ? const Center(child: CircularProgressIndicator(color: kAccent))
-          : _convos.isEmpty
+          : (_convos.isEmpty && _groups.isEmpty)
               ? const Center(child: Padding(padding: EdgeInsets.all(40),
                   child: Text('No messages yet.\nOpen someone’s profile and tap Message.',
                       textAlign: TextAlign.center, style: TextStyle(color: kDim, height: 1.5))))
               : RefreshIndicator(
                   color: kAccent, backgroundColor: kCard, onRefresh: _load,
                   child: ListView.separated(
-                    itemCount: _convos.length,
+                    // Groups first, then one-to-one. Both are conversations; the header is what
+                    // stops a group reading as a person with an odd name.
+                    itemCount: _groups.length + _convos.length,
                     separatorBuilder: (_, __) => Container(color: kLine, height: 1),
-                    itemBuilder: (_, i) {
+                    itemBuilder: (_, idx) {
+                      if (idx < _groups.length) {
+                        final g = _groups[idx];
+                        return ListTile(
+                          onTap: () async {
+                            await Navigator.of(context).push(MaterialPageRoute(
+                                builder: (_) =>
+                                    GroupChatScreen(group: g, handleOf: _handleOf)));
+                            _load();
+                          },
+                          leading: CircleAvatar(
+                            radius: 22,
+                            backgroundColor: kCard,
+                            child: const Icon(Icons.groups_outlined, color: kAccent, size: 22),
+                          ),
+                          title: Text(g.name.isEmpty ? 'Group' : g.name,
+                              style: const TextStyle(
+                                  color: kText, fontWeight: FontWeight.w700)),
+                          subtitle: Text(
+                              '${g.members.length} members · ${g.msgs.length} messages',
+                              maxLines: 1, overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: kDim, fontSize: 13)),
+                          trailing: Text(timeAgo(g.newestTs),
+                              style: const TextStyle(color: kDim, fontSize: 12)),
+                        );
+                      }
+                      final i = idx - _groups.length;
                       final c = _convos[i];
                       final peer = '${c['peer']}';
                       final handle = widget.handleOf(peer);
@@ -10707,6 +10841,240 @@ class QuotedCard extends StatelessWidget {
                     SizedBox(width: 5), Text('movie', style: TextStyle(color: kDim, fontSize: 12))])),
         ]),
       ),
+    );
+  }
+}
+
+// ---- GROUPS: a view over the DMs that already arrived --------------------------------------------
+//
+// There is no group store and no group fetch. A group message IS a DM carrying an envelope, so the
+// inbox the app already has contains everything: scanning it yields the groups you are in, who is in
+// them and what was said. That is why groups needed no relay change, no node change and no new poll —
+// and why a group appears on a reinstall as soon as your DMs do.
+
+class GroupChatMsg {
+  final String from, cid, key;
+  final int ts;
+  const GroupChatMsg(this.from, this.ts, this.cid, this.key);
+}
+
+class GroupChat {
+  final String gid;
+  String name;
+  List<String> members;
+  final List<GroupChatMsg> msgs;
+  int newestTs;
+  GroupChat(this.gid, this.name, this.members, this.msgs, this.newestTs);
+
+  /// Groups, newest first, built from the conversation list.
+  ///
+  /// Membership and name are LAST-WRITER-WINS: the newest envelope seen for a group decides both.
+  /// With no coordinator there is nothing better to do, and pretending otherwise would be worse than
+  /// saying so — see the note on GroupMsg.
+  static List<GroupChat> extract(List<Map<String, dynamic>> convos) {
+    final by = <String, GroupChat>{};
+    final seen = <String, Set<String>>{};       // gid -> cids already taken
+    for (final c in convos) {
+      for (final m in ((c['messages'] as List?) ?? const [])) {
+        final env = GroupMsg.parse('${m['text']}');
+        if (env == null) continue;
+        final ts = (m['ts'] as int?) ?? 0;
+        final g = by.putIfAbsent(env.gid,
+            () => GroupChat(env.gid, env.name, env.members, [], 0));
+        // The SAME message reaches us once per conversation it was addressed through — our own copy
+        // and, for anything we sent, one per recipient. The cid names the content, so it is what
+        // makes a message one message.
+        final cids = seen.putIfAbsent(env.gid, () => <String>{});
+        if (cids.add(env.cid)) {
+          g.msgs.add(GroupChatMsg('${m['outgoing'] == true ? '' : c['peer']}', ts, env.cid, env.key));
+        }
+        if (ts >= g.newestTs) {
+          g.newestTs = ts;
+          if (env.name.isNotEmpty) g.name = env.name;
+          if (env.members.isNotEmpty) g.members = env.members;
+        }
+      }
+    }
+    final out = by.values.toList();
+    for (final g in out) {
+      g.msgs.sort((a, b) => a.ts.compareTo(b.ts));
+    }
+    out.sort((a, b) => b.newestTs.compareTo(a.newestTs));
+    return out;
+  }
+}
+
+class GroupChatScreen extends StatefulWidget {
+  const GroupChatScreen({super.key, required this.group, required this.handleOf});
+  final GroupChat group;
+  final String Function(String account) handleOf;
+  @override
+  State<GroupChatScreen> createState() => _GroupChatScreenState();
+}
+
+class _GroupChatScreenState extends State<GroupChatScreen> {
+  // cid -> plaintext, process-wide. The content lives in a blob, so without this every rebuild
+  // re-fetches and re-decrypts the whole conversation.
+  static final Map<String, String> _body = {};
+  final _ctl = TextEditingController();
+  final _scroll = ScrollController();
+  bool _sending = false;
+  String? _err;
+  late GroupChat _g = widget.group;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchAll();
+  }
+
+  @override
+  void dispose() {
+    _ctl.dispose();
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  Future<void> _fetchAll() async {
+    for (final m in _g.msgs) {
+      if (_body.containsKey(m.cid)) continue;
+      final t = await Api.groupText(m.cid, m.key);
+      if (!mounted) return;
+      // A message whose blob is gone is marked as such rather than left blank — an empty bubble
+      // reads as "they sent nothing", which is a different and wrong claim.
+      setState(() => _body[m.cid] = t ?? '');
+    }
+    _toBottom();
+  }
+
+  void _toBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
+    });
+  }
+
+  Future<void> _send() async {
+    final text = _ctl.text.trim();
+    if (text.isEmpty || _sending) return;
+    setState(() { _sending = true; _err = null; });
+    final r = await Api.groupSend(_g.gid, _g.name, _g.members, text);
+    if (!mounted) return;
+    if (r['ok'] == true) {
+      _ctl.clear();
+      // Report a PARTIAL send instead of showing a tick. "Sent to 4 of 5" is the truth, and the one
+      // person who did not get it is exactly what the sender needs to know.
+      final sent = r['sent'] as int, of = r['of'] as int;
+      setState(() {
+        _sending = false;
+        _err = sent < of ? 'sent to $sent of $of — the rest have not enabled DMs' : null;
+      });
+    } else {
+      setState(() { _sending = false; _err = '${r['error'] ?? 'send failed'}'; });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: kBg,
+      appBar: AppBar(
+        backgroundColor: kBg, elevation: 0, iconTheme: const IconThemeData(color: kText),
+        title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(_g.name.isEmpty ? 'Group' : _g.name,
+              style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+          Text('🔐 ${_g.members.length} members',
+              style: const TextStyle(color: Color(0xFF4DD0A7), fontSize: 11.5)),
+        ]),
+      ),
+      body: Column(children: [
+        Expanded(
+          child: _g.msgs.isEmpty
+              ? const Center(child: Text('No messages yet.', style: TextStyle(color: kDim)))
+              : ListView.builder(
+                  controller: _scroll,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  itemCount: _g.msgs.length,
+                  itemBuilder: (_, i) {
+                    final m = _g.msgs[i];
+                    final out = m.from.isEmpty;
+                    final txt = _body[m.cid];
+                    return Align(
+                      alignment: out ? Alignment.centerRight : Alignment.centerLeft,
+                      child: Container(
+                        margin: const EdgeInsets.only(top: 6),
+                        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+                        constraints: BoxConstraints(
+                            maxWidth: MediaQuery.of(context).size.width * 0.78),
+                        decoration: BoxDecoration(
+                            color: out ? kAccent : kCard,
+                            borderRadius: BorderRadius.circular(16)),
+                        child: Column(
+                          crossAxisAlignment:
+                              out ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            // Who said it. In a group this is not decoration — without it a
+                            // conversation between four people is unreadable.
+                            if (!out)
+                              Text(widget.handleOf(m.from),
+                                  style: const TextStyle(
+                                      fontSize: 11, fontWeight: FontWeight.w700, color: kAccent)),
+                            Text(
+                              txt == null
+                                  ? '…'
+                                  : (txt.isEmpty ? 'message unavailable' : txt),
+                              style: TextStyle(
+                                  color: out ? Colors.black : kText,
+                                  fontSize: 15,
+                                  height: 1.3,
+                                  fontStyle: txt != null && txt.isEmpty
+                                      ? FontStyle.italic
+                                      : FontStyle.normal),
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+        if (_err != null)
+          Container(
+            width: double.infinity, color: const Color(0xFF2A1A00),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+            child: Text(_err!, style: const TextStyle(color: Color(0xFFFFC46B), fontSize: 12)),
+          ),
+        SafeArea(
+          top: false,
+          child: Container(
+            decoration: const BoxDecoration(
+                color: kCard, border: Border(top: BorderSide(color: kLine))),
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(children: [
+              Expanded(
+                child: TextField(
+                  controller: _ctl,
+                  style: const TextStyle(color: kText, fontSize: 15),
+                  minLines: 1, maxLines: 5,
+                  onSubmitted: (_) => _send(),
+                  decoration: const InputDecoration(
+                      hintText: 'Encrypted message…',
+                      hintStyle: TextStyle(color: kDim), border: InputBorder.none,
+                      contentPadding: EdgeInsets.symmetric(horizontal: 6, vertical: 12)),
+                ),
+              ),
+              _sending
+                  ? const Padding(padding: EdgeInsets.all(10),
+                      child: SizedBox(height: 20, width: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: kAccent)))
+                  : IconButton(
+                      onPressed: _send,
+                      tooltip: 'Send to the group',
+                      icon: const Icon(Icons.send, color: kAccent)),
+            ]),
+          ),
+        ),
+      ]),
     );
   }
 }

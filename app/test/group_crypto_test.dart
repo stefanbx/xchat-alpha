@@ -17,7 +17,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:xchat/main.dart' show GroupMsg;
+import 'package:xchat/main.dart' show DmCtl, GroupChat, GroupMsg;
 import 'package:xchat/wallet.dart';
 
 void main() {
@@ -206,6 +206,8 @@ void main() {
     });
   });
 
+  _extractTests();
+
   group('bad input is refused, not thrown', () {
     test('a corrupt ciphertext yields null', () {
       expect(alice.groupTextOpen('ff' * 32, 'not-base64-!!'), isNull);
@@ -214,6 +216,118 @@ void main() {
       final s = alice.groupTextSeal('x');
       expect(alice.groupTextOpen('nothex', s.ct), isNull);
       expect(alice.groupTextOpen('ff', s.ct), isNull);
+    });
+  });
+}
+
+// ---- building the group list out of the DMs that already arrived --------------------------------
+
+void _extractTests() {
+  Map<String, dynamic> env(String gid, String name, String cid, List<String> members,
+          {int ts = 100, bool outgoing = false}) =>
+      {
+        'text': GroupMsg(gid: gid, name: name, cid: cid, key: 'ff' * 32, members: members).encode(),
+        'ts': ts,
+        'outgoing': outgoing,
+      };
+
+  group('GroupChat.extract', () {
+    test('a group appears from its messages alone — nothing else is stored', () {
+      final g = GroupChat.extract([
+        {'peer': 'nano_1alice', 'messages': [env('g1', 'friends', 'c1', ['nano_1alice', 'nano_1me'])]}
+      ]);
+      expect(g.length, 1);
+      expect(g.first.gid, 'g1');
+      expect(g.first.name, 'friends');
+      expect(g.first.members, ['nano_1alice', 'nano_1me']);
+      expect(g.first.msgs.length, 1);
+    });
+
+    test('THE SAME message arriving through several conversations counts once', () {
+      // This is the one that bites. A message we SENT is delivered once per recipient, so our own
+      // copy of it turns up in every one of those conversations. Without deduping by cid, a group of
+      // five shows every outgoing message five times.
+      final e = env('g1', 'f', 'samecid', ['a', 'b', 'c'], outgoing: true);
+      final g = GroupChat.extract([
+        {'peer': 'nano_1a', 'messages': [e]},
+        {'peer': 'nano_1b', 'messages': [e]},
+        {'peer': 'nano_1c', 'messages': [e]},
+      ]);
+      expect(g.first.msgs.length, 1);
+    });
+
+    test('different messages are kept, and ordered oldest first', () {
+      final g = GroupChat.extract([
+        {'peer': 'nano_1a', 'messages': [
+          env('g1', 'f', 'c2', ['a'], ts: 200),
+          env('g1', 'f', 'c1', ['a'], ts: 100),
+          env('g1', 'f', 'c3', ['a'], ts: 300),
+        ]}
+      ]);
+      expect(g.first.msgs.map((m) => m.cid).toList(), ['c1', 'c2', 'c3']);
+    });
+
+    test('the NEWEST envelope decides the name and the membership', () {
+      // Last-writer-wins, stated in one place and tested in another. An older envelope must not be
+      // able to resurrect a member who was removed since.
+      final g = GroupChat.extract([
+        {'peer': 'nano_1a', 'messages': [
+          env('g1', 'old name', 'c1', ['a', 'b', 'c'], ts: 100),
+          env('g1', 'new name', 'c2', ['a', 'b'], ts: 200),
+        ]}
+      ]);
+      expect(g.first.name, 'new name');
+      expect(g.first.members, ['a', 'b']);
+    });
+
+    test('an older envelope arriving LATE does not overwrite a newer one', () {
+      // Relays gossip, so order of arrival is not order of sending. Deciding by ts rather than by
+      // position is what makes that harmless.
+      final g = GroupChat.extract([
+        {'peer': 'nano_1a', 'messages': [
+          env('g1', 'new name', 'c2', ['a', 'b'], ts: 200),
+          env('g1', 'old name', 'c1', ['a', 'b', 'c'], ts: 100),
+        ]}
+      ]);
+      expect(g.first.name, 'new name');
+      expect(g.first.members, ['a', 'b']);
+    });
+
+    test('several groups are separated, newest first', () {
+      final g = GroupChat.extract([
+        {'peer': 'nano_1a', 'messages': [
+          env('gOld', 'old', 'c1', ['a'], ts: 100),
+          env('gNew', 'new', 'c2', ['a'], ts: 900),
+        ]}
+      ]);
+      expect(g.map((x) => x.gid).toList(), ['gNew', 'gOld']);
+    });
+
+    test('ordinary DMs contribute nothing', () {
+      final g = GroupChat.extract([
+        {'peer': 'nano_1a', 'messages': [
+          {'text': 'hello there', 'ts': 1, 'outgoing': false},
+          {'text': DmCtl.encode('read', {'u': 1}), 'ts': 2, 'outgoing': true},
+          {'text': 'xchat:img:bafyfoo', 'ts': 3, 'outgoing': false},
+        ]}
+      ]);
+      expect(g, isEmpty);
+    });
+
+    test('an outgoing message is attributed to us, an incoming one to its sender', () {
+      final g = GroupChat.extract([
+        {'peer': 'nano_1alice', 'messages': [
+          env('g1', 'f', 'c1', ['a'], ts: 100, outgoing: true),
+          env('g1', 'f', 'c2', ['a'], ts: 200),
+        ]}
+      ]);
+      expect(g.first.msgs[0].from, '');                 // '' means us
+      expect(g.first.msgs[1].from, 'nano_1alice');
+    });
+
+    test('an empty inbox yields no groups rather than throwing', () {
+      expect(GroupChat.extract([]), isEmpty);
+      expect(GroupChat.extract([{'peer': 'x'}]), isEmpty);
     });
   });
 }
