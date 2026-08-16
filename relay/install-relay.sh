@@ -955,9 +955,17 @@ PYCFG
             log "tailscale is not installed — install it and run 'tailscale up', then restart"
             sleep 60; continue
         fi
-        # DNSName is authoritative and comes back with a trailing dot; strip it.
-        URL=$(tailscale status --json 2>/dev/null \
-              | sed -n 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//')
+        tailscale status --json > "$XC_HOME/ts-status.json" 2>/dev/null || true
+        # Parse the JSON properly rather than grepping it. EVERY peer in `tailscale status --json`
+        # carries a DNSName, so taking the first match only works while Self happens to be serialised
+        # before Peer — i.e. it would announce a neighbour's hostname the day that order changed.
+        # python3 is a hard requirement of this installer, so there is no reason to guess.
+        URL=$("$PY" -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print((d.get("Self") or {}).get("DNSName", "").rstrip("."))
+except Exception:
+    pass' < "$XC_HOME/ts-status.json" 2>/dev/null)
         if [ -z "$URL" ]; then
             log "tailscale is installed but not logged in — run 'tailscale up', then restart"
             sleep 60; continue
