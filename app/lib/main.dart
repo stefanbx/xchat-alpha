@@ -6834,6 +6834,11 @@ class _DmChatScreenState extends State<DmChatScreen> {
   bool _loading = true, _sending = false, _emoji = false;
   String? _err;
   Map<String, dynamic>? _replyTo;     // the message being replied to, until it is sent or cancelled
+  // In-thread search. Free now: Phase 1 keeps every message decrypted on the device, so finding one
+  // is a string match over memory — no request, and nothing a relay could answer even if we asked it.
+  bool _searching = false;
+  String _query = '';
+  final _searchCtl = TextEditingController();
   final _ctl = TextEditingController();
   Timer? _poll;
   String _peerPk = '';                // the peer's DM key, needed to decrypt attachments
@@ -6895,7 +6900,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
   }
 
   @override
-  void dispose() { _poll?.cancel(); _ctl.dispose(); super.dispose(); }
+  void dispose() { _poll?.cancel(); _ctl.dispose(); _searchCtl.dispose(); super.dispose(); }
 
   Future<void> _load({bool quiet = false}) async {
     final convos = await Api.dmInbox();
@@ -7008,18 +7013,38 @@ class _DmChatScreenState extends State<DmChatScreen> {
       appBar: AppBar(
         backgroundColor: kBg, elevation: 0, iconTheme: const IconThemeData(color: kText),
         titleSpacing: 0,
-        title: Row(children: [
-          AuthorAvatar(account: widget.peer, handle: widget.handle, radius: 16),
-          const SizedBox(width: 10),
-          Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
-            AnimatedBuilder(
-              animation: ProfileCache.I,
-              builder: (_, __) => Text(ProfileCache.I.displayName(widget.peer, widget.handle),
-                  style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 16)),
-            ),
-            const Text('🔐 encrypted', style: TextStyle(color: Color(0xFF4DD0A7), fontSize: 11)),
-          ]),
-        ]),
+        title: _searching
+            ? TextField(
+                controller: _searchCtl,
+                autofocus: true,
+                style: const TextStyle(color: kText, fontSize: 16),
+                onChanged: (v) => setState(() => _query = v.trim()),
+                decoration: const InputDecoration(
+                    hintText: 'Search this conversation',
+                    hintStyle: TextStyle(color: kDim), border: InputBorder.none),
+              )
+            : Row(children: [
+                AuthorAvatar(account: widget.peer, handle: widget.handle, radius: 16),
+                const SizedBox(width: 10),
+                Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                  AnimatedBuilder(
+                    animation: ProfileCache.I,
+                    builder: (_, __) => Text(ProfileCache.I.displayName(widget.peer, widget.handle),
+                        style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 16)),
+                  ),
+                  const Text('🔐 encrypted', style: TextStyle(color: Color(0xFF4DD0A7), fontSize: 11)),
+                ]),
+              ]),
+        actions: [
+          IconButton(
+            icon: Icon(_searching ? Icons.close : Icons.search, color: kText),
+            tooltip: _searching ? 'Close search' : 'Search this conversation',
+            onPressed: () => setState(() {
+              _searching = !_searching;
+              if (!_searching) { _searchCtl.clear(); _query = ''; }
+            }),
+          ),
+        ],
       ),
       body: Column(children: [
         Expanded(
@@ -7053,7 +7078,28 @@ class _DmChatScreenState extends State<DmChatScreen> {
   // messages from the same person read as a block the way they do in Messenger/WhatsApp instead of a
   // ladder of identical rounded boxes each restating the time.
   List<Widget> _rows() {
-    final all = [..._msgs, ..._pending];        // optimistic sends sit at the end, i.e. newest
+    var all = [..._msgs, ..._pending];          // optimistic sends sit at the end, i.e. newest
+    if (_query.isNotEmpty) {
+      // Search the BODY, not the raw text: a hit inside the "> " quote of a reply would otherwise
+      // match the message that quoted it as well as the original, which reads as a duplicate.
+      final q = _query.toLowerCase();
+      all = all.where((m) {
+        final (_, rest) = _splitQuote('${m['text']}');
+        final (_, body) = _splitImg(rest);
+        return body.toLowerCase().contains(q);
+      }).toList();
+      if (all.isEmpty) {
+        return [
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 40),
+            child: Center(
+              child: Text('No messages matching “$_query”',
+                  style: const TextStyle(color: kDim, fontSize: 14)),
+            ),
+          )
+        ];
+      }
+    }
     const groupWindow = 300;                    // 5 min: past that, a message starts a new block
     final rows = <Widget>[];
     for (var i = 0; i < all.length; i++) {
@@ -7172,6 +7218,30 @@ class _DmChatScreenState extends State<DmChatScreen> {
     );
   }
 
+  /// Message text with the search term marked. Plain Text when nothing is being searched, so the
+  /// common case pays nothing for a feature that is off.
+  Widget _highlighted(String body, bool out) {
+    final base = TextStyle(color: out ? Colors.black : kText, fontSize: 15, height: 1.3);
+    if (_query.isEmpty) return Text(body, style: base);
+    final q = _query.toLowerCase();
+    final lower = body.toLowerCase();
+    final spans = <TextSpan>[];
+    var i = 0;
+    while (true) {
+      final at = lower.indexOf(q, i);
+      if (at < 0) { spans.add(TextSpan(text: body.substring(i))); break; }
+      if (at > i) spans.add(TextSpan(text: body.substring(i, at)));
+      spans.add(TextSpan(
+        text: body.substring(at, at + q.length),
+        style: TextStyle(
+            backgroundColor: out ? Colors.black.withValues(alpha: 0.22) : kAccent.withValues(alpha: 0.38),
+            fontWeight: FontWeight.w800),
+      ));
+      i = at + q.length;
+    }
+    return RichText(text: TextSpan(style: base, children: spans));
+  }
+
   Widget _quoteBlock(String quote, bool out) {
     final who = _quoteAuthor(quote);
     // A left accent bar via Row, not BoxDecoration's border: a non-uniform Border with a
@@ -7243,8 +7313,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
               if (imgCid != null) _attachment(imgCid, out),
               // A photo sent with no caption should not leave an empty text line under it.
               if (body.isNotEmpty || imgCid == null)
-                Text(body,
-                    style: TextStyle(color: out ? Colors.black : kText, fontSize: 15, height: 1.3)),
+                _highlighted(body, out),
               if (showTime) ...[
                 const SizedBox(height: 3),
                 Row(mainAxisSize: MainAxisSize.min, children: [
