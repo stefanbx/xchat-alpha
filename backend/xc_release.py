@@ -225,7 +225,16 @@ else:                                                  # check: newest VALID sig
                 if rec.get('publisher') == PUBLISHER and xc.pub_to_addr(rec['pub']) == PUBLISHER \
                    and (verify(rec['pub'], canon(rec), rec['sig'])
                         or verify(rec['pub'], canon_legacy(rec), rec['sig'])):
-                    if best is None or vt(rec['version']) > vt(best['version']):
+                    # Higher version wins; on the SAME version the newer record wins. Without that
+                    # tie-break a version could never be corrected: the comparison was strictly
+                    # greater, so the first 2.4.0 seen was final and a re-publish of the same version
+                    # was silently ignored. That matters because a signed record is permanent on the
+                    # relays — a bad build shipped under a version number could only ever be answered
+                    # by burning the next version number. Safe to prefer the newer one here: every
+                    # record reaching this line has already proved the publisher's signature, so only
+                    # the publisher can move it.
+                    if best is None or (vt(rec['version']), rec.get('ts', 0)) > \
+                                       (vt(best['version']), best.get('ts', 0)):
                         best = rec
             if best is not None:                          # a responsive relay gave us a valid record — done
                 break

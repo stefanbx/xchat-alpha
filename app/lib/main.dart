@@ -6,7 +6,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb, setEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
@@ -159,7 +159,7 @@ Future<void> resolveWorkBase() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.3.9'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.4.1'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -2705,7 +2705,10 @@ class _FeedScreenState extends State<FeedScreen> {
   Set<String> _channelAccounts = {};
   Future<void> _refreshChannelAccounts() async {
     final chs = await Api.channels();
-    if (mounted) setState(() => _channelAccounts = chs.map((c) => '${c['account']}').toSet());
+    final next = chs.map((c) => '${c['account']}').toSet();
+    if (mounted && !setEquals(next, _channelAccounts)) {
+      setState(() => _channelAccounts = next);
+    }
   }
 
   // A settled-tips history sheet: one card per settlement, each split leg with its amount, a ✓/✗ for
@@ -3484,7 +3487,11 @@ class _FeedScreenState extends State<FeedScreen> {
         if (lastIn > _dmSeenTs) unread++;
         if (lastIn > 0) fresh.add({'peer': c['peer'], 'ts': lastIn, 'text': lastText});
       }
-      if (mounted) setState(() => _dmUnread = unread);
+      // Only rebuild when the number actually MOVED. This runs inside the 12s feed poll, and an
+      // unconditional setState here rebuilt the entire home screen — feed, avatars and all — four
+      // times a minute to redraw an identical badge. That is invisible in a screenshot diff (the
+      // pixels match) and very visible on a phone.
+      if (mounted && unread != _dmUnread) setState(() => _dmUnread = unread);
       Notifs.setBadge(unread);   // unread-DM count on the launcher icon
       await _alertNewDms(fresh);
     } catch (_) {}
@@ -5433,7 +5440,17 @@ class _FeedScreenState extends State<FeedScreen> {
   Future<void> _refreshNotifs() async {
     if (gWallet == null) return;
     final list = await Api.notify();
-    if (mounted) setState(() => _notifs = list);
+    // Same reasoning as the DM badge: this fires every ~24s and replaced the list object every time,
+    // so the feed rebuilt whether or not a notification had arrived. Compare cheaply — count plus the
+    // newest timestamp is enough to catch anything that would change what is drawn.
+    int newest(List<Map<String, dynamic>> l) {
+      var m = 0;
+      for (final n in l) { final t = (n['ts'] as num?)?.toInt() ?? 0; if (t > m) m = t; }
+      return m;
+    }
+    if (mounted && (list.length != _notifs.length || newest(list) != newest(_notifs))) {
+      setState(() => _notifs = list);
+    }
     final p = await SharedPreferences.getInstance();
     final seen = p.getInt('notif_seen_ts') ?? -1;
     if (seen < 0) {                                    // first run → baseline, don't alert for history
@@ -7870,8 +7887,34 @@ class MediaImage extends StatefulWidget {
 }
 
 class _MediaImageState extends State<MediaImage> {
-  static final Map<String, Uint8List> _cache = {};   // CID -> bytes, shared app-wide (bounded)
-  static const int _cacheMax = 48;
+  // CID -> bytes, shared app-wide. Bounded by BYTES and evicted LEAST-RECENTLY-USED.
+  //
+  // It used to be a flat 48 entries evicted in insertion order, and every avatar in the feed takes a
+  // slot as well as every photo. Once the feed held more images than that, scrolling evicted the ones
+  // above you, scrolling back re-fetched them over the network, and they visibly blinked — worse than
+  // it sounds, because FIFO can evict an image that is on screen right now while keeping one you
+  // scrolled past. A count cap is also the wrong unit: 48 avatars and 48 photos are wildly different
+  // amounts of memory. Bound the bytes, keep what is actually being looked at.
+  static final Map<String, Uint8List> _cache = {};
+  static int _cacheBytes = 0;
+  static const int _cacheMaxBytes = 32 * 1024 * 1024;
+
+  static Uint8List? _cacheGet(String cid) {
+    final v = _cache.remove(cid);
+    if (v != null) _cache[cid] = v;                  // re-insert = most recently used
+    return v;
+  }
+
+  static void _cachePut(String cid, Uint8List data) {
+    final old = _cache.remove(cid);
+    if (old != null) _cacheBytes -= old.length;
+    _cache[cid] = data;
+    _cacheBytes += data.length;
+    while (_cacheBytes > _cacheMaxBytes && _cache.isNotEmpty) {
+      final k = _cache.keys.first;                   // oldest touched
+      _cacheBytes -= (_cache.remove(k)?.length ?? 0);
+    }
+  }
   Uint8List? _bytes;
   bool _loading = false;
 
@@ -7886,15 +7929,14 @@ class _MediaImageState extends State<MediaImage> {
 
   Future<void> _resolve() async {
     final cid = widget.cid;
-    final hit = _cache[cid];
+    final hit = _cacheGet(cid);
+    // A cache hit must not flash a spinner: setting _loading=true below and clearing it on the next
+    // frame is exactly the blink this is meant to avoid. Paint the bytes we already have, now.
     if (hit != null) { setState(() { _bytes = hit; _loading = false; }); return; }
     setState(() => _loading = true);
     final data = await Api.media(cid);
     if (!mounted || cid != widget.cid) return;   // widget moved to a different CID → drop this result
-    if (data != null) {
-      _cache[cid] = data;
-      if (_cache.length > _cacheMax) _cache.remove(_cache.keys.first);  // evict oldest
-    }
+    if (data != null) _cachePut(cid, data);
     setState(() { _bytes = data; _loading = false; });
   }
 
