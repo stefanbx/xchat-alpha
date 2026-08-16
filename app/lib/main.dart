@@ -6364,8 +6364,51 @@ class _DmChatScreenState extends State<DmChatScreen> {
   final List<Map<String, dynamic>> _pending = [];
   bool _loading = true, _sending = false, _emoji = false;
   String? _err;
+  Map<String, dynamic>? _replyTo;     // the message being replied to, until it is sent or cancelled
   final _ctl = TextEditingController();
   Timer? _poll;
+
+  // Quote wire format. The reference to the original rides INSIDE the sealed plaintext as "> "
+  // prefixed lines — never as a field on the envelope. A reply_to column would hand the relay the
+  // shape of every conversation for free, and this app's whole claim is that relays hold ciphertext
+  // and nothing else. It also degrades: someone on an older build sees a readable quoted block
+  // rather than markup they can't parse, which matters while real people are running old installs.
+  static const _quoteMax = 160;
+
+  (String?, String) _splitQuote(String text) {
+    final lines = text.split('\n');
+    var i = 0;
+    while (i < lines.length && lines[i].startsWith('>')) {
+      i++;
+    }
+    // All quote and no body is NOT a reply. People type "> something" inline for emphasis on one
+    // line — seen in this very thread — and parsing that as a quote renders an empty-bodied block
+    // that looks broken. Fall back to plain text unless there is something the quote introduces.
+    if (i == 0 || i == lines.length) return (null, text);
+    final body = lines.skip(i).join('\n').trimLeft();
+    if (body.isEmpty) return (null, text);
+    // Accept "> x" and ">x" both: the space is a convention, not a guarantee, and other clients differ.
+    return (lines.take(i).map((l) => l.startsWith('> ') ? l.substring(2) : l.substring(1)).join('\n'),
+            body);
+  }
+
+  String _quoteLines(String original) {
+    var s = original.replaceAll('\r', '');
+    if (s.length > _quoteMax) s = '${s.substring(0, _quoteMax).trimRight()}…';
+    return s.split('\n').map((l) => '> $l').join('\n');
+  }
+
+  // Who said the quoted thing. Resolved by looking it up in the thread rather than stored, because
+  // storing it would mean trusting the sender's claim about who said what.
+  String _quoteAuthor(String quote) {
+    final needle = quote.endsWith('…') ? quote.substring(0, quote.length - 1) : quote;
+    for (final m in [..._msgs, ..._pending].reversed) {
+      if (_splitQuote('${m['text']}').$2.startsWith(needle)) {
+        return m['outgoing'] == true ? 'You' : ProfileCache.I.displayName(widget.peer, widget.handle);
+      }
+    }
+    return '';                       // quoted a message that is no longer loaded
+  }
 
   @override
   void initState() {
@@ -6398,11 +6441,15 @@ class _DmChatScreenState extends State<DmChatScreen> {
   }
 
   Future<void> _send() async {
-    final text = _ctl.text.trim();
-    if (text.isEmpty || _sending) return;
+    final body = _ctl.text.trim();
+    if (body.isEmpty || _sending) return;
+    final q = _replyTo;
+    // Quote the original's BODY, not its raw text: replying to a reply would otherwise nest the
+    // old quote inside the new one and grow a staircase down the thread.
+    final text = q == null ? body : '${_quoteLines(_splitQuote('${q['text']}').$2)}\n$body';
     final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     setState(() {
-      _sending = true; _err = null; _emoji = false;
+      _sending = true; _err = null; _emoji = false; _replyTo = null;
       _pending.add({'text': text, 'ts': ts, 'outgoing': true, 'pending': true});
       _ctl.clear();                       // clear NOW; the optimistic bubble is the receipt
     });
@@ -6417,8 +6464,9 @@ class _DmChatScreenState extends State<DmChatScreen> {
       setState(() {
         _sending = false;
         _pending.removeWhere((p) => p['ts'] == ts && p['text'] == text);
-        _ctl.text = text;
-        _ctl.selection = TextSelection.collapsed(offset: text.length);
+        _ctl.text = body;                 // the body back, not the quote markup
+        _ctl.selection = TextSelection.collapsed(offset: body.length);
+        _replyTo = q;                     // and put the reply target back too
         _err = (r?['error'] ?? 'send failed').toString();
       });
     }
@@ -6531,28 +6579,96 @@ class _DmChatScreenState extends State<DmChatScreen> {
         ),
       );
 
+  // Long-press is how both WhatsApp and Messenger expose per-message actions, so it is where people
+  // already look for them.
+  void _msgMenu(Map<String, dynamic> m) {
+    final body = _splitQuote('${m['text']}').$2;
+    showModalBottomSheet(
+      context: context, backgroundColor: kCard,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+            leading: const Icon(Icons.reply, color: kAccent),
+            title: const Text('Reply', style: TextStyle(color: kText)),
+            onTap: () {
+              Navigator.pop(ctx);
+              setState(() { _replyTo = m; _emoji = false; });
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.copy_outlined, color: kDim),
+            title: const Text('Copy', style: TextStyle(color: kText)),
+            onTap: () {
+              Clipboard.setData(ClipboardData(text: body));
+              Navigator.pop(ctx);
+            },
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _quoteBlock(String quote, bool out) {
+    final who = _quoteAuthor(quote);
+    // A left accent bar via Row, not BoxDecoration's border: a non-uniform Border with a
+    // borderRadius throws at paint time.
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(7),
+        child: IntrinsicHeight(
+          child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, mainAxisSize: MainAxisSize.min, children: [
+            Container(width: 3, color: out ? Colors.black54 : kAccent),
+            Flexible(
+              child: Container(
+                color: out ? Colors.black.withValues(alpha: 0.10) : Colors.white.withValues(alpha: 0.05),
+                padding: const EdgeInsets.fromLTRB(7, 5, 7, 5),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (who.isNotEmpty)
+                      Text(who, style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700,
+                          color: out ? Colors.black87 : kAccent)),
+                    Text(quote, maxLines: 3, overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontSize: 13, height: 1.25,
+                            color: out ? Colors.black.withValues(alpha: 0.72) : kDim)),
+                  ],
+                ),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
   Widget _bubble(Map<String, dynamic> m, {bool cont = false, bool showTime = true}) {
     final out = m['outgoing'] == true;
     final pending = m['pending'] == true;
+    final (quote, body) = _splitQuote('${m['text']}');
     const r16 = Radius.circular(16), r5 = Radius.circular(5);
     return Align(
       alignment: out ? Alignment.centerRight : Alignment.centerLeft,
       child: Opacity(
         opacity: pending ? 0.6 : 1,             // "on its way" without a second widget
-        child: Container(
-          // Tight inside a block, loose between blocks — the spacing IS the grouping cue.
-          margin: EdgeInsets.only(top: cont ? 2 : 8),
-          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
-          constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
-          decoration: BoxDecoration(
-            color: out ? kAccent : kCard,
-            // Only the last bubble of a block keeps its tail; the ones above square off against it.
-            borderRadius: BorderRadius.only(
-              topLeft: out ? r16 : (cont ? r5 : r16),
-              topRight: out ? (cont ? r5 : r16) : r16,
-              bottomLeft: out ? r16 : (showTime ? r5 : r16),
-              bottomRight: out ? (showTime ? r5 : r16) : r16),
-          ),
+        child: GestureDetector(
+          onLongPress: () => _msgMenu(m),
+          child: Container(
+            // Tight inside a block, loose between blocks — the spacing IS the grouping cue.
+            margin: EdgeInsets.only(top: cont ? 2 : 8),
+            padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+            constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
+            decoration: BoxDecoration(
+              color: out ? kAccent : kCard,
+              // Only the last bubble of a block keeps its tail; the ones above square off against it.
+              borderRadius: BorderRadius.only(
+                topLeft: out ? r16 : (cont ? r5 : r16),
+                topRight: out ? (cont ? r5 : r16) : r16,
+                bottomLeft: out ? r16 : (showTime ? r5 : r16),
+                bottomRight: out ? (showTime ? r5 : r16) : r16),
+            ),
           // The timestamp was always in the message map — sorted on, even — but never shown, so a DM
           // thread read as one undated block. Clock time, not "16m": relative ages are for a feed you
           // skim, while a conversation you re-read needs to say when something was actually said.
@@ -6560,7 +6676,8 @@ class _DmChatScreenState extends State<DmChatScreen> {
             crossAxisAlignment: out ? CrossAxisAlignment.end : CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text('${m['text']}',
+              if (quote != null) _quoteBlock(quote, out),
+              Text(body,
                   style: TextStyle(color: out ? Colors.black : kText, fontSize: 15, height: 1.3)),
               if (showTime) ...[
                 const SizedBox(height: 3),
@@ -6575,6 +6692,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
                 ]),
               ],
             ],
+          ),
           ),
         ),
       ),
@@ -6608,6 +6726,37 @@ class _DmChatScreenState extends State<DmChatScreen> {
       child: Container(
         decoration: const BoxDecoration(color: kCard, border: Border(top: BorderSide(color: kLine))),
         child: Column(mainAxisSize: MainAxisSize.min, children: [
+          // What you are about to quote, shown before you send rather than after — otherwise the only
+          // way to check you picked the right message is to send and look.
+          if (_replyTo != null)
+            Container(
+              padding: const EdgeInsets.fromLTRB(12, 7, 4, 7),
+              decoration: const BoxDecoration(border: Border(bottom: BorderSide(color: kLine))),
+              child: Row(children: [
+                Container(width: 3, height: 32, color: kAccent),
+                const SizedBox(width: 9),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _replyTo!['outgoing'] == true
+                            ? 'Replying to yourself'
+                            : 'Replying to ${ProfileCache.I.displayName(widget.peer, widget.handle)}',
+                        style: const TextStyle(
+                            color: kAccent, fontSize: 11.5, fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 2),
+                      Text(_splitQuote('${_replyTo!['text']}').$2,
+                          maxLines: 1, overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: kDim, fontSize: 12.5)),
+                    ],
+                  ),
+                ),
+                IconButton(
+                    icon: const Icon(Icons.close, color: kDim, size: 20),
+                    onPressed: () => setState(() => _replyTo = null)),
+              ]),
+            ),
           Padding(
             padding: const EdgeInsets.fromLTRB(4, 4, 4, 4),
             child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
