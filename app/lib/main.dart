@@ -450,6 +450,92 @@ class Notifs {
   }
 }
 
+// ON-DEVICE MESSAGE STORE — decrypt each DM once, ever.
+//
+// A poll opens EVERY ciphertext in the inbox and throws the plaintext away, so cost grows linearly
+// with history forever: measured at 437ms per poll over 500 messages, running every 5s in an open
+// thread plus every 12s for the home badge. Caching the box halved that; this removes the rest by not
+// decrypting a message we have already read.
+//
+// ENCRYPTED AT REST, and not optionally. The entire claim of this feature is that these bytes are
+// secret — relays hold ciphertext and nothing else — so a plaintext cache on the phone would hand
+// away exactly what we refused to give the network, to anything that can read app storage. The blob
+// is sealed to the wallet's OWN DM key (crypto_box to self), which reuses the audited path instead of
+// inventing a second one and ties the store to the identity that owns it: a different seed cannot
+// open it, so a reinstall or wallet switch reads as an empty store rather than leaking the previous
+// identity's conversations.
+//
+// One sealed blob, not one entry per key: flutter_secure_storage is built for a handful of small
+// secrets, and thousands of keystore round-trips would cost more than the decryption this exists to
+// avoid. The blob is opaque, so ordinary preferences are a fine place to keep it.
+class DmStore {
+  static const _k = 'xchat_dm_store';
+  static const _max = 4000;
+  static final Map<String, Map<String, dynamic>> _mem = {};   // ct -> {t: text, s: ts}
+  static String _owner = '';
+  static bool _dirty = false;
+
+  static String? get(String ct) => _mem[ct]?['t'] as String?;
+  static int get count => _mem.length;
+
+  static void put(String ct, String text, int ts) {
+    if (_mem.containsKey(ct)) return;
+    _mem[ct] = {'t': text, 's': ts};
+    _dirty = true;
+  }
+
+  static Future<void> load(NanoWallet w) async {
+    if (_owner == w.account && _mem.isNotEmpty) return;
+    if (_owner != w.account) { _mem.clear(); _dirty = false; }
+    _owner = w.account;
+    try {
+      final blob = (await SharedPreferences.getInstance()).getString('${_k}_${w.account}');
+      if (blob == null || blob.isEmpty) return;
+      // Sealed to ourselves, so our own DM key opens it. A blob written under a DIFFERENT seed fails
+      // here and is ignored — the store rebuilds from the relay rather than throwing.
+      final plain = w.dmOpen(w.dmPub, blob);
+      if (plain == null) return;
+      for (final e in (jsonDecode(plain) as Map<String, dynamic>).entries) {
+        _mem[e.key] = (e.value as Map).cast<String, dynamic>();
+      }
+    } catch (_) {
+      _mem.clear();                      // corrupt or unreadable: start clean, never break a poll
+    }
+  }
+
+  static Future<void> flush(NanoWallet w) async {
+    if (!_dirty || _owner != w.account) return;
+    _dirty = false;
+    try {
+      // Eviction drops the OLDEST, and that choice deserves stating: a relay also evicts ciphertext
+      // under memory pressure, so a message gone from both is gone for good. The cap sits well above
+      // any real thread to keep this theoretical, and the oldest is what a relay is likeliest to
+      // still hold, since a live head keeps its thread alive.
+      if (_mem.length > _max) {
+        final byAge = _mem.entries.toList()
+          ..sort((a, b) => ((a.value['s'] ?? 0) as int).compareTo((b.value['s'] ?? 0) as int));
+        for (final e in byAge.take(_mem.length - _max)) {
+          _mem.remove(e.key);
+        }
+      }
+      final sealed = w.dmSeal(w.dmPub, jsonEncode(_mem));
+      await (await SharedPreferences.getInstance()).setString('${_k}_${w.account}', sealed);
+    } catch (_) {
+      _dirty = true;                     // failed write: retry on the next flush
+    }
+  }
+
+  /// Wipe a wallet's messages, so a replaced seed cannot inherit the previous identity's threads.
+  static Future<void> clear(String account) async {
+    _mem.clear();
+    _owner = '';
+    _dirty = false;
+    try {
+      await (await SharedPreferences.getInstance()).remove('${_k}_$account');
+    } catch (_) {}
+  }
+}
+
 // Remembers the update the user dismissed — for A DAY, not forever.
 //
 // It used to store the bare version string and suppress that version permanently. One tap on the ×
@@ -540,12 +626,19 @@ class _RootGateState extends State<RootGate> {
   }
 
   Future<void> _onDone(String seed) async {
+    // Drop the OUTGOING identity's cached messages before adopting a new seed. The blob is sealed to
+    // the old wallet's key so the new one could not read it anyway, but leaving it on disk keeps
+    // someone's conversations after they have handed the phone on or restored a different wallet.
+    final prev = gWallet?.account;
+    if (prev != null) await DmStore.clear(prev);
     await WalletStore.save(seed);
     gWallet = NanoWallet(seed);       // seedless node: nothing to activate server-side
     setState(() => _seed = seed);
   }
 
   Future<void> _logout() async {
+    final prev = gWallet?.account;
+    if (prev != null) await DmStore.clear(prev);   // logging out must not leave messages behind
     await WalletStore.clear();
     gWallet = null;
     setState(() => _seed = null);
@@ -1765,6 +1858,7 @@ class Api {
     final w = gWallet;
     if (w == null) return [];
     try {
+      await DmStore.load(w);          // decrypt-once cache; no-op after the first call
       final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'));
       final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
       final convos = <String, List<Map<String, dynamic>>>{};
@@ -1775,8 +1869,17 @@ class Api {
         final outgoing = m['from'] == w.account;
         final peerAcc = '${outgoing ? m['to'] : m['from']}';
         final peerPk = '${outgoing ? m['to_pk'] : m['from_pk']}';
-        final plain = w.dmOpen(peerPk, '${m['ct']}');      // decrypts locally; null if not ours
-        if (plain == null) continue;
+        // Already-read messages come from the store; only genuinely NEW ciphertext is decrypted.
+        // Keyed by ciphertext, which is safe HERE (unlike inside dmOpen) because this loop has
+        // already established the message is addressed to us — a ciphertext that is not ours never
+        // reaches put(), so it can never be served from get().
+        final ct = '${m['ct']}';
+        var plain = DmStore.get(ct);
+        if (plain == null) {
+          plain = w.dmOpen(peerPk, ct);                   // decrypts locally; null if not ours
+          if (plain == null) continue;
+          DmStore.put(ct, plain, (m['ts'] ?? 0) as int);
+        }
         peerKeys[peerAcc] = peerPk;                        // only from messages that actually opened
         (convos[peerAcc] ??= []).add({'from': m['from'], 'outgoing': outgoing, 'text': plain, 'ts': m['ts']});
       }
@@ -1788,6 +1891,7 @@ class Api {
                        'peer_pk': peerKeys[e.key] ?? ''})
           .toList();
       out.sort((a, b) => (b['last_ts'] as int).compareTo(a['last_ts'] as int));
+      await DmStore.flush(w);         // persist anything newly decrypted, sealed to our own key
       return out.cast<Map<String, dynamic>>();
     } catch (_) {
       return [];
