@@ -64,9 +64,11 @@ fi
 NODE_PUBLIC_URL="${NODE_PUBLIC_URL:-https://xchat-alpha-node.fly.dev}"
 PEER_RELAY="${PEER_RELAY:-https://xchat-relay-1.fly.dev}"
 export RELAY_PUBLIC_URL="$NODE_PUBLIC_URL"     # the embedded relay's reachable identity (proxied to :7401)
-# Payout account for the embedded relay. XC_DEV=1 preserves the historical DEMO account (key derivable
-# from the repo by anyone — not a wallet). Set RELAY_ACCT=nano_... and drop this to be paid for real.
-export XC_DEV=1
+# Payout account for the embedded relay comes from the RELAY_ACCT secret. XC_DEV=1 used to be set
+# here, which made an unset RELAY_ACCT fall back to acct(0x50) — a key ANYONE with the repo can
+# derive. That was not theoretical: 0.0123 XNO in six pinning/tip payments accumulated there before
+# it was noticed, claimable by anybody. Without XC_DEV, an unset RELAY_ACCT now means "this relay
+# takes no payments", which is the only safe default for money.
 export XCHAT_BOOTSTRAP="$PEER_RELAY"           # xc_common._bootstrap() always includes the peer relay
 echo "http://127.0.0.1:7401" > /tmp/xchat_bootstrap.txt   # node still talks to its co-located relay on loopback
 python3 /app/xc_relayd.py 7401 "$STORE_DIR/relay.json" "$PEER_RELAY" >/tmp/relay.log 2>&1 &

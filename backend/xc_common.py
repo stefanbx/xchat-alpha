@@ -24,6 +24,14 @@ WORK_RPCS = [u.strip().rstrip('/') for u in os.environ.get(
     'https://nanoslo.0x.no/proxy,https://rainstorm.city/api,https://node.somenano.com/proxy').split(',')
     if u.strip()]
 MAINNET_WORK_DIFF = 'fffffff800000000'   # epoch-2 SEND threshold; valid for send AND receive/open blocks
+# The LOCAL work server (xc_workd), when this machine runs one. run.sh already exports XC_WORK_URL for
+# the relay and XC_WORK for the node, both pointing at it — but xc_workd speaks GET /work?hash=..,
+# NOT the JSON-RPC work_generate the public proxies use, so this module never once used it. That is
+# the whole reason a node with a GPU still waited on public endpoints: measured 2-3s locally against
+# 20s+ remotely, and during a real payout sweep all three public endpoints returned HTTP 500 while
+# the GPU sat idle. NO default port: guessing one risks picking up somebody else's DEV-difficulty
+# work daemon, which produces work mainnet silently rejects. Configured or nothing.
+WORK_LOCAL_URL = (os.environ.get('XC_WORK') or os.environ.get('XC_WORK_URL') or '').rstrip('/')
 GEN = '34F0A37AAD20F4A260F0A5B3CB3D7FB50673212263E58A380BC10474BB039CE4'
 GPUB = 'b0311ea55708d6a53c75cdbf88300259c6d018522fe3d4d0a242e431f9e8b6d0'
 NANO_ALPH = "13456789abcdefghijkmnopqrstuwxyz"
@@ -104,10 +112,31 @@ def _work_valid(root, work):
         return True                                        # can't validate → let `process` be the judge
 
 
+def _local_work(root):
+    # xc_workd's interface: GET /work?hash=<root>&difficulty=<hex> -> {"work": "..."}. Returns None on
+    # anything unexpected so the caller just moves on to the public endpoints.
+    if not WORK_LOCAL_URL:
+        return None
+    try:
+        u = '%s/work?hash=%s&difficulty=%s' % (WORK_LOCAL_URL, root, MAINNET_WORK_DIFF)
+        r = json.loads(urllib.request.urlopen(u, timeout=180).read())
+        return r.get('work') if isinstance(r, dict) else None
+    except Exception:
+        return None
+
+
 def work_generate(root):
     # Delegated PoW over `root` (the frontier hash, or the account pubkey for an open). Requests the
     # explicit mainnet difficulty and VALIDATES the result — only returns work the network will accept.
     # Falls back to the ledger RPCs (a self-hosted full node) if the work endpoints don't deliver.
+    #
+    # The machine's OWN work server goes first when one is configured. It is usually a GPU, it is not
+    # rate-limited, and it cannot be down while the node it belongs to is up. The result still goes
+    # through _work_valid, so a misconfigured local server (wrong difficulty, dev-net daemon) is
+    # caught and we fall through to the public endpoints rather than building a block mainnet drops.
+    w = _local_work(root)
+    if w and _work_valid(root, w):
+        return w
     last = None
     for ep in list(WORK_RPCS) + [None]:
         try:
