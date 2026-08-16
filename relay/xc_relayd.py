@@ -237,6 +237,47 @@ def channels_directory():
 _heads_lock = threading.Lock()                                # guards heads across prune + /push
 _dm_seen = set()                                              # (from, ts) O(1) dedup for the mailbox
 
+# Reading a mailbox: prove you own it.
+#
+# /dm returns records whose BODIES are sealed but whose `to`, `from` and `ts` are not, so serving
+# them to anyone publishes the account's whole social graph. See the audit in
+# docs/PRIVACY-AND-DECENTRALIZATION.md.
+#
+# STRICT IS OFF BY DEFAULT, on purpose, and it is the uncomfortable part of this change. Clients up
+# to and including 2.5.0 do not sign these reads, so a relay that enforced today would break DMs for
+# every install that exists right now — shipping a privacy fix by taking the feature away. So: the
+# signature is accepted and verified whenever it is offered, the app and node send it from this
+# version on, and an operator flips XC_DM_STRICT=1 once the people using their relay have updated.
+# The default flips in a later release, when that is true by default rather than by hope.
+#
+# Until then this closes nothing on its own. It is the half that can ship without a flag day.
+DM_STRICT = os.environ.get('XC_DM_STRICT', '0') == '1'
+DM_SIG_WINDOW = int(os.environ.get('XC_DM_SIG_WINDOW', '300'))   # seconds either side of now
+
+def _mailbox_ok(acc, q):
+    """(allowed, reason). A valid signature always wins; an absent one depends on DM_STRICT."""
+    if not acc:
+        return False, 'account required'
+    sig, pub, ts = q.get('sig', ''), q.get('pub', ''), q.get('ts', '')
+    if not (sig and pub and ts):
+        return (not DM_STRICT), 'this relay requires a signed mailbox read — update your app'
+    try:
+        ts_i = int(ts)
+    except ValueError:
+        return False, 'bad ts'
+    # A captured signature is a bearer token for this mailbox, so bound how long it is worth
+    # capturing. Both directions: a clock ahead of ours must not mint a token valid for hours.
+    if abs(time.time() - ts_i) > DM_SIG_WINDOW:
+        return False, 'signature expired'
+    try:
+        if xc.pub_to_addr(pub) != acc:
+            return False, 'key does not match the account'
+        if not xc.verify_msg(pub, xc.sig_canon('dminbox', acc, ts_i), sig):
+            return False, 'bad signature'
+    except Exception:
+        return False, 'bad signature'
+    return True, ''
+
 _dirty = False                                                # state changed since the last flush
 def mark_dirty():
     global _dirty
@@ -1143,8 +1184,22 @@ class H(BaseHTTPRequestHandler):
             pid = qs(self.path).get('poll', '')
             self._send(200, json.dumps({'poll': pid, 'votes': list(pollvotes.get(pid, {}).values())}))
         elif self.path.startswith('/dm'):
-            # every encrypted message this account is a party to (ciphertext only — relay can't read)
-            acc = qs(self.path).get('account', '')
+            # Every encrypted message this account is a party to. The BODIES are ciphertext and this
+            # relay cannot read them — but the records carry `to`, `from` and `ts` in the clear, so
+            # handing them to whoever asks publishes the account's entire social graph: who it talks
+            # to, when, how often, in which direction. For most people that is more revealing than
+            # the text, and it used to be served to strangers with no key, no signature and no
+            # session. Reading a mailbox now requires proving you own it.
+            #
+            # Fixing the plaintext `from`/`to` themselves is a separate and bigger job (sealed
+            # sender — see docs/PRIVACY-AND-DECENTRALIZATION.md). This closes the part that does not
+            # need a wire change, which is the part where anyone at all could look.
+            q = qs(self.path)
+            acc = q.get('account', '')
+            ok, why = _mailbox_ok(acc, q)
+            if not ok:
+                self._send(403, json.dumps({'error': why, 'account': acc, 'dms': []}))
+                return
             mine = [m for m in dms if m.get('to') == acc or m.get('from') == acc]
             self._send(200, json.dumps({'account': acc, 'dms': mine}))
         elif self.path.startswith('/comments'):

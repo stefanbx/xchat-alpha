@@ -122,6 +122,9 @@ class NanoWallet {
   String profileMsg(int ts, String display, String bio, String avatar, String banner) =>
       sigCanon('profile', [account, ts, display, bio, avatar, banner]);
   String dmKeyMsg(int ts, String dmPub) => sigCanon('dmkey', [account, ts, dmPub]);
+  /// Proof that we own a mailbox, for reading it. Bound to a timestamp so a captured signature is a
+  /// bearer token for minutes rather than forever.
+  String dmInboxMsg(int ts) => sigCanon('dminbox', [account, ts]);
   // report/reshare are ALSO verified by the separately-deployed relay, which is why they stayed on
   // the legacy '|'-joined preimage after everything else moved (issue #7). Relays and the node now
   // accept BOTH preimages, so signing v2 here is safe: a relay that has been redeployed reads it as

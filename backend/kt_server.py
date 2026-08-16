@@ -788,6 +788,11 @@ def route(path, query, body):
         with ipc_lock('dm'):
             put('/tmp/xc_dm_acct.txt', q('account'))
             put('/tmp/xc_dm_since.txt', q('since') or '0')   # incremental: only ciphertext at/after
+            # Proof the caller owns this mailbox, passed straight through to the relays. Reading a
+            # mailbox exposes who an account talks to, so it should cost a signature; the node has
+            # no seed and cannot forge one.
+            put('/tmp/xc_dm_auth.json', json.dumps({'ts': q('ts'), 'sig': q('sig'), 'pub': q('pub')})
+                if q('sig') else '')
             spawn('xc_dm.py','inbox');       return read('/tmp/xc_dm_result.json','{}')
 
     if path.startswith('/api/blob_put'):

@@ -9,7 +9,7 @@
 #   inbox     — returns the RAW ciphertext records for an account; the APP decrypts them locally
 # (No `nacl` import → no special interpreter needed anymore.)
 # Usage: xc_dm.py register | keyget | send | inbox
-import json, os, sys, time, urllib.request
+import json, os, sys, time, urllib.parse, urllib.request
 import importlib.util
 spec = importlib.util.spec_from_file_location("xc_common", os.path.join(os.path.dirname(__file__), "xc_common.py"))
 xc = importlib.util.module_from_spec(spec); spec.loader.exec_module(xc)
@@ -90,10 +90,24 @@ else:                                                      # inbox: return RAW c
         since = int(rd('/tmp/xc_dm_since.txt', '0') or 0)
     except ValueError:
         since = 0
+    # The app signs "I own this mailbox" and the node forwards it verbatim. The node CANNOT produce
+    # this itself — it holds no seed — which is the point: a relay that enforces is trusting the
+    # account's own key, not the node vouching for whoever asked.
+    auth = rd('/tmp/xc_dm_auth.json', '')
+    qs = ''
+    if auth:
+        try:
+            a = json.loads(auth)
+            if a.get('sig') and a.get('pub') and a.get('ts'):
+                qs = '&ts=%d&sig=%s&pub=%s' % (int(a['ts']),
+                                               urllib.parse.quote(a['sig']),
+                                               urllib.parse.quote(a['pub']))
+        except Exception:
+            qs = ''
     seen = set(); dms = []
     for r in RELAYS:
         try:
-            for m in json.loads(urllib.request.urlopen(r + '/dm?account=' + acc, timeout=4).read()).get('dms', []):
+            for m in json.loads(urllib.request.urlopen(r + '/dm?account=' + acc + qs, timeout=4).read()).get('dms', []):
                 k = (m.get('from'), m.get('ts'))
                 if k in seen:
                     continue

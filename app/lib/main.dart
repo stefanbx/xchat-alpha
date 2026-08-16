@@ -2181,8 +2181,15 @@ class Api {
       final newest = DmStore.newestTs;
       final full = (_dmPoll++ % 10 == 0) || newest == 0;
       final since = full ? 0 : (newest - 600).clamp(0, newest);
+      // Prove we own this mailbox. Reading one exposes who an account talks to, when and how often
+      // — the bodies are sealed but `from`/`to`/`ts` are not — and until now any stranger could ask
+      // a relay for anyone's. The node cannot forge this: it holds no seed.
+      final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final auth = w.signMsg(w.dmInboxMsg(ats));
       final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'
-          '${since > 0 ? '&since=$since' : ''}'));
+          '${since > 0 ? '&since=$since' : ''}'
+          '&ts=$ats&sig=${Uri.encodeQueryComponent(auth['sig']!)}'
+          '&pub=${Uri.encodeQueryComponent(auth['pub']!)}'));
       final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
       final convos = <String, List<Map<String, dynamic>>>{};
       // The peer's DM key, kept per conversation: attachments are sealed to this same box, so the
