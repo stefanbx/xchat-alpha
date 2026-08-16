@@ -455,6 +455,62 @@ class Notifs {
   }
 }
 
+// Swipe a bubble toward its own side to reply to it — the gesture every messenger has, and the
+// reason the long-press menu is not the only route to Reply.
+//
+// Horizontal only: the thread scrolls vertically, so claiming the horizontal axis costs nothing and
+// cannot fight the list. The bubble follows the finger up to a limit and springs back, so a drag that
+// does not reach the threshold reads as "not far enough" rather than as nothing happening.
+class _SwipeToReply extends StatefulWidget {
+  const _SwipeToReply({required this.child, required this.onReply, required this.fromRight});
+  final Widget child;
+  final VoidCallback onReply;
+  final bool fromRight;          // your own messages sit right and swipe left; theirs the reverse
+
+  @override
+  State<_SwipeToReply> createState() => _SwipeToReplyState();
+}
+
+class _SwipeToReplyState extends State<_SwipeToReply> {
+  static const _trigger = 56.0;  // far enough to be deliberate, short enough to be easy
+  double _dx = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final sign = widget.fromRight ? -1 : 1;
+    return GestureDetector(
+      behavior: HitTestBehavior.deferToChild,
+      onHorizontalDragUpdate: (d) {
+        // Only track movement in the reply direction, and damp it past the trigger so the bubble
+        // does not slide off with the finger.
+        final next = _dx + d.delta.dx * sign;
+        setState(() => _dx = next.clamp(0.0, _trigger * 1.35));
+      },
+      onHorizontalDragEnd: (_) {
+        final fire = _dx >= _trigger;
+        setState(() => _dx = 0);
+        if (fire) widget.onReply();
+      },
+      onHorizontalDragCancel: () => setState(() => _dx = 0),
+      child: Stack(
+        alignment: widget.fromRight ? Alignment.centerRight : Alignment.centerLeft,
+        children: [
+          // The arrow fades in with the drag, so the gesture explains itself the first time.
+          Opacity(
+            opacity: (_dx / _trigger).clamp(0.0, 1.0),
+            child: Padding(
+              padding: EdgeInsets.only(
+                  left: widget.fromRight ? 0 : 6, right: widget.fromRight ? 6 : 0),
+              child: const Icon(Icons.reply, size: 18, color: kDim),
+            ),
+          ),
+          Transform.translate(offset: Offset(_dx * sign, 0), child: widget.child),
+        ],
+      ),
+    );
+  }
+}
+
 // SEALED CONTROL MESSAGES — the envelope reactions, read receipts and anything after them ride in.
 //
 // A control message is an ordinary DM: same sealing, same relay path, same "relays hold ciphertext
@@ -6916,6 +6972,12 @@ class _DmChatScreenState extends State<DmChatScreen> {
   bool _searching = false;
   String _query = '';
   final _searchCtl = TextEditingController();
+  // Jump-to-original. A key per rendered message lets Scrollable.ensureVisible do the work with
+  // variable-height bubbles, which an offset calculation cannot. ListView.builder only builds near
+  // the viewport, so a target further away has no context yet — hence the coarse scroll first.
+  final _scroll = ScrollController();
+  final Map<String, GlobalKey> _msgKeys = {};
+  String? _flashId;                 // briefly outlined after a jump, so the eye lands on it
   final _ctl = TextEditingController();
   Timer? _poll;
   String _peerPk = '';                // the peer's DM key, needed to decrypt attachments
@@ -6980,7 +7042,50 @@ class _DmChatScreenState extends State<DmChatScreen> {
   }
 
   @override
-  void dispose() { _poll?.cancel(); _ctl.dispose(); _searchCtl.dispose(); super.dispose(); }
+  void dispose() {
+    _poll?.cancel(); _ctl.dispose(); _searchCtl.dispose(); _scroll.dispose();
+    super.dispose();
+  }
+
+  /// Scroll to the message a quote came from, and flash it.
+  ///
+  /// Two passes on purpose. The list is lazy, so a message far from the viewport has no BuildContext
+  /// and ensureVisible has nothing to aim at. Jump to a rough position first — which forces the
+  /// target to build — then let ensureVisible land it exactly on the next frame.
+  Future<void> _jumpTo(String id) async {
+    final rowIndex = _rowIndexOf(id);
+    if (rowIndex == null) return;
+    final key = _msgKeys[id];
+    if (key?.currentContext == null && _scroll.hasClients) {
+      final total = _rows().length;
+      if (total > 0) {
+        final frac = 1 - (rowIndex / total);          // reverse: true, so index 0 is the bottom
+        _scroll.jumpTo((_scroll.position.maxScrollExtent * frac)
+            .clamp(0.0, _scroll.position.maxScrollExtent));
+        await WidgetsBinding.instance.endOfFrame;
+      }
+    }
+    final ctx = _msgKeys[id]?.currentContext;
+    if (ctx != null) {
+      await Scrollable.ensureVisible(ctx,
+          alignment: 0.3, duration: const Duration(milliseconds: 250));
+    }
+    if (!mounted) return;
+    setState(() => _flashId = id);
+    await Future.delayed(const Duration(milliseconds: 1200));
+    if (mounted) setState(() => _flashId = null);
+  }
+
+  /// Where a message sits in the rendered rows, so the coarse scroll has something to aim at.
+  int? _rowIndexOf(String id) {
+    var i = 0;
+    for (final m in [..._msgs, ..._pending]) {
+      if (DmCtl.isControl('${m['text']}')) continue;
+      if ('${m['id'] ?? ''}' == id) return i;
+      i++;
+    }
+    return null;
+  }
 
   Future<void> _load({bool quiet = false}) async {
     final convos = await Api.dmInbox();
@@ -7141,6 +7246,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
                   : Builder(builder: (_) {
                       final rows = _rows();
                       return ListView.builder(
+                        controller: _scroll,
                         reverse: true,
                         padding: const EdgeInsets.all(14),
                         itemCount: rows.length,
@@ -7492,13 +7598,27 @@ class _DmChatScreenState extends State<DmChatScreen> {
     return RichText(text: TextSpan(style: base, children: spans));
   }
 
+  /// The id of the message a quote came from, matched by its text — the same lookup _quoteAuthor
+  /// does. Quotes carry the words, not an id, because they must stay readable on a client that knows
+  /// nothing about quoting.
+  String? _quoteTarget(String quote) {
+    final needle = quote.endsWith('…') ? quote.substring(0, quote.length - 1) : quote;
+    for (final m in [..._msgs, ..._pending].reversed) {
+      if (_splitQuote('${m['text']}').$2.startsWith(needle)) return '${m['id'] ?? ''}';
+    }
+    return null;
+  }
+
   Widget _quoteBlock(String quote, bool out) {
     final who = _quoteAuthor(quote);
+    final target = _quoteTarget(quote);
     // A left accent bar via Row, not BoxDecoration's border: a non-uniform Border with a
     // borderRadius throws at paint time.
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
-      child: ClipRRect(
+      child: GestureDetector(
+        onTap: (target == null || target.isEmpty) ? null : () => _jumpTo(target),
+        child: ClipRRect(
         borderRadius: BorderRadius.circular(7),
         child: IntrinsicHeight(
           child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, mainAxisSize: MainAxisSize.min, children: [
@@ -7522,6 +7642,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
             ),
           ]),
         ),
+        ),
       ),
     );
   }
@@ -7540,7 +7661,11 @@ class _DmChatScreenState extends State<DmChatScreen> {
       alignment: out ? Alignment.centerRight : Alignment.centerLeft,
       child: Opacity(
         opacity: pending ? 0.6 : 1,             // "on its way" without a second widget
-        child: GestureDetector(
+        key: _msgKeys.putIfAbsent('${m['id'] ?? ''}', () => GlobalKey()),
+        child: _SwipeToReply(
+          fromRight: out,
+          onReply: () => setState(() { _replyTo = m; _emoji = false; }),
+          child: GestureDetector(
           onLongPress: () => _msgMenu(m),
           child: Container(
             // Tight inside a block, loose between blocks — the spacing IS the grouping cue.
@@ -7549,6 +7674,11 @@ class _DmChatScreenState extends State<DmChatScreen> {
             constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
             decoration: BoxDecoration(
               color: out ? kAccent : kCard,
+              // A jump lands the message on screen; the outline says WHICH one, which scrolling alone
+              // does not when several bubbles look alike.
+              border: _flashId != null && _flashId == '${m['id'] ?? ''}'
+                  ? Border.all(color: const Color(0xFF4DD0A7), width: 2)
+                  : null,
               // Only the last bubble of a block keeps its tail; the ones above square off against it.
               borderRadius: BorderRadius.only(
                 topLeft: out ? r16 : (cont ? r5 : r16),
@@ -7581,6 +7711,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
                 ]),
               ],
             ],
+          ),
           ),
           ),
         ),
