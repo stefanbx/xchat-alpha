@@ -178,7 +178,15 @@ def api_history(acct, count='50'):
 # request — that made /api/feed the whole node's bottleneck (~4 req/s). Cache it for a few seconds:
 # clients read the cached JSON, and at most one thread re-aggregates per window (others serve stale
 # rather than pile on). A social feed being a few seconds behind is invisible; the throughput is not.
-FEED_TTL = float(os.environ.get('XC_FEED_TTL', '5'))
+# Match the CLIENT's poll interval (12s in main.dart). At 5s the node re-ran a full relay fan-out
+# aggregation roughly every 5 seconds — measured: 5 re-aggregations in 26s of ordinary polling, about
+# 1s of work each, so ~20% of a core burned continuously for a feed nobody asks for more often than
+# every 12s. Aggregating faster than anyone reads changes no user-visible latency; it only costs the
+# operator, and operators run this on laptops.
+#
+# Not raised FURTHER than the poll: the warm path serves the stale cache while refreshing, so a TTL
+# well above the poll would hand out content noticeably older than the client could have had.
+FEED_TTL = float(os.environ.get('XC_FEED_TTL', '12'))
 _feed_ts = [0.0]
 _feed_lock = threading.Lock()
 
