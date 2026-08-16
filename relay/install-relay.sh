@@ -40,6 +40,15 @@
 #                                         exist on-chain. The seed is written to ~/.xchat-relay/
 #                                         operator.seed, mode 600 — back it up.
 #
+#   sh install-relay.sh --tailscale   free PERMANENT address via Tailscale Funnel, no domain needed.
+#                                         Install tailscale, run `tailscale up`, enable Funnel for the
+#                                         tailnet, then use this. Unlike the default quick tunnel the
+#                                         name never changes, so it can be announced on-chain, and it
+#                                         is not subject to the quick-tunnel rate limit.
+#   sh install-relay.sh --domain relay.example.com --tunnel-token TOKEN
+#                                         most reliable of all: your own domain over a NAMED Cloudflare
+#                                         tunnel. Unlimited bandwidth, stable name. Needs a domain.
+#
 #   sh install-relay.sh --status      what's running, the public URL, and whether you're announced
 #   sh install-relay.sh --update      get the latest code, keeping your address, keys and data
 #   sh install-relay.sh --check-update   just say whether a newer version exists
@@ -123,6 +132,7 @@ stop_service() {
 ACTION=install
 DOMAIN=''
 TUNNEL_TOKEN=''
+USE_TAILSCALE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --status)          ACTION=status ;;
@@ -142,6 +152,7 @@ while [ $# -gt 0 ]; do
         --domain=*)        DOMAIN="${1#*=}" ;;
         --tunnel-token)    shift; TUNNEL_TOKEN="${1:-}"; [ -n "$TUNNEL_TOKEN" ] || die "--tunnel-token needs a value" ;;
         --tunnel-token=*)  TUNNEL_TOKEN="${1#*=}" ;;
+        --tailscale)       USE_TAILSCALE=1 ;;
         *) die "unknown option: $1  (try --help)" ;;
     esac
     shift
@@ -470,8 +481,14 @@ DOMAIN=$(printf '%s' "$DOMAIN" | sed 's#^[a-zA-Z]*://##; s#/*$##')
 case "$DOMAIN" in
     *[!a-zA-Z0-9.-]*) die "--domain should be a bare hostname, e.g. relay.example.com (got: $DOMAIN)" ;;
 esac
+# A quick tunnel is the DEFAULT because it needs nothing from the operator, but it is also the least
+# reliable thing here: the hostname churns on every restart (so it can never be announced on-chain)
+# and the endpoint that mints it rate-limits — error 1015 / HTTP 429 — which on a real operator's
+# relay turned a passing blip into hours of downtime. Prefer, in order: a named tunnel (your own
+# domain, unlimited bandwidth), Tailscale Funnel (free, no domain, stable *.ts.net name), then quick.
 if   [ -n "$DOMAIN" ] && [ -n "$TUNNEL_TOKEN" ]; then MODE=named
 elif [ -n "$DOMAIN" ];                          then MODE=direct
+elif [ "$USE_TAILSCALE" = 1 ];                  then MODE=tailscale
 else                                                 MODE=quick
 fi
 PUBLIC_URL=''
@@ -928,6 +945,32 @@ PYCFG
             sleep "$TWAIT"; continue
         fi
         TFAIL=0                                # a tunnel came up: forget the backoff
+    elif [ "$MODE" = tailscale ]; then
+        # Tailscale Funnel: a FREE, stable public hostname with no domain of your own and no
+        # quick-tunnel rate limit. The name (machine.tailnet.ts.net) never changes, so unlike a quick
+        # tunnel it can actually be announced on-chain and stay valid across restarts.
+        : > "$XC_HOME/tunnel.log"
+        TUNNEL_PORT="$PORT"; [ "$WITH_NODE" = 1 ] && TUNNEL_PORT="$NODE_PORT"
+        if ! command -v tailscale >/dev/null 2>&1; then
+            log "tailscale is not installed — install it and run 'tailscale up', then restart"
+            sleep 60; continue
+        fi
+        # DNSName is authoritative and comes back with a trailing dot; strip it.
+        URL=$(tailscale status --json 2>/dev/null \
+              | sed -n 's/.*"DNSName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//')
+        if [ -z "$URL" ]; then
+            log "tailscale is installed but not logged in — run 'tailscale up', then restart"
+            sleep 60; continue
+        fi
+        # --bg so it survives this shell; re-running is idempotent.
+        tailscale funnel --bg "$TUNNEL_PORT" >>"$XC_HOME/tunnel.log" 2>&1 || {
+            log "tailscale funnel refused — enable Funnel for this tailnet in the admin console"
+            log "  (Access controls -> nodeAttrs -> funnel), then restart. Last lines:"
+            tail -3 "$XC_HOME/tunnel.log" 2>/dev/null | sed 's/^/  tailscale: /'
+            sleep 120; continue
+        }
+        URL="https://$URL"
+        CF_PID=''                       # funnel runs inside the tailscaled daemon, not as our child
     elif [ "$MODE" = named ]; then
         : > "$XC_HOME/tunnel.log"
         "$CF" tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" >>"$XC_HOME/tunnel.log" 2>&1 &
@@ -997,7 +1040,11 @@ PYCFG
         # watches for EXITS, that state was invisible: measured 10 hours of a node serving nobody while
         # --status happily reported "relay is running". Probe the public URL itself, and only after
         # several consecutive failures (~3 min) so a blip or a sleeping laptop doesn't churn the address.
-        if [ -n "$CF_PID" ] && [ -n "$URL" ]; then
+        # Probe whenever we HAVE a public URL, not only when we own a cloudflared child. Tailscale
+        # Funnel runs inside the tailscaled daemon, so CF_PID is empty there and gating on it would
+        # have left exactly the blind spot this check exists to close: a funnel that stops routing
+        # while the relay keeps happily reporting itself up.
+        if [ -n "$URL" ] && [ "$MODE" != direct ]; then
             HB=$((HB + 5))
             if [ "$HB" -ge 60 ]; then
                 HB=0
@@ -1008,7 +1055,16 @@ PYCFG
                     log "public URL not answering ($DEAD/3): $URL"
                     if [ "$DEAD" -ge 3 ]; then
                         log "tunnel is up but unreachable — rebuilding it"
-                        kill $CF_PID 2>/dev/null || true
+                        # With a cloudflared child, killing it exits the inner loop and the outer one
+                        # mints a fresh tunnel. Tailscale Funnel has no child of ours to kill, so drop
+                        # the relay instead: same effect, the outer loop re-runs `tailscale funnel`.
+                        # Without this branch the probe above would spot the outage and then sit there
+                        # unable to act on it, which is worse than not probing at all.
+                        if [ -n "$CF_PID" ]; then
+                            kill $CF_PID 2>/dev/null || true
+                        else
+                            kill $RELAY_PID 2>/dev/null || true
+                        fi
                         DEAD=0
                     fi
                 fi
