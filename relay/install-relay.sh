@@ -236,6 +236,20 @@ case "$ACTION" in
     status)
         if pgrep -f "$XC_HOME/run.sh" >/dev/null 2>&1; then ok "relay is running"
         else warn "relay is not running"; fi
+        # Running NOW is not the same as coming back after a reboot, and this is the exact gap that bit
+        # a real operator: a relay started via the nohup fallback (or an enable that never took) gave
+        # no sign here that it would vanish on the next restart. --status is where you look when it is
+        # already broken, so it has to say whether boot-persistence is actually set up.
+        if command -v systemctl >/dev/null 2>&1 && [ -f "$UNIT" ]; then
+            if systemctl --user is-enabled xchat-relay >/dev/null 2>&1; then
+                ok "starts on boot (systemd service enabled)"
+            else
+                warn "will NOT start on boot — the service is installed but not enabled"
+                say "  so if the machine reboots or sleeps, the relay does not come back on its own."
+                say "  fix it once:  sudo loginctl enable-linger $(id -un)"
+                say "                systemctl --user enable xchat-relay"
+            fi
+        fi
         if [ -f "$XC_HOME/public-url.txt" ]; then
             PUB=$(cat "$XC_HOME/public-url.txt")
             # "running" is not "reachable". A slept laptop leaves cloudflared alive and retrying, and
@@ -1388,8 +1402,21 @@ EOF
         systemctl --user daemon-reload
         # without lingering, the relay stops the moment the operator logs out
         loginctl enable-linger "$(id -un)" >/dev/null 2>&1 || \
-            warn "couldn't enable lingering — the relay will stop when you log out"
-        systemctl --user enable --now xchat-relay >/dev/null 2>&1 && STARTED=systemd
+            warn "couldn't enable lingering — the relay stops at logout (fix: sudo loginctl enable-linger $(id -un))"
+        # Do NOT swallow this. When `enable --now` fails — no user D-Bus session over SSH is the common
+        # case — the old code fell SILENTLY to the nohup path below, the relay ran until the next sleep
+        # or reboot, and then died with nothing anywhere saying why. A running relay that is not ENABLED
+        # does not survive a restart, and that distinction has to be said out loud, not hidden in /dev/null.
+        _en=$(systemctl --user enable --now xchat-relay 2>&1)
+        if systemctl --user is-active xchat-relay >/dev/null 2>&1; then
+            STARTED=systemd
+            if ! systemctl --user is-enabled xchat-relay >/dev/null 2>&1; then
+                warn "the relay is running but is NOT enabled for boot — it will die on the next reboot"
+                [ -n "$_en" ] && printf '%s\n' "$_en" | sed 's/^/  systemd: /'
+                say "  fix it once:  sudo loginctl enable-linger $(id -un)"
+                say "                systemctl --user enable xchat-relay"
+            fi
+        fi
     fi
     if [ -z "$STARTED" ]; then
         warn "no systemd user session here — starting it in the background instead"
