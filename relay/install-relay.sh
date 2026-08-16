@@ -71,7 +71,17 @@ WORKD_PORT="${XC_WORKD_PORT:-7503}"
 # proof-of-work that a tip waits on. Running one locally is what makes YOUR tips fast, because the work
 # is then done by this machine instead of a public RPC that is frequently down.
 NODE_PORT="${XC_NODE_PORT:-8790}"
+# Default OFF for a first install, but INHERIT whatever an existing install chose. --update is
+# documented as keeping your setup, and it did not keep this one: a relay installed --with-node came
+# back after an update with WITH_NODE=0, so kt_server was gone, the tunnel pointed at the relay
+# instead of the node, and every /api path 404'd. From outside that looks exactly like a broken
+# tunnel — which is how it went unnoticed on the maintainer's own relay. An explicit --with-node or
+# --no-node on the command line still wins; this only supplies the default.
 WITH_NODE="${XC_WITH_NODE:-0}"
+if [ -z "${XC_WITH_NODE:-}" ] && [ -f "$XC_HOME/run.sh" ]; then
+    _prev=$(sed -n 's/^WITH_NODE=\([01]\)$/\1/p' "$XC_HOME/run.sh" | head -1)
+    [ -n "$_prev" ] && WITH_NODE="$_prev"
+fi
 # Name of the Cloudflare Worker that fronts this node (see --setup-worker). SHORT on purpose: the
 # on-chain link holds 32 bytes of hostname, and the final host is <name>.<account>.workers.dev — so
 # every character here is one fewer available to the account subdomain, which the operator can't change.
@@ -573,7 +583,25 @@ fetch "$SRC/backend/xc_reldir.py"  "$XC_HOME/xc_reldir.py"
 fetch "$SRC/relay/work/nano_work_cl.c" "$XC_HOME/nano_work_cl.c" 2>/dev/null || true
 "$PY" -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$XC_HOME/xc_relayd.py" \
     || die "the downloaded relay is not valid Python — the download was truncated or tampered with"
-fetch "$SRC/relay/install-relay.sh" "$SELF" && chmod +x "$SELF"   # so --status/--uninstall work later
+# Update THIS script via a temp file and an atomic mv — never by writing over it in place.
+#
+# `sh` reads a script incrementally, seeking by byte offset as it goes. Overwriting the file it is
+# currently executing means the next read comes from DIFFERENT bytes at the same offset, and the shell
+# resumes mid-statement: observed as `syntax error near unexpected token 'fi'` at a line that is
+# perfectly valid in both the old and new file. It only ever "worked" when the two happened to line
+# up, which is a coin flip that every --update was taking — the new installer is never the same length
+# as the old one.
+#
+# mv replaces the directory entry; the running shell keeps its open inode and finishes reading the
+# ORIGINAL bytes, while the next invocation picks up the new file. Same destination, no torn read.
+_self_new="$XC_HOME/.install-relay.sh.new"
+if fetch "$SRC/relay/install-relay.sh" "$_self_new" \
+   && [ -s "$_self_new" ] && sh -n "$_self_new" 2>/dev/null; then
+    chmod +x "$_self_new" && mv -f "$_self_new" "$SELF"
+else
+    rm -f "$_self_new"
+    warn "could not refresh the installer itself — keeping the current copy"
+fi
 # Fingerprint what we just installed, so --status and --check-update can tell the operator when the
 # shipped code has moved on. A relay has no self-update path like the app's signed releases, so
 # without this an operator has no way to know a fix exists short of being told.
