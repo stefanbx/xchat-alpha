@@ -159,7 +159,7 @@ Future<void> resolveWorkBase() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.4.2'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.4.3'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
