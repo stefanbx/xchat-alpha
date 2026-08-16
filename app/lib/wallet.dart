@@ -160,4 +160,27 @@ class NanoWallet {
       return null;
     }
   }
+
+  // ---- DM attachments ----
+  // Same box, raw bytes in and out. An attachment is stored as an ordinary blob on a relay, so if the
+  // bytes went up as-is, "the relay only ever sees ciphertext" would hold for the words of a DM and be
+  // false for its photos — the one part of a private message most worth reading. Sealing to RAW bytes
+  // rather than base64 also matters: blob_put base64s whatever it is handed, so returning base64 here
+  // would encode twice and put ~1.8x the bytes of the image on the wire.
+
+  /// Seal raw bytes for a peer → raw (nonce+ciphertext) bytes, ready to store as a blob.
+  Uint8List dmSealBytes(String peerPkHex, Uint8List bytes) {
+    final box = pnacl.Box(myPrivateKey: _dmKey, theirPublicKey: pnacl.PublicKey(_bytesOfHex(peerPkHex)));
+    return Uint8List.fromList(box.encrypt(bytes));
+  }
+
+  /// Open raw (nonce+ciphertext) bytes from/for a peer → the original bytes, or null if not ours.
+  Uint8List? dmOpenBytes(String peerPkHex, Uint8List sealed) {
+    try {
+      final box = pnacl.Box(myPrivateKey: _dmKey, theirPublicKey: pnacl.PublicKey(_bytesOfHex(peerPkHex)));
+      return Uint8List.fromList(box.decrypt(pnacl.EncryptedMessage.fromList(sealed)));
+    } catch (_) {
+      return null;
+    }
+  }
 }

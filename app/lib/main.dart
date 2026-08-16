@@ -276,7 +276,7 @@ class Settings {
   double defaultTip;
   int relaySplit;    // % of a tip that rewards the relay serving the media
   int reposterSplit; // % of a tip that rewards whoever reposted it
-  bool notifyLike, notifyComment, notifyTip;
+  bool notifyLike, notifyComment, notifyTip, notifyDm;
   int forYouFreshness;      // For You ranking: 0 = popular, 1 = balanced, 2 = latest
   bool forYouBoostFollows;  // boost posts from people you follow
   bool autoSweep;           // auto-forward balance above the safety cap to a savings address
@@ -288,6 +288,7 @@ class Settings {
     this.notifyLike = true,
     this.notifyComment = true,
     this.notifyTip = true,
+    this.notifyDm = true,
     this.forYouFreshness = 1,
     this.forYouBoostFollows = true,
     this.autoSweep = false,
@@ -310,6 +311,7 @@ class SettingsStore {
         notifyLike: m['notifyLike'] ?? true,
         notifyComment: m['notifyComment'] ?? true,
         notifyTip: m['notifyTip'] ?? true,
+        notifyDm: m['notifyDm'] ?? true,
         forYouFreshness: (m['forYouFreshness'] as num?)?.toInt() ?? 1,
         forYouBoostFollows: m['forYouBoostFollows'] ?? true,
         autoSweep: m['autoSweep'] ?? false,
@@ -330,6 +332,7 @@ class SettingsStore {
           'notifyLike': s.notifyLike,
           'notifyComment': s.notifyComment,
           'notifyTip': s.notifyTip,
+          'notifyDm': s.notifyDm,
           'forYouFreshness': s.forYouFreshness,
           'forYouBoostFollows': s.forYouBoostFollows,
           'autoSweep': s.autoSweep,
@@ -1636,6 +1639,41 @@ class Api {
 
   // encrypted DMs: seal ON-DEVICE (NaCl crypto_box), relay only the ciphertext — the node never
   // sees plaintext or any secret.
+  // An attachment is: seal the bytes to the peer, park the SEALED bytes in an ordinary blob, then send
+  // a normal DM whose (also sealed) text carries the blob's cid. The relay stores a blob it cannot read
+  // and a message it cannot read, and never learns the two belong together beyond what the recipient's
+  // own fetch reveals. Marker goes on its own first line so a caption can follow it, and so a client
+  // that predates attachments shows one odd line plus a readable caption rather than nothing at all.
+  static const dmImgTag = 'xchat:img:';
+
+  static Future<Map<String, dynamic>?> dmSendImage(String to, Uint8List bytes, String caption) async {
+    final w = gWallet;
+    if (w == null) return null;
+    final peer = await dmKeyGet(to);
+    if (peer == null) return {'ok': false, 'error': 'recipient has not enabled DMs yet'};
+    final cid = await blobPut(w.dmSealBytes(peer, bytes));
+    if (cid == null || cid.isEmpty) {
+      return {'ok': false, 'error': 'could not store the image (${lastBlobErr ?? "no cid"})'};
+    }
+    final body = caption.trim();
+    return dmSend(to, body.isEmpty ? '$dmImgTag$cid' : '$dmImgTag$cid\n$body');
+  }
+
+  /// Fetch + decrypt a DM attachment. `peerPk` is the other party's DM key for this conversation —
+  /// the same box opens messages in both directions, so this works for what you sent too.
+  static Future<Uint8List?> dmImage(String cid, String peerPk) async {
+    final w = gWallet;
+    if (w == null) return null;
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/media?cid=$cid')).timeout(const Duration(seconds: 45));
+      final b64 = jsonDecode(r.body)['b64'];
+      if (b64 == null) return null;
+      return w.dmOpenBytes(peerPk, base64Decode(b64));
+    } catch (_) {
+      return null;
+    }
+  }
+
   static Future<Map<String, dynamic>?> dmSend(String to, String text) async {
     final w = gWallet;
     if (w == null) return null;
@@ -1661,19 +1699,24 @@ class Api {
       final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'));
       final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
       final convos = <String, List<Map<String, dynamic>>>{};
+      // The peer's DM key, kept per conversation: attachments are sealed to this same box, so the
+      // chat screen needs it to decrypt them and would otherwise have to re-fetch it per image.
+      final peerKeys = <String, String>{};
       for (final m in dms) {
         final outgoing = m['from'] == w.account;
         final peerAcc = '${outgoing ? m['to'] : m['from']}';
         final peerPk = '${outgoing ? m['to_pk'] : m['from_pk']}';
         final plain = w.dmOpen(peerPk, '${m['ct']}');      // decrypts locally; null if not ours
         if (plain == null) continue;
+        peerKeys[peerAcc] = peerPk;                        // only from messages that actually opened
         (convos[peerAcc] ??= []).add({'from': m['from'], 'outgoing': outgoing, 'text': plain, 'ts': m['ts']});
       }
       for (final lst in convos.values) {
         lst.sort((a, b) => (a['ts'] as int).compareTo(b['ts'] as int));
       }
       final out = convos.entries
-          .map((e) => {'peer': e.key, 'messages': e.value, 'last_ts': e.value.last['ts']})
+          .map((e) => {'peer': e.key, 'messages': e.value, 'last_ts': e.value.last['ts'],
+                       'peer_pk': peerKeys[e.key] ?? ''})
           .toList();
       out.sort((a, b) => (b['last_ts'] as int).compareTo(a['last_ts'] as int));
       return out.cast<Map<String, dynamic>>();
@@ -3427,20 +3470,69 @@ class _FeedScreenState extends State<FeedScreen> {
     try {
       final convos = await Api.dmInbox();
       var unread = 0;
+      final fresh = <Map<String, dynamic>>[];     // newest incoming per conversation, for alerting
       for (final c in convos) {
         final msgs = (c['messages'] as List?) ?? const [];
         var lastIn = 0;
+        var lastText = '';
         for (final m in msgs) {
           if ((m as Map)['outgoing'] != true) {
             final ts = (m['ts'] ?? 0) as int;
-            if (ts > lastIn) lastIn = ts;
+            if (ts > lastIn) { lastIn = ts; lastText = '${m['text'] ?? ''}'; }
           }
         }
         if (lastIn > _dmSeenTs) unread++;
+        if (lastIn > 0) fresh.add({'peer': c['peer'], 'ts': lastIn, 'text': lastText});
       }
       if (mounted) setState(() => _dmUnread = unread);
       Notifs.setBadge(unread);   // unread-DM count on the launcher icon
+      await _alertNewDms(fresh);
     } catch (_) {}
+  }
+
+  // Raise an Android alert for a DM that arrived since the last check. Until now a new message only
+  // ever moved a silent badge, so unless you happened to look at the app you did not know.
+  //
+  // Deliberately LOCAL. Likes, comments and tips route through the relay's notify queue, and it would
+  // have been less code to do the same here — but that queue stores {from, to, ts} in the clear, so
+  // every DM would publish "A messaged B at T" to a relay. That metadata does not exist today, and
+  // withholding it is most of the point of sealing the messages. The app already polls and decrypts,
+  // so it has everything it needs; the preview is built from plaintext that never leaves the device.
+  Future<void> _alertNewDms(List<Map<String, dynamic>> fresh) async {
+    final p = await SharedPreferences.getInstance();
+    final seen = p.getInt('dm_alert_ts') ?? -1;
+    var maxTs = seen < 0 ? 0 : seen;
+    for (final f in fresh) {
+      final ts = f['ts'] as int;
+      if (ts > maxTs) maxTs = ts;
+    }
+    if (seen < 0) {                    // first run: baseline, don't alert for the entire history
+      await p.setInt('dm_alert_ts', maxTs);
+      return;
+    }
+    if (_settings.notifyDm) {
+      for (final f in fresh) {
+        final ts = f['ts'] as int;
+        if (ts <= seen) continue;
+        final peer = '${f['peer']}';
+        final name = ProfileCache.I.displayName(peer, '');
+        Notifs.show('dm$peer$ts'.hashCode & 0x7fffffff,
+            name.trim().isEmpty ? '💬 New message' : '💬 $name', _dmPreview('${f['text']}'));
+      }
+    }
+    if (maxTs > seen) await p.setInt('dm_alert_ts', maxTs);
+  }
+
+  // The shade should show the message, not our wire format: drop quote lines and turn an attachment
+  // marker into "📷 Photo" (plus its caption) rather than printing a cid at the reader.
+  String _dmPreview(String text) {
+    var s = text.split('\n').where((l) => !l.startsWith('>')).join(' ').trim();
+    if (s.startsWith(Api.dmImgTag)) {
+      final sp = s.indexOf(' ');
+      final rest = sp < 0 ? '' : s.substring(sp + 1).trim();
+      s = rest.isEmpty ? '📷 Photo' : '📷 $rest';
+    }
+    return s.length > 140 ? '${s.substring(0, 140)}…' : s;
   }
 
   Future<void> _openChat(String account, String handle) async {
@@ -4681,6 +4773,7 @@ class _FeedScreenState extends State<FeedScreen> {
               toggle('Likes', 'Android alert when someone likes your post', _settings.notifyLike, (v) => _settings.notifyLike = v),
               toggle('Comments', 'Android alert when someone comments', _settings.notifyComment, (v) => _settings.notifyComment = v),
               toggle('Tips', 'Android alert when someone tips you', _settings.notifyTip, (v) => _settings.notifyTip = v),
+              toggle('Messages', 'Android alert when a DM arrives', _settings.notifyDm, (v) => _settings.notifyDm = v),
 
               section('Privacy'),
               ListTile(
@@ -6367,6 +6460,12 @@ class _DmChatScreenState extends State<DmChatScreen> {
   Map<String, dynamic>? _replyTo;     // the message being replied to, until it is sent or cancelled
   final _ctl = TextEditingController();
   Timer? _poll;
+  String _peerPk = '';                // the peer's DM key, needed to decrypt attachments
+  // Decrypted attachments, by cid. The thread re-polls every 5s and rebuilds on every keystroke, so
+  // without this each image would be re-fetched and re-decrypted constantly — visible as photos that
+  // blink out and reload while you type. `null` value = fetched and failed, so we stop retrying it.
+  final Map<String, Uint8List?> _imgCache = {};
+  final Set<String> _imgLoading = {};
 
   // Quote wire format. The reference to the original rides INSIDE the sealed plaintext as "> "
   // prefixed lines — never as a field on the envelope. A reply_to column would hand the relay the
@@ -6426,6 +6525,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
     final convos = await Api.dmInbox();
     if (!mounted) return;
     final mine = convos.firstWhere((c) => c['peer'] == widget.peer, orElse: () => {});
+    _peerPk = '${mine['peer_pk'] ?? ''}';
     final next = ((mine['messages'] as List?) ?? []).cast<Map<String, dynamic>>();
     // Retire each optimistic bubble once the real one comes back. Match on text + a loose timestamp
     // window: the relay stamps its own receipt time, so requiring equality would leave a permanent
@@ -6468,6 +6568,37 @@ class _DmChatScreenState extends State<DmChatScreen> {
         _ctl.selection = TextSelection.collapsed(offset: body.length);
         _replyTo = q;                     // and put the reply target back too
         _err = (r?['error'] ?? 'send failed').toString();
+      });
+    }
+  }
+
+  // Pick a photo and send it. Same picker settings as a post (quality 88 / maxWidth 1600): a modern
+  // phone photo is several MB raw, and a DM attachment gets sealed and base64'd on the way to a blob
+  // store, so shipping the original would put tens of MB through a relay for one message.
+  Future<void> _sendImage() async {
+    if (_sending) return;
+    final x = await ImagePicker().pickImage(
+        source: ImageSource.gallery, imageQuality: 88, maxWidth: 1600);
+    if (x == null || !mounted) return;
+    final bytes = await x.readAsBytes();
+    if (!mounted) return;
+    final caption = _ctl.text.trim();     // whatever is already typed rides along as the caption
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    setState(() {
+      _sending = true; _err = null; _emoji = false;
+      _ctl.clear();
+    });
+    final r = await Api.dmSendImage(widget.peer, bytes, caption);
+    if (!mounted) return;
+    if (r != null && r['ok'] == true) {
+      await _load();
+      if (mounted) setState(() => _sending = false);
+    } else {
+      setState(() {
+        _sending = false;
+        _ctl.text = caption;              // don't eat a caption the send failed to deliver
+        _ctl.selection = TextSelection.collapsed(offset: caption.length);
+        _err = (r?['error'] ?? 'could not send the image').toString();
       });
     }
   }
@@ -6579,6 +6710,61 @@ class _DmChatScreenState extends State<DmChatScreen> {
         ),
       );
 
+  /// Split an attachment marker off a message body → (cid, caption). Runs AFTER the quote split, so a
+  /// reply that carries a photo works: quote lines, then the marker, then the caption.
+  (String?, String) _splitImg(String body) {
+    if (!body.startsWith(Api.dmImgTag)) return (null, body);
+    final nl = body.indexOf('\n');
+    final cid = (nl < 0 ? body.substring(Api.dmImgTag.length) : body.substring(Api.dmImgTag.length, nl)).trim();
+    if (cid.isEmpty) return (null, body);
+    return (cid, nl < 0 ? '' : body.substring(nl + 1).trimLeft());
+  }
+
+  void _wantImage(String cid) {
+    if (_imgCache.containsKey(cid) || _imgLoading.contains(cid) || _peerPk.isEmpty) return;
+    _imgLoading.add(cid);
+    Api.dmImage(cid, _peerPk).then((b) {
+      if (!mounted) return;
+      _imgLoading.remove(cid);
+      setState(() => _imgCache[cid] = b);
+    });
+  }
+
+  Widget _attachment(String cid, bool out) {
+    _wantImage(cid);                       // kicks off exactly one fetch per cid
+    final bytes = _imgCache[cid];
+    const h = 190.0;
+    Widget inner;
+    if (!_imgCache.containsKey(cid)) {
+      inner = const SizedBox(height: h, width: 190,
+          child: Center(child: SizedBox(height: 22, width: 22,
+              child: CircularProgressIndicator(strokeWidth: 2, color: kAccent))));
+    } else if (bytes == null) {
+      inner = SizedBox(
+        height: h, width: 190,
+        child: Center(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Icon(Icons.image_not_supported_outlined, color: out ? Colors.black54 : kDim, size: 26),
+            const SizedBox(height: 5),
+            // Say which of the two it is. A relay only keeps blobs for so long, and that is a very
+            // different problem from a key mismatch.
+            Text('image unavailable', style: TextStyle(fontSize: 11.5, color: out ? Colors.black54 : kDim)),
+          ]),
+        ),
+      );
+    } else {
+      inner = GestureDetector(
+        onTap: () => Navigator.of(context).push(MaterialPageRoute(
+            builder: (_) => PhotoScreen(bytes: bytes))),
+        child: Image.memory(bytes, fit: BoxFit.cover, width: 250),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 5),
+      child: ClipRRect(borderRadius: BorderRadius.circular(10), child: inner),
+    );
+  }
+
   // Long-press is how both WhatsApp and Messenger expose per-message actions, so it is where people
   // already look for them.
   void _msgMenu(Map<String, dynamic> m) {
@@ -6647,7 +6833,8 @@ class _DmChatScreenState extends State<DmChatScreen> {
   Widget _bubble(Map<String, dynamic> m, {bool cont = false, bool showTime = true}) {
     final out = m['outgoing'] == true;
     final pending = m['pending'] == true;
-    final (quote, body) = _splitQuote('${m['text']}');
+    final (quote, rest) = _splitQuote('${m['text']}');
+    final (imgCid, body) = _splitImg(rest);
     const r16 = Radius.circular(16), r5 = Radius.circular(5);
     return Align(
       alignment: out ? Alignment.centerRight : Alignment.centerLeft,
@@ -6677,8 +6864,11 @@ class _DmChatScreenState extends State<DmChatScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               if (quote != null) _quoteBlock(quote, out),
-              Text(body,
-                  style: TextStyle(color: out ? Colors.black : kText, fontSize: 15, height: 1.3)),
+              if (imgCid != null) _attachment(imgCid, out),
+              // A photo sent with no caption should not leave an empty text line under it.
+              if (body.isNotEmpty || imgCid == null)
+                Text(body,
+                    style: TextStyle(color: out ? Colors.black : kText, fontSize: 15, height: 1.3)),
               if (showTime) ...[
                 const SizedBox(height: 3),
                 Row(mainAxisSize: MainAxisSize.min, children: [
@@ -6769,6 +6959,11 @@ class _DmChatScreenState extends State<DmChatScreen> {
                 icon: Icon(_emoji ? Icons.keyboard : Icons.emoji_emotions_outlined,
                     color: _emoji ? kAccent : kDim),
                 tooltip: _emoji ? 'Keyboard' : 'Emoji',
+              ),
+              IconButton(
+                onPressed: _sending ? null : _sendImage,
+                icon: Icon(Icons.image_outlined, color: _sending ? kLine : kDim),
+                tooltip: 'Send a photo',
               ),
               Expanded(
                 child: TextField(
@@ -7849,8 +8044,12 @@ class _WalletHistoryScreenState extends State<WalletHistoryScreen> {
 }
 
 class PhotoScreen extends StatelessWidget {
-  const PhotoScreen({super.key, required this.cid});
+  // Either a cid (public post media, fetched by MediaImage) or raw bytes (a DM attachment, which is
+  // decrypted on-device and must never be re-fetched as plaintext by cid).
+  const PhotoScreen({super.key, this.cid = '', this.bytes})
+      : assert(cid != '' || bytes != null, 'PhotoScreen needs a cid or bytes');
   final String cid;
+  final Uint8List? bytes;
 
   @override
   Widget build(BuildContext context) {
@@ -7865,7 +8064,9 @@ class PhotoScreen extends StatelessWidget {
         child: InteractiveViewer(
           minScale: 1,
           maxScale: 6,
-          child: MediaImage(cid: cid, fit: BoxFit.contain),
+          child: bytes != null
+              ? Image.memory(bytes!, fit: BoxFit.contain)
+              : MediaImage(cid: cid, fit: BoxFit.contain),
         ),
       ),
     );
