@@ -7,7 +7,7 @@
 # Wallet state is namespaced per instance (XC_NS = port): one node = one identity ("run your own node").
 #
 #   python3 kt_server.py 8790            # serve on :8790 (binds 0.0.0.0 so a phone/relay can reach it)
-import os, sys, json, subprocess, urllib.parse, urllib.request, time, threading, base64, hashlib
+import os, sys, json, subprocess, urllib.parse, urllib.request, time, threading, queue, base64, hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -527,6 +527,114 @@ def api_status():
     except Exception:
         return '{"online":false}'
 
+# ---- PUSH DELIVERY -----------------------------------------------------------------------------
+# A DM used to arrive when the recipient next got round to asking: a 5s poll inside a thread, 12s for
+# the unread badge. That interval IS the product — a chat where a reply can take twelve seconds to
+# appear reads as a mailbox, not a conversation. See docs/PUSH-AND-PRODUCTION.md.
+#
+# What makes this tractable without a central server: /api/dm_send ALREADY comes through a node. The
+# app seals the ciphertext here and the node relays it onward, so the node sees every message in
+# flight that passes through it and the recipient is right there in the record. When both parties use
+# the same node — the alpha reality, and the normal case for any node with a community on it — the
+# send wakes the recipient's stream directly and delivery is sub-second with no polling at all.
+#
+# Different nodes fall back to _dm_watch below, which polls relays ONCE PER NODE on behalf of whoever
+# has a stream open, instead of once per client. Relay-side push would collapse that too, but it needs
+# every relay updated, so it is stage two.
+#
+# THE STREAM CARRIES A NUDGE, NEVER CONTENT: {"ts": ...} meaning "there is something for you". The
+# ciphertext still travels by /api/dm_inbox. One decryption path, the gossip-overlap logic untouched,
+# and a bug in here can delay a message but can never corrupt or leak one.
+_dm_subs = {}                      # account -> {id: queue.Queue}, one entry per open stream
+_dm_subs_lock = threading.Lock()
+_DM_MAX_STREAMS = int(os.environ.get('XC_DM_MAX_STREAMS', '256'))   # threads are finite; shed politely
+_dm_sub_seq = [0]
+
+def dm_subscribe(account):
+    """Register a stream. Returns (id, queue) or (None, None) when the node is already at capacity."""
+    with _dm_subs_lock:
+        if sum(len(v) for v in _dm_subs.values()) >= _DM_MAX_STREAMS:
+            return None, None
+        _dm_sub_seq[0] += 1
+        sid = _dm_sub_seq[0]
+        _dm_subs.setdefault(account, {})[sid] = queue.Queue(maxsize=8)
+        return sid, _dm_subs[account][sid]
+
+def dm_unsubscribe(account, sid):
+    with _dm_subs_lock:
+        subs = _dm_subs.get(account)
+        if subs:
+            subs.pop(sid, None)
+            if not subs:
+                _dm_subs.pop(account, None)      # keep the map from growing one dead account at a time
+
+def dm_notify(account, ts):
+    """Wake every stream for `account`. Never blocks and never raises: a wedged or slow reader must
+    not be able to stall the sender's request, so a full queue simply drops the nudge — the client
+    re-syncs on its next fetch anyway, because the nudge is not the data."""
+    if not account:
+        return 0
+    with _dm_subs_lock:
+        qs = list(_dm_subs.get(account, {}).values())
+    n = 0
+    for q in qs:
+        try:
+            q.put_nowait(ts)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+def dm_watched_accounts():
+    with _dm_subs_lock:
+        return list(_dm_subs.keys())
+
+DM_PING = float(os.environ.get('XC_DM_PING', '20'))       # SSE keep-alive comment interval (s)
+DM_WATCH = float(os.environ.get('XC_DM_WATCH', '4'))      # cross-node poll interval (s)
+_dm_seen = {}                                             # account -> newest ts we have nudged for
+
+def _dm_watch():
+    """Cover the case the fast path cannot: a sender on a DIFFERENT node.
+
+    This is still a poll — but ONE per node on behalf of every open stream, rather than one per
+    client. Ten people in an app used to mean ten pollers; now it means one, and the clients hold a
+    stream that costs nothing while idle.
+
+    Only accounts with a live stream are polled. Nobody watching means no work at all, which matters
+    because most nodes are somebody's laptop.
+    """
+    while True:
+        try:
+            accounts = dm_watched_accounts()
+            if not accounts:
+                time.sleep(DM_WATCH)
+                continue
+            for acc in accounts:
+                try:
+                    with ipc_lock('dm'):
+                        put('/tmp/xc_dm_acct.txt', acc)
+                        # Ask only for what is newer than the last thing we nudged about. On the very
+                        # first pass that is 0, i.e. everything — deliberately: we have no idea what
+                        # the client holds, and one redundant nudge costs a fetch the client was
+                        # going to do anyway.
+                        put('/tmp/xc_dm_since.txt', str(int(_dm_seen.get(acc, 0))))
+                        spawn('xc_dm.py', 'inbox')
+                        res = read('/tmp/xc_dm_result.json', '{}')
+                    newest = 0
+                    for m in (json.loads(res or '{}').get('dms') or []):
+                        newest = max(newest, int(m.get('ts') or 0))
+                    # Strictly newer, or a quiet conversation re-nudges on every pass forever.
+                    if newest > _dm_seen.get(acc, 0):
+                        _dm_seen[acc] = newest
+                        dm_notify(acc, newest)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        time.sleep(DM_WATCH)
+
+threading.Thread(target=_dm_watch, daemon=True).start()
+
 # Link previews. The node fetches, so a reader's phone never touches a stranger's server just for
 # scrolling past their link — see the long note at the top of xc_unfurl.py for why that is the only
 # one of the three possible designs that is honest. All the SSRF guarding lives there.
@@ -664,7 +772,18 @@ def route(path, query, body):
             put('/tmp/xc_dm_peer.txt', q('account')); spawn('xc_dm.py','keyget');       return read('/tmp/xc_dm_result.json','{}')
     if path.startswith('/api/dm_send'):
         with ipc_lock('dm'):
-            put('/tmp/xc_dm_msg.json', json.dumps(body)); spawn('xc_dm.py','send');    return read('/tmp/xc_dm_result.json','{}')
+            put('/tmp/xc_dm_msg.json', json.dumps(body)); spawn('xc_dm.py','send')
+            out = read('/tmp/xc_dm_result.json','{}')
+        # THE FAST PATH. Both parties on this node → the recipient hears about it now, not on their
+        # next poll. Deliberately AFTER the relay push has returned, so a nudge is never sent for a
+        # message that failed to reach a relay: an early nudge would make the recipient fetch, find
+        # nothing, and conclude there was nothing.
+        try:
+            if json.loads(out or '{}').get('ok'):
+                dm_notify(b('to'), int(b('ts') or time.time()))
+        except Exception:
+            pass                      # never let the notify path fail a send that already succeeded
+        return out
     if path.startswith('/api/dm_inbox'):
         with ipc_lock('dm'):
             put('/tmp/xc_dm_acct.txt', q('account'))
@@ -801,7 +920,72 @@ class H(BaseHTTPRequestHandler):
             return self._send_text(RELAY_INSTALLER)
         if not u.path.startswith('/api/') and u.path != '/':   # /api/* is kt_server's; the rest is the relay's
             return self._proxy_relay(raw)
+        # SSE lives here rather than in route(), which is defined to return a finished string. This
+        # response is open-ended by nature — it writes for as long as the client stays.
+        if self.command == 'GET' and u.path.startswith('/api/dm_events'):
+            return self._dm_events(urllib.parse.parse_qs(u.query).get('account', [''])[0])
         self._send(route(u.path, urllib.parse.parse_qs(u.query), body))
+
+    def _dm_events(self, account):
+        """Server-sent events: 'there is something for you', never the thing itself.
+
+        SSE and not a websocket, on purpose. Only one direction is needed — the client still POSTs to
+        send — and this is plain HTTP, so it survives the Cloudflare quick tunnels and workers.dev
+        fronts our operators actually run. A websocket upgrade through a churning tunnel is one more
+        thing that can be silently broken.
+        """
+        if not account:
+            return self._send(json.dumps({'ok': False, 'error': 'account required'}))
+        sid, q = dm_subscribe(account)
+        if sid is None:
+            # Shed, don't queue. A stream that is waiting for a slot looks identical to a stream that
+            # is working, and the client would sit there believing it had push.
+            self.send_response(503)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Retry-After', '30')
+            self.end_headers()
+            return self._write_body(json.dumps({'ok': False, 'error': 'too many streams'}).encode())
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache, no-store')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Connection', 'close')
+            # Nginx and friends buffer proxied responses by default, which for a stream means the
+            # client receives nothing until enough bytes pile up — i.e. push silently degrades to
+            # something worse than polling.
+            self.send_header('X-Accel-Buffering', 'no')
+            self.end_headers()
+            # Say hello immediately. It flushes the headers through any intermediary and lets the
+            # client distinguish "connected" from "connecting" without waiting for the first message.
+            self.wfile.write(b': ok\n\nevent: ready\ndata: {}\n\n')
+            self.wfile.flush()
+            while True:
+                try:
+                    ts = q.get(timeout=DM_PING)
+                    self.wfile.write(('event: dm\ndata: {"ts": %d}\n\n' % int(ts)).encode())
+                    self.wfile.flush()
+                except queue.Empty:
+                    # A comment every DM_PING seconds. Two jobs, and the second is the one that is
+                    # easy to miss:
+                    #
+                    #  - intermediaries in front of a home relay close an idle connection minutes
+                    #    later and tell neither end, so the client sits believing it has push
+                    #  - it is the ONLY way this thread learns the client has gone. Nothing arrives
+                    #    on a dead socket; the failure only surfaces on a write. So the ping interval
+                    #    is also how long a departed client keeps holding a slot against the cap.
+                    #
+                    # Which is why the queue wait IS the ping interval rather than some other number
+                    # next to it. An earlier version waited a hardcoded 5s and then checked whether
+                    # DM_PING had elapsed — so setting DM_PING below 5 did nothing at all, and a
+                    # dead stream was never reaped sooner than 5s no matter how it was configured.
+                    self.wfile.write(b': ping\n\n')
+                    self.wfile.flush()
+        except Exception:
+            pass                       # client went away, or the socket died: nothing to report
+        finally:
+            dm_unsubscribe(account, sid)
 
     def do_OPTIONS(self):
         # CORS PREFLIGHT. Responses already carry Access-Control-Allow-Origin, which is enough for the

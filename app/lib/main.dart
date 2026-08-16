@@ -2660,7 +2660,18 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     // so it is cheap; four hours meant a release could sit unmentioned for most of a day in front of
     // someone with the app open — which is exactly how a 2.4.1 that fixes a stuck wallet goes unseen.
     _updateTimer = Timer.periodic(const Duration(minutes: 30), (_) => _autoCheckUpdate());
+    // Push: the badge updates when a DM is sent, not up to 12s later. The poll below stays as the
+    // safety net — see DmPush — but backs off to 45s while a stream is live.
+    DmPush.onNudge = _refreshDmBadge;
+    _dmBadgeTimer = Timer.periodic(const Duration(seconds: 12), (_) {
+      if (DmPush.live && DateTime.now().difference(_lastBadgePoll).inSeconds < 45) return;
+      _lastBadgePoll = DateTime.now();
+      _refreshDmBadge();
+    });
   }
+
+  Timer? _dmBadgeTimer;
+  DateTime _lastBadgePoll = DateTime.fromMillisecondsSinceEpoch(0);
 
   // THE trigger that matters. Until now the app did not observe lifecycle at all, so a phone that sat
   // in a pocket for an hour came back showing a balance that had been wrong the whole time and stayed
@@ -2671,12 +2682,23 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _autoReceive();
       _refreshDmBadge();
+      final a = gWallet?.account;
+      if (a != null) DmPush.start(a);
+    } else if (state == AppLifecycleState.paused) {
+      // Drop the stream when the app is not in front of anyone. An idle SSE connection is cheaper
+      // than a request every 5s, but only while it is genuinely idle AND closed on the way out —
+      // otherwise push trades a visible battery cost for an invisible one. Android will suspend the
+      // socket anyway; closing it means the node frees the slot instead of discovering the corpse
+      // on its next keep-alive.
+      DmPush.stop();
     }
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _dmBadgeTimer?.cancel();
+    DmPush.stop();
     _batSub?.cancel();
     _connSub?.cancel();
     _republishTimer?.cancel();
@@ -5923,6 +5945,11 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     unawaited(resolveWorkBase()); // pick a fast-PoW (work:local) node for tip settlement, if any
     _refreshNotifs();    // notifications + raise Android alerts for new like/comment/tip
     _refreshDmBadge();   // mail-icon unread count + launcher badge (fire-and-forget)
+    // Open the push stream here rather than in initState: this runs once the wallet exists and kBase
+    // has settled on a reachable node, and a stream opened against the wrong base just fails and
+    // backs off — burning the first two reconnect steps before it can possibly work.
+    final me = gWallet?.account;
+    if (me != null) DmPush.start(me);
     Api.announcement().then((a) { if (mounted) setState(() => _announcement = a); });  // coordinated-event banner
   }
 
@@ -7081,6 +7108,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
   String? _flashId;                 // briefly outlined after a jump, so the eye lands on it
   final _ctl = TextEditingController();
   Timer? _poll;
+  DateTime _lastPoll = DateTime.fromMillisecondsSinceEpoch(0);
   String _peerPk = '';                // the peer's DM key, needed to decrypt attachments
   // Decrypted attachments, by cid. The thread re-polls every 5s and rebuilds on every keystroke, so
   // without this each image would be re-fetched and re-decrypted constantly — visible as photos that
@@ -7139,12 +7167,25 @@ class _DmChatScreenState extends State<DmChatScreen> {
         .then((p) => _sentReadUpTo = p.getInt(_readKey) ?? 0);   // resume the high-water mark
     // A conversation that only loads once is a mailbox, not a chat: a reply landed on the relay and
     // you had to back out of the thread and re-open it to see it. Poll while the thread is on screen.
-    _poll = Timer.periodic(const Duration(seconds: 5), (_) => _load(quiet: true));
+    // Push first, poll as the safety net. While a stream is live the poll drops to 30s, which is
+    // what makes a silently-dead stream cost seconds rather than forever — see DmPush.
+    DmPush.onNudge = () { if (mounted) _load(quiet: true); };
+    final me = gWallet?.account;
+    if (me != null) DmPush.start(me);
+    _poll = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (DmPush.live && DateTime.now().difference(_lastPoll).inSeconds < 30) return;
+      _lastPoll = DateTime.now();
+      _load(quiet: true);
+    });
   }
 
   @override
   void dispose() {
-    _poll?.cancel(); _ctl.dispose(); _searchCtl.dispose(); _scroll.dispose();
+    _poll?.cancel();
+    // Hand the nudge back to the feed screen, which owns it outside a conversation. Leaving this
+    // pointing at a disposed State is a callback into a dead widget on the next message.
+    DmPush.onNudge = null;
+    _ctl.dispose(); _searchCtl.dispose(); _scroll.dispose();
     super.dispose();
   }
 
@@ -8457,6 +8498,106 @@ class PostCard extends StatefulWidget {
   static void _noop() {}
   @override
   State<PostCard> createState() => _PostCardState();
+}
+
+/// A held-open connection to the node that says "there is something for you", so a DM lands when it
+/// is sent rather than when we next get round to asking.
+///
+/// The polling it replaces was 5s inside a thread and 12s for the badge, and that interval IS the
+/// product — a reply that can take twelve seconds to appear reads as a mailbox, not a conversation.
+///
+/// THE STREAM CARRIES A NUDGE, NEVER CONTENT. The ciphertext still arrives by /api/dm_inbox, so
+/// there is exactly one decryption path and the store and gossip-overlap logic are untouched. A bug
+/// in here can delay a message; it cannot corrupt or leak one.
+///
+/// Polling is NOT removed, only slowed. A node that is older than this endpoint, a proxy that
+/// buffers the stream to death, a network that drops it silently — all of them end with a client
+/// that believes it has push and receives nothing. The slow poll is what makes those failures cost
+/// seconds instead of forever.
+class DmPush {
+  static http.Client? _client;
+  static StreamSubscription<String>? _sub;
+  static String _account = '';
+  static int _fails = 0;
+  static Timer? _retry;
+  static bool _wanted = false;
+
+  /// True while a stream is actually established — the callers that slow their polling down check
+  /// this, so believing it wrongly is the one thing that would make delivery worse than before.
+  static bool live = false;
+
+  /// Called on every nudge. The receiver decides what to fetch; this class never touches messages.
+  static void Function()? onNudge;
+
+  static void start(String account) {
+    if (account.isEmpty) return;
+    if (_wanted && _account == account && (live || _retry != null)) return;
+    _account = account;
+    _wanted = true;
+    _connect();
+  }
+
+  static void stop() {
+    _wanted = false;
+    live = false;
+    _retry?.cancel();
+    _retry = null;
+    _sub?.cancel();
+    _sub = null;
+    _client?.close();     // closes the socket, which is what actually ends the request on the node
+    _client = null;
+  }
+
+  static Future<void> _connect() async {
+    if (!_wanted) return;
+    _retry?.cancel();
+    _retry = null;
+    _sub?.cancel();
+    _client?.close();
+    final c = http.Client();
+    _client = c;
+    try {
+      final req = http.Request('GET', Uri.parse('$kBase/api/dm_events?account=$_account'));
+      req.headers['Accept'] = 'text/event-stream';
+      final resp = await c.send(req).timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) {
+        // 503 is the node shedding load and 404 is a node too old to know the endpoint. Neither is
+        // worth retrying hard, and neither is an error the reader should ever see: polling covers it.
+        _fail();
+        return;
+      }
+      _fails = 0;
+      live = true;
+      _sub = resp.stream
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+        // Only the event name is acted on. A payload is deliberately not parsed for anything but
+        // its presence — whatever the node says, the client re-fetches through the normal path.
+        if (line.startsWith('event: dm')) onNudge?.call();
+      }, onDone: _fail, onError: (_) => _fail(), cancelOnError: true);
+    } catch (_) {
+      _fail();
+    }
+  }
+
+  static void _fail() {
+    live = false;
+    _sub?.cancel();
+    _sub = null;
+    _client?.close();
+    _client = null;
+    if (!_wanted || _retry != null) return;
+    // Backoff, because the failure that matters is a node that is down or overloaded, and a tight
+    // reconnect loop is how a client turns that into a worse outage — the same lesson the relay's
+    // tunnel watchdog learned against Cloudflare's rate limiter.
+    _fails = (_fails + 1).clamp(1, 6);
+    final wait = Duration(seconds: [2, 4, 8, 15, 30, 60][_fails - 1]);
+    _retry = Timer(wait, () {
+      _retry = null;
+      _connect();
+    });
+  }
 }
 
 /// Hand a URL to the system browser. EXTERNAL, deliberately: an in-app webview would put our chrome
