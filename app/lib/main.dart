@@ -8,6 +8,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show kIsWeb, setEquals;
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart' show TapGestureRecognizer;
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:image_picker/image_picker.dart';
@@ -2555,6 +2556,10 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   bool _autoSettle = false;
   double _autoThreshold = 0.05, _autoCap = 1.0, _autoSpent = 0.0;
   int _tab = 0; // 0 = Home, 1 = Discover (everyone + search)
+  String? _discoverQ;   // a query handed over by tapping a mention or a hashtag
+
+  /// Jump to Discover with the search already filled in.
+  void _openDiscover(String q) => setState(() { _discoverQ = q; _tab = 2; });
   int _homeFeed = 0; // 0 = For You (ranked), 1 = Following (STRICT: only accounts you follow). Open on
   // For You so a user who follows nobody isn't greeted by an empty Following tab.
   List<Map<String, dynamic>> _outbox = []; // posts composed OFFLINE, queued + auto-flushed on reconnect
@@ -3492,6 +3497,21 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         replyingToHandle: post.replyTo == null ? '' : (_postById(post.replyTo)?.handle ?? ''),
         onQuote: () => _quotePost(post),
         onOpenThread: () => _openThread(post),
+        // A handle resolves to an account only here, where the feed's view of who is who lives.
+        onTapHandle: (h) {
+          final want = h.toLowerCase();
+          final hit = _knownHandles().entries
+              .where((e) => e.value.toLowerCase() == want)
+              .map((e) => e.key);
+          if (hit.isNotEmpty) {
+            _openProfile(hit.first, h);
+          } else {
+            // Unknown handle: fall back to search rather than doing nothing, since the person may
+            // simply not be in the posts we currently hold.
+            _openDiscover('@$h');
+          }
+        },
+        onTapTag: (t) => _openDiscover('#$t'),
         onOpenProfile: () => _openProfile(post.account, post.handle),
         muted: _muted.contains(post.account),
         blocked: _blocked.contains(post.account),
@@ -6255,6 +6275,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
               ? _ErrorView(msg: _error!, onRetry: _load, onEndpoint: _showEndpoint)
               : _tab == 2
                   ? DiscoverScreen(
+                      initialQuery: _discoverQ,
                       posts: _posts.where((p) => !_hidden(p.account)).toList(),
                       authors: _authors(),
                       follows: _follows,
@@ -8168,12 +8189,14 @@ class DiscoverScreen extends StatefulWidget {
   final Set<String> follows, liked, reposted;
   final Map<String, dynamic> engage;
   final void Function(String account) onToggleFollow;
+  final String? initialQuery;      // set when arriving from a tapped mention or hashtag
   final double Function(String account) pendingOf;
   final int Function(String postId) commentCountOf;
   final void Function(Post) onTipPost, onLikePost, onRepostPost, onReportPost, onCommentPost;
   final void Function(String account, String handle) onOpenProfile;
   const DiscoverScreen(
       {super.key,
+      this.initialQuery,
       required this.posts,
       required this.authors,
       required this.follows,
@@ -8198,6 +8221,24 @@ class DiscoverScreen extends StatefulWidget {
 class _DiscoverScreenState extends State<DiscoverScreen> {
   final _c = TextEditingController();
   String _q = '';
+
+  @override
+  void initState() {
+    super.initState();
+    // Arriving from a tapped #tag or @handle: land with the search already run, rather than on an
+    // empty box the reader has to retype into.
+    final q = widget.initialQuery;
+    if (q != null && q.isNotEmpty) { _q = q; _c.text = q; }
+  }
+
+  @override
+  void didUpdateWidget(DiscoverScreen old) {
+    super.didUpdateWidget(old);
+    final q = widget.initialQuery;
+    if (q != null && q.isNotEmpty && q != old.initialQuery) {
+      setState(() { _q = q; _c.text = q; });
+    }
+  }
 
   double _authorXno(String account) {
     double s = 0;
@@ -8334,6 +8375,10 @@ class PostCard extends StatefulWidget {
   final int commentCount;
   final VoidCallback onTip, onLike, onRepost, onReport, onComment;
   final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete, onReply;
+  /// Tapping an @handle or a #tag inside the body. The card cannot resolve either itself — a handle
+  /// maps to an account only in the feed's view of the network — so it reports and lets the caller act.
+  final void Function(String handle)? onTapHandle;
+  final void Function(String tag)? onTapTag;
   final bool muted, blocked, bookmarked;
   final Post? quoted; // resolved quoted post (for a quote-post), rendered inline
   final bool inThread; // part of an author thread → show a thread affordance
@@ -8358,6 +8403,8 @@ class PostCard extends StatefulWidget {
       this.onOpenProfile,
       this.onQuote,
       this.onOpenThread,
+      this.onTapHandle,
+      this.onTapTag,
       this.onMute,
       this.onBlock,
       this.onBookmark,
@@ -8378,7 +8425,63 @@ class PostCard extends StatefulWidget {
   State<PostCard> createState() => _PostCardState();
 }
 
+// @mentions and #hashtags — the two things a timeline is made of on X, and neither existed here:
+// a mention was grey text you could not tap, so there was no way to pull someone into a thread, and a
+// tag was not a thing at all.
+//
+// Deliberately conservative about what counts. A trailing '.' or ',' is punctuation, not part of the
+// name; an email address is not a mention; a bare '#' is not a tag. Over-matching is worse than
+// under-matching here, because every false positive turns ordinary prose into a wrong link.
+final RegExp _entityRe = RegExp(r'(?<![\w@])@([A-Za-z0-9_.-]{2,32})|(?<![\w#])#([A-Za-z0-9_]{1,48})');
+
 class _PostCardState extends State<PostCard> {
+  // TapGestureRecognizers in a TextSpan are NOT owned by the span: they leak unless disposed. Held
+  // here and cleared on every rebuild, which is the whole reason this lives in a StatefulWidget.
+  final List<TapGestureRecognizer> _taps = [];
+
+  @override
+  void dispose() {
+    for (final t in _taps) {
+      t.dispose();
+    }
+    super.dispose();
+  }
+
+  /// Post body with mentions and tags marked and tappable. Plain text when neither appears, so the
+  /// common post pays nothing.
+  Widget _richBody(String text, TextStyle base) {
+    final matches = _entityRe.allMatches(text).toList();
+    if (matches.isEmpty) return Text(text, style: base, maxLines: null);
+    for (final t in _taps) {
+      t.dispose();
+    }
+    _taps.clear();
+    final spans = <TextSpan>[];
+    var i = 0;
+    for (final m in matches) {
+      if (m.start > i) spans.add(TextSpan(text: text.substring(i, m.start)));
+      final handle = m.group(1);
+      final tag = m.group(2);
+      final rec = TapGestureRecognizer()
+        ..onTap = () {
+          if (handle != null) {
+            widget.onTapHandle?.call(handle);
+          } else if (tag != null) {
+            widget.onTapTag?.call(tag);
+          }
+        };
+      _taps.add(rec);
+      spans.add(TextSpan(
+        text: text.substring(m.start, m.end),
+        style: const TextStyle(color: kAccent, fontWeight: FontWeight.w600),
+        recognizer: rec,
+      ));
+      i = m.end;
+    }
+    if (i < text.length) spans.add(TextSpan(text: text.substring(i)));
+    return RichText(text: TextSpan(style: base, children: spans));
+  }
+
   late bool _expanded = widget.expanded;   // start expanded (full text) for the focused post in a thread
   // Local optimistic like state so the thumb-up responds INSTANTLY on tap — even inside a pushed route
   // (the Thread/conversation screen) that doesn't rebuild when the parent's like set changes. Without
@@ -8483,10 +8586,15 @@ class _PostCardState extends State<PostCard> {
             GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: widget.onOpenThread,
-              child: Text(p.text,
-                  maxLines: (longText && !_expanded) ? 6 : null,
-                  overflow: (longText && !_expanded) ? TextOverflow.ellipsis : TextOverflow.clip,
-                  style: const TextStyle(color: kText, fontSize: 15, height: 1.35)),
+              child: (longText && !_expanded)
+                  // Collapsed: plain Text, because maxLines+ellipsis belongs to Text and a truncated
+                  // tappable span offers links whose end the reader cannot see.
+                  ? Text(p.text,
+                      maxLines: 6,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: kText, fontSize: 15, height: 1.35))
+                  : _richBody(p.text,
+                      const TextStyle(color: kText, fontSize: 15, height: 1.35)),
             ),
             // "Show more" EXPANDS the text in place. It used to open the thread instead, on the reasoning
             // that an inline expand would fight the open-thread tap on the body. It doesn't — the body
