@@ -857,6 +857,7 @@ start_admin
 start_workd
 start_node
 
+TFAIL=0                     # consecutive quick-tunnel failures; drives the retry backoff below
 while : ; do
     # Re-read settings every time round: this is how the settings page applies a change — it writes
     # config.json, stops the relay, and the values below are picked up on the way back up.
@@ -902,10 +903,31 @@ PYCFG
             sleep 1; i=$((i + 1))
         done
         if [ -z "$URL" ]; then
-            log "tunnel did not come up; retrying in 15s"
+            # BACK OFF. This used to retry every 15s forever, which is ~240 requests an hour at
+            # Cloudflare's quick-tunnel endpoint. Cloudflare answers that with error 1015 / HTTP 429,
+            # and because the loop kept hammering at the same rate it never got back out: a transient
+            # failure escalated into a rate-limit the retry itself then sustained. Seen on a real
+            # operator's relay — hours of "tunnel did not come up" every 15s, and a hand-run cloudflared
+            # finally naming it as 429. Doubling to a 10 min ceiling stays responsive to a blip while
+            # letting a rate-limit actually expire.
             kill $CF_PID 2>/dev/null || true; wait $CF_PID 2>/dev/null || true
-            sleep 15; continue
+            TFAIL=$((TFAIL + 1))
+            TWAIT=$((15 * TFAIL * TFAIL)); [ "$TWAIT" -gt 600 ] && TWAIT=600
+            if grep -qE 'error code: 1015|429 Too Many Requests' "$XC_HOME/tunnel.log" 2>/dev/null; then
+                # Say it plainly. "tunnel did not come up" sent an operator hunting their own network
+                # and firewall for hours; the cause was upstream and self-inflicted, and neither is
+                # guessable from that line.
+                [ "$TWAIT" -lt 300 ] && TWAIT=300
+                log "tunnel refused: Cloudflare is RATE-LIMITING this IP (error 1015 / HTTP 429)."
+                log "  Nothing is wrong with your machine or network. Retrying in ${TWAIT}s."
+                log "  It clears on its own; retrying faster only keeps it going. A named tunnel or"
+                log "  a --setup-worker front avoids the quick-tunnel limit entirely."
+            else
+                log "tunnel did not come up (attempt $TFAIL); retrying in ${TWAIT}s"
+            fi
+            sleep "$TWAIT"; continue
         fi
+        TFAIL=0                                # a tunnel came up: forget the backoff
     elif [ "$MODE" = named ]; then
         : > "$XC_HOME/tunnel.log"
         "$CF" tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" >>"$XC_HOME/tunnel.log" 2>&1 &
