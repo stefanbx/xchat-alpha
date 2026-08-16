@@ -7014,7 +7014,18 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
                       final peer = '${c['peer']}';
                       final handle = widget.handleOf(peer);
                       final msgs = (c['messages'] as List?) ?? [];
-                      final last = msgs.isEmpty ? null : msgs.last as Map<String, dynamic>;
+                      // Skip control messages when picking what to preview. The THREAD hides them,
+                      // but this list did not, so a conversation whose most recent event was a
+                      // reaction or a read receipt advertised itself as
+                      // `You: xchat:ctl/1 read {"u":1786897878}` — machine text, on the one screen
+                      // you see before opening anything. The envelope's whole promise is that a
+                      // client which meets one never shows it to a reader; that has to hold on every
+                      // surface, not just the one it was written for.
+                      final visible = msgs
+                          .cast<Map<String, dynamic>>()
+                          .where((m) => !DmCtl.isControl('${m['text']}'))
+                          .toList();
+                      final last = visible.isEmpty ? null : visible.last;
                       return ListTile(
                         onTap: () async {
                           await widget.onOpen(peer, handle);

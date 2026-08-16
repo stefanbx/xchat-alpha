@@ -96,6 +96,36 @@ void main() {
     });
   });
 
+  group('a control message is hidden on EVERY surface, not just the thread', () {
+    test('the newest visible message skips control, however many are stacked on top', () {
+      // The bug this pins, found by looking at the running app: the thread hid control messages and
+      // the INBOX did not, so a conversation whose last event was a read receipt announced itself in
+      // the list as `You: xchat:ctl/1 read {"u":1786897878}`. Machine text, on the one screen you see
+      // before opening anything.
+      //
+      // "Hide the raw line" is not a property of one widget. Any surface that picks "the last
+      // message" has to filter first, and the way to keep that true is to state it here rather than
+      // to remember it.
+      final msgs = <Map<String, dynamic>>[
+        {'text': 'cool feature', 'outgoing': false},
+        {'text': DmCtl.encode('react', {'m': 'abc', 'e': '👍'}), 'outgoing': true},
+        {'text': DmCtl.encode('read', {'u': 1786897878}), 'outgoing': true},
+      ];
+      final visible = msgs.where((m) => !DmCtl.isControl('${m['text']}')).toList();
+      expect(visible.length, 1);
+      expect(visible.last['text'], 'cool feature');
+    });
+
+    test('a conversation of NOTHING but control has no preview at all', () {
+      // Better an empty subtitle than a line of JSON. This is the case that produced the bug: the
+      // filtered list is empty, and the caller must cope rather than index into it.
+      final msgs = <Map<String, dynamic>>[
+        {'text': DmCtl.encode('read', {'u': 1}), 'outgoing': true},
+      ];
+      expect(msgs.where((m) => !DmCtl.isControl('${m['text']}')).isEmpty, isTrue);
+    });
+  });
+
   group('message ids', () {
     test('both sides derive the SAME id from the ciphertext they each hold', () {
       // Neither side can invent an id and no relay may assign one, so it comes from the one thing
