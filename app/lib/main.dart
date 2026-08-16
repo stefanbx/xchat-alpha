@@ -159,7 +159,7 @@ Future<void> resolveWorkBase() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.4.1'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.4.2'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -446,14 +446,36 @@ class Notifs {
   }
 }
 
-// remembers the update version the user dismissed, so the auto-check banner nags once per version, not
-// every launch. ("" = nothing dismissed.)
+// Remembers the update the user dismissed — for A DAY, not forever.
+//
+// It used to store the bare version string and suppress that version permanently. One tap on the ×
+// and the banner never returned, which is wrong for the thing that carries security fixes: the user
+// who most wants to postpone an update today is not saying "never tell me again". A day is long
+// enough that dismissing means something and short enough that nothing important goes unmentioned.
+//
+// Stored as "version|unixSeconds". A legacy bare value (no separator) reads as dismissed at time 0,
+// i.e. already expired — so anyone who dismissed under the old permanent rule is told once more.
 class UpdateDismiss {
   static const _k = 'xchat_update_dismissed';
+  static const _ttl = Duration(days: 1);
+
   static Future<String> get() async =>
-      (await SharedPreferences.getInstance()).getString(_k) ?? '';
+      ((await SharedPreferences.getInstance()).getString(_k) ?? '').split('|').first;
+
+  /// Should the banner stay hidden for this version right now?
+  static Future<bool> suppressed(String version) async {
+    final raw = (await SharedPreferences.getInstance()).getString(_k) ?? '';
+    if (raw.isEmpty) return false;
+    final parts = raw.split('|');
+    if (parts.first != version) return false;              // a different version is always worth showing
+    final at = parts.length > 1 ? (int.tryParse(parts[1]) ?? 0) : 0;
+    final age = DateTime.now().millisecondsSinceEpoch ~/ 1000 - at;
+    return age >= 0 && age < _ttl.inSeconds;
+  }
+
   static Future<void> set(String version) async =>
-      (await SharedPreferences.getInstance()).setString(_k, version);
+      (await SharedPreferences.getInstance()).setString(
+          _k, '$version|${DateTime.now().millisecondsSinceEpoch ~/ 1000}');
 }
 
 // Whether the user has CONFIRMED (by re-entering characters from their backup) that they saved a
@@ -2258,7 +2280,10 @@ class _FeedScreenState extends State<FeedScreen> {
     _refreshChannelAccounts(); // learn which accounts are channels (to keep them out of the feed)
     // re-check for a newer release periodically, not only at launch — so a long-lived session still
     // surfaces the update banner (the launch check is in _bootWallet).
-    _updateTimer = Timer.periodic(const Duration(hours: 4), (_) => _autoCheckUpdate());
+    // Every 30 min, not every 4 hours. The check is one GET that the node answers from a 20s cache,
+    // so it is cheap; four hours meant a release could sit unmentioned for most of a day in front of
+    // someone with the app open — which is exactly how a 2.4.1 that fixes a stuck wallet goes unseen.
+    _updateTimer = Timer.periodic(const Duration(minutes: 30), (_) => _autoCheckUpdate());
   }
 
   @override
@@ -4006,7 +4031,7 @@ class _FeedScreenState extends State<FeedScreen> {
       final r = await Api.releaseCheck();
       if (r == null || r['update'] != true) return;
       final v = '${r['version']}';
-      if (await UpdateDismiss.get() == v) return;   // already dismissed this exact version
+      if (await UpdateDismiss.suppressed(v)) return;   // dismissed this version within the last day
       if (mounted) setState(() => _update = r);
     } catch (_) {}
   }
