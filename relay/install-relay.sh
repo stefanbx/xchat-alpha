@@ -144,7 +144,20 @@ case "$ACTION" in
     status)
         if pgrep -f "$XC_HOME/run.sh" >/dev/null 2>&1; then ok "relay is running"
         else warn "relay is not running"; fi
-        [ -f "$XC_HOME/public-url.txt" ] && say "public URL: $(cat "$XC_HOME/public-url.txt")"
+        if [ -f "$XC_HOME/public-url.txt" ]; then
+            PUB=$(cat "$XC_HOME/public-url.txt")
+            # "running" is not "reachable". A slept laptop leaves cloudflared alive and retrying, and
+            # this used to print the URL as though it worked — for 10 hours, in one measured case. Ask
+            # the address whether it answers, and say plainly when it doesn't.
+            if curl -fsS -m 10 -o /dev/null "$PUB" 2>/dev/null; then
+                ok "public URL answers: $PUB"
+            else
+                warn "public URL is NOT answering: $PUB"
+                say "  The relay is fine locally, but nobody outside can reach it — usually the tunnel"
+                say "  dropped while the machine slept. It re-tests every minute and rebuilds after 3"
+                say "  failures; to force it now:  sh $SELF --stop && sh $SELF --start"
+            fi
+        fi
         # Whether this node is DISCOVERABLE is the thing an operator most needs to know and the thing
         # that used to be invisible: a failed self-announce only ever wrote a line to selfannounce.log,
         # so a node could serve happily for hours while being unreachable to anyone who didn't already
@@ -881,11 +894,34 @@ PYCFG
 
     # If either half dies the pair is useless — the URL would point at nothing, or the relay would
     # keep advertising a hostname that no longer routes. Take both down and rebuild together.
+    HB=0; DEAD=0                       # heartbeat timer + consecutive unreachable count, per tunnel
     while kill -0 $RELAY_PID 2>/dev/null && { [ -z "$CF_PID" ] || kill -0 $CF_PID 2>/dev/null; }; do
         sleep 5
         [ -n "$ADMIN_PID" ] && ! kill -0 $ADMIN_PID 2>/dev/null && start_admin   # keep the page alive
         [ -n "$WORKD_PID" ] && ! kill -0 $WORKD_PID 2>/dev/null && start_workd   # and the work server
         [ -n "$NODE_PID" ] && ! kill -0 $NODE_PID 2>/dev/null && start_node      # and the node
+        # A LIVE tunnel is not a WORKING tunnel. cloudflared survives the laptop sleeping, then sits in
+        # "Retrying connection" forever — process alive, nothing reachable. Because the loop above only
+        # watches for EXITS, that state was invisible: measured 10 hours of a node serving nobody while
+        # --status happily reported "relay is running". Probe the public URL itself, and only after
+        # several consecutive failures (~3 min) so a blip or a sleeping laptop doesn't churn the address.
+        if [ -n "$CF_PID" ] && [ -n "$URL" ]; then
+            HB=$((HB + 5))
+            if [ "$HB" -ge 60 ]; then
+                HB=0
+                if curl -fsS -m 10 -o /dev/null "$URL" 2>/dev/null; then
+                    DEAD=0
+                else
+                    DEAD=$((DEAD + 1))
+                    log "public URL not answering ($DEAD/3): $URL"
+                    if [ "$DEAD" -ge 3 ]; then
+                        log "tunnel is up but unreachable — rebuilding it"
+                        kill $CF_PID 2>/dev/null || true
+                        DEAD=0
+                    fi
+                fi
+            fi
+        fi
         # keep the log from growing without bound on a long-lived install
         if [ "$(wc -c < "$XC_HOME/relay.log" 2>/dev/null || echo 0)" -gt 20000000 ]; then
             tail -c 2000000 "$XC_HOME/relay.log" > "$XC_HOME/relay.log.tmp" 2>/dev/null &&
