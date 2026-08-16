@@ -1144,15 +1144,31 @@ class Api {
 
   // since > 0 asks the node for ONLY posts newer than that ts (incremental poll), so a quiet
   // refresh usually returns an empty list instead of re-downloading the whole feed.
-  static Future<FeedData> feed({int since = 0}) async {
-    final url = since > 0 ? '$kBase/api/feed?since=$since' : '$kBase/api/feed';
+  /// The newest page of the feed. `before` walks backwards through older posts.
+  ///
+  /// Paged because the feed returned EVERY post it had — 625 bytes each, so a thousand posts is
+  /// ~0.6 MB fetched, JSON-parsed on the UI isolate and written to the local cache on every full
+  /// refresh. Invisible at 33 posts, and the one cost here that grows with the network's success.
+  /// A page is bounded work no matter how large the network gets.
+  static bool feedHasMore = false;      // set by the last paged fetch; drives the load-more trigger
+
+  static Future<FeedData> feed({int since = 0, int limit = 0, int before = 0}) async {
+    final q = <String>[
+      if (since > 0) 'since=$since',
+      if (limit > 0) 'limit=$limit',
+      if (before > 0) 'before=$before',
+    ];
+    final url = q.isEmpty ? '$kBase/api/feed' : '$kBase/api/feed?${q.join('&')}';
     final r = await http.get(Uri.parse(url));
     final d = jsonDecode(r.body);
     final c = d['content'] ?? {};
     final posts = (c['posts'] as List?) ?? [];
     // Cache the last FULL feed that actually has content, so a cold-node blip (a machine just restarted
     // and its feed cache is still warming) or an offline launch shows the last feed instead of blanking.
-    if (since == 0 && posts.isNotEmpty) {
+    feedHasMore = c['more'] == true;
+    // Only the FIRST page is cached. Caching a later page would replace the cold-start feed with a
+    // slice from the middle of the timeline, so the next launch would open on old posts.
+    if (since == 0 && before == 0 && posts.isNotEmpty) {
       try {
         (await SharedPreferences.getInstance()).setString('xchat_feed_cache', r.body);
       } catch (_) {}
@@ -2499,6 +2515,11 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                                           // not injected live, so the reader's scroll never jumps
   int _pollTick = 0;                      // every 5th quiet poll does a full reconcile (drops expired)
   final ScrollController _scroll = ScrollController();
+  // One screen holds ~6 cards, so 40 is several screens of runway before the next fetch — enough
+  // that scrolling never waits on the network, small enough that a cold launch parses ~25 KB
+  // instead of the whole timeline.
+  static const _pageSize = 40;
+  bool _loadingMore = false;
   List<Labeler> _labelers = [];
   final Set<String> _shown = {}; // posts the viewer chose to reveal
   int _modIdx = 0;
@@ -2598,6 +2619,12 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     _loadChannels();
     // keep our own head alive on the relays (republish < TTL); also backfills new relays
     WidgetsBinding.instance.addObserver(this);   // resume -> claim immediately (see below)
+    // Load the next page BEFORE the user reaches the end, so the timeline never shows a dead stop.
+    _scroll.addListener(() {
+      if (!_scroll.hasClients) return;
+      final p = _scroll.position;
+      if (p.pixels > p.maxScrollExtent - 1200) _loadMore();
+    });
     _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) => Api.republish());
     // quietly poll the feed so posts from OTHER devices appear on their own (no manual refresh)
     _feedTimer = Timer.periodic(const Duration(seconds: 12), (_) => _refreshFeedQuiet());
@@ -3868,6 +3895,28 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     } finally {
       _autoReceiving = false;
       if (mounted) setState(() => _incomingRaw = BigInt.zero);
+    }
+  }
+
+  /// Fetch the next page of OLDER posts and append. Guarded against re-entry, because a scroll can
+  /// cross the trigger many times before the first request returns and each one would refetch the
+  /// same page.
+  Future<void> _loadMore() async {
+    if (_loadingMore || !Api.feedHasMore || _posts.isEmpty) return;
+    _loadingMore = true;
+    try {
+      final oldest = _posts.map((p) => p.ts).reduce((a, b) => a < b ? a : b);
+      final fd = await Api.feed(limit: _pageSize, before: oldest);
+      if (!mounted || fd.posts.isEmpty) return;
+      // De-dupe by id: a post can arrive in a page AND in the incremental poll, and appending both
+      // would show it twice.
+      final have = {for (final p in _posts) p.id};
+      final add = [for (final p in fd.posts) if (!have.contains(p.id)) p];
+      if (add.isEmpty) return;
+      setState(() => _posts = [..._posts, ...add]);
+    } catch (_) {
+    } finally {
+      _loadingMore = false;
     }
   }
 
@@ -5779,7 +5828,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       // Slim launch: fetch ONLY what the first paint needs — the feed, identity, and moderation labels
       // (3 requests, not 5). Notifications + engagement counts aren't needed to render the feed, so they
       // load just after (see _loadSecondary) — a lighter startup burst and a faster first frame.
-      final results = await Future.wait([Api.feed(), Api.me(), Api.labels()]);
+      final results = await Future.wait([Api.feed(limit: _pageSize), Api.me(), Api.labels()]);
       final fd = results[0] as FeedData;
       final me = results[1] as Map<String, dynamic>;
       final labelers = results[2] as List<Labeler>;

@@ -213,11 +213,37 @@ def api_feed(query=None):
         since = int((query or {}).get('since', ['0'])[0])   # router parses the query and passes it in
     except Exception:
         since = 0
-    if since > 0:
+    # PAGINATION: ?limit=N (newest first), ?before=<ts> for the next page. The feed returned every
+    # post it had — 625 bytes each, so a thousand posts is ~0.6 MB fetched, parsed on the phone's UI
+    # isolate and held in the local cache, on every full refresh. Fine at 33 posts and the one thing
+    # here that gets WORSE as the network succeeds.
+    #
+    # Aggregation is still cached WHOLE (that is the expensive part); this only slices on the way out,
+    # exactly like `since` above. No limit = the full feed, so older clients are unaffected.
+    try:
+        limit = int((query or {}).get('limit', ['0'])[0])
+    except Exception:
+        limit = 0
+    try:
+        before = int((query or {}).get('before', ['0'])[0])
+    except Exception:
+        before = 0
+    if since > 0 or limit > 0 or before > 0:
         try:
             c = json.loads(content)
-            c['posts'] = [p for p in c.get('posts', []) if int(p.get('ts', 0)) > since]
-            c['incremental'] = True
+            posts = c.get('posts', [])
+            if since > 0:
+                posts = [p for p in posts if int(p.get('ts', 0)) > since]
+                c['incremental'] = True
+            if before > 0:
+                posts = [p for p in posts if int(p.get('ts', 0)) < before]
+            # Sort before slicing: "the newest N" is meaningless over an unordered list, and the
+            # aggregation's order is not guaranteed across relays.
+            posts.sort(key=lambda p: int(p.get('ts', 0)), reverse=True)
+            if limit > 0:
+                c['more'] = len(posts) > limit      # tells the client whether another page exists
+                posts = posts[:limit]
+            c['posts'] = posts
             content = json.dumps(c)
         except Exception:
             pass
