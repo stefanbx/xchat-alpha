@@ -76,6 +76,7 @@ Done, each verified before the next was started.
 | G1+2 | @mentions, #hashtags | linked and tappable; mention → profile (search fallback), tag → Discover | on device: `@jiovan` and `#nano` linked, `bob@example.com` and `C#` plain; tapping `#nano` found 1 post |
 | G3a | links in a body | `body.dart`, one scanner, imported by the tests; tap → system browser | 29 tests; on device the fragment stayed inside the URL, both trailing marks outside, ACTION_VIEW dispatched |
 | G3b | link preview cards | node-side unfurl + SSRF guards, card under the post | 54 checks; live: 0.58 s cold / 0.22 s cached, and metadata/localhost/file: all refused on the real host |
+| G4 | accessibility, first pass | labels on the post actions, avatars, images, overflow, previews, send | 6 widget tests reading the real semantics tree |
 
 **S2 is an operator-cost fix, not a user-latency one.** Nothing got faster on the phone; the node
 stopped re-running an aggregation nobody consumed, ~1 s of CPU a time. That matters because operators
@@ -91,6 +92,17 @@ footnote:
 - **The node learns which links a reader loads.** Small next to what it already knows (it served the
   feed those links came from), but not nothing. Serving previews as part of the feed aggregation
   would remove even that.
+
+Accessibility (G4) is a FIRST PASS, and the remainder is not a rounding error:
+
+- **Author-written alt text still does not exist.** Images now announce a role — "a photo in a post
+  by alice" — which beats silence but describes nothing. Real alt text needs a field in the composer
+  and a field on the wire, i.e. a format change, not a label.
+- **Only the feed surfaces were covered.** Settings, the wallet, profiles, channels, Discover and the
+  DM thread have had no pass at all. The DM composer's buttons were already labelled by their
+  tooltips, which is luck rather than design.
+- **Nothing has been tried with a real screen reader.** The tests assert the tree Flutter publishes,
+  which is the right thing to assert and is not the same as TalkBack being usable end to end.
 
 ## Method
 

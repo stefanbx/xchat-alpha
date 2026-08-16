@@ -2344,9 +2344,22 @@ class AuthorAvatar extends StatelessWidget {
                     child: Text(handle.isEmpty ? '?' : handle.substring(0, 1).toUpperCase(),
                         style: TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: radius * 0.62)),
                   );
-        if (!PresenceCache.I.isOnline(account)) return avatar;
+        final who = handle.isEmpty ? 'this account' : handle;
+        if (!PresenceCache.I.isOnline(account)) {
+          // ONE label for the whole avatar, whichever of the three forms it took. Without it, the
+          // initial-letter fallback reads out as a lone capital letter and the image forms read as
+          // nothing at all.
+          return Semantics(
+              image: true, label: 'Avatar of $who', child: ExcludeSemantics(child: avatar));
+        }
         final d = (radius * 0.55).clamp(8.0, 14.0);        // dot scales with the avatar
-        return Stack(clipBehavior: Clip.none, children: [
+        return Semantics(
+          image: true,
+          // The online dot is a 10-pixel green circle — pure colour and position, carrying a fact
+          // that is otherwise unreachable without sight.
+          label: 'Avatar of $who, online',
+          child: ExcludeSemantics(
+            child: Stack(clipBehavior: Clip.none, children: [
           avatar,
           Positioned(
             right: -1, bottom: -1,
@@ -2359,7 +2372,9 @@ class AuthorAvatar extends StatelessWidget {
               ),
             ),
           ),
-        ]);
+            ]),
+          ),
+        );
       },
     );
   }
@@ -3621,7 +3636,10 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         if (p.media != null && p.media!.isNotEmpty)
           ConstrainedBox(
             constraints: const BoxConstraints(maxHeight: 240),
-            child: SizedBox(width: double.infinity, child: MediaImage(cid: p.media!, fit: BoxFit.cover)),
+            child: SizedBox(
+                width: double.infinity,
+                child: MediaImage(
+                    cid: p.media!, fit: BoxFit.cover, label: 'Header image of an article by ${p.handle}')),
           ),
         Padding(
           padding: const EdgeInsets.fromLTRB(18, 18, 18, 32),
@@ -7889,7 +7907,10 @@ class _DmChatScreenState extends State<DmChatScreen> {
               _sending
                   ? const Padding(padding: EdgeInsets.all(10),
                       child: SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: kAccent)))
-                  : IconButton(onPressed: _send, icon: const Icon(Icons.send, color: kAccent)),
+                  : IconButton(
+                      onPressed: _send,
+                      tooltip: 'Send message',
+                      icon: const Icon(Icons.send, color: kAccent)),
             ]),
           ),
           if (_emoji)
@@ -8525,7 +8546,15 @@ class _LinkPreviewState extends State<LinkPreview> {
     final site = '${d['site'] ?? ''}';
     return Padding(
       padding: const EdgeInsets.only(top: 10),
-      child: InkWell(
+      child: Semantics(
+        button: true,
+        link: true,
+        // Read as one thing. Left to its own devices this is three loose text nodes inside a tappable
+        // box, so it announces as an unexplained fragment, then a headline, then a sentence.
+        label: 'Link${site.isEmpty ? '' : ' to $site'}: $title'
+            '${desc.isEmpty ? '' : '. $desc'}',
+        child: ExcludeSemantics(
+        child: InkWell(
         onTap: () => openLink(widget.url),
         borderRadius: BorderRadius.circular(14),
         child: Container(
@@ -8553,6 +8582,8 @@ class _LinkPreviewState extends State<LinkPreview> {
                   style: const TextStyle(color: kDim, fontSize: 13, height: 1.25)),
             ],
           ]),
+        ),
+      ),
         ),
       ),
     );
@@ -8674,11 +8705,17 @@ class _PostCardState extends State<PostCard> {
                 const SizedBox(width: 6),
               ],
               if (p.kind != 'post') _KindBadge(kind: p.kind),
-              InkWell(
-                onTap: () => _menu(context),
-                child: const Padding(
-                    padding: EdgeInsets.only(left: 6),
-                    child: Icon(Icons.more_horiz, size: 18, color: kDim)),
+              Semantics(
+                button: true,
+                label: 'More actions for this post',
+                child: ExcludeSemantics(
+                  child: InkWell(
+                    onTap: () => _menu(context),
+                    child: const Padding(
+                        padding: EdgeInsets.only(left: 6),
+                        child: Icon(Icons.more_horiz, size: 18, color: kDim)),
+                  ),
+                ),
               ),
             ]),
             const SizedBox(height: 3),
@@ -8702,7 +8739,10 @@ class _PostCardState extends State<PostCard> {
                   borderRadius: BorderRadius.circular(14),
                   child: ConstrainedBox(
                     constraints: const BoxConstraints(maxHeight: 170),
-                    child: SizedBox(width: double.infinity, child: MediaImage(cid: p.media!, fit: BoxFit.cover)),
+                    child: SizedBox(
+                width: double.infinity,
+                child: MediaImage(
+                    cid: p.media!, fit: BoxFit.cover, label: 'Header image of an article by ${p.handle}')),
                   ),
                 ),
               ),
@@ -8761,7 +8801,12 @@ class _PostCardState extends State<PostCard> {
                     borderRadius: BorderRadius.circular(16),
                     child: ConstrainedBox(
                       constraints: const BoxConstraints(maxHeight: 380),
-                      child: SizedBox(width: double.infinity, child: MediaImage(cid: p.media!, fit: BoxFit.cover)),
+                      child: SizedBox(
+                          width: double.infinity,
+                          child: MediaImage(
+                              cid: p.media!,
+                              fit: BoxFit.cover,
+                              label: 'Photo in a post by ${p.handle}')),
                     ),
                   ),
                 ),
@@ -8995,7 +9040,15 @@ class _KindBadge extends StatelessWidget {
 class MediaImage extends StatefulWidget {
   final String cid;
   final BoxFit fit;
-  const MediaImage({super.key, required this.cid, this.fit = BoxFit.cover});
+
+  /// What a screen reader says instead of the picture.
+  ///
+  /// This is a ROLE, not alt text: "a photo in a post by alice" tells you something is there and
+  /// whose it is, which is what an unlabelled image fails to do — but it does not describe the
+  /// image, and nothing here can. Real alt text has to be written by the author, which means a field
+  /// in the composer and a field on the wire. Neither exists yet; see docs/SPEED-AND-GAPS.md.
+  final String label;
+  const MediaImage({super.key, required this.cid, this.fit = BoxFit.cover, this.label = 'Image'});
   @override
   State<MediaImage> createState() => _MediaImageState();
 }
@@ -9056,15 +9109,27 @@ class _MediaImageState extends State<MediaImage> {
 
   @override
   Widget build(BuildContext context) {
-    if (_bytes != null) return Image.memory(_bytes!, fit: widget.fit, gaplessPlayback: true);
+    if (_bytes != null) {
+      return Semantics(
+        image: true,
+        label: widget.label,
+        child: Image.memory(_bytes!, fit: widget.fit, gaplessPlayback: true),
+      );
+    }
     // loading → spinner (reads as loading, not broken); resolved-but-null → a plain dark tile
-    return Container(
-      color: kCard,
-      child: _loading
-          ? const Center(
-              child: SizedBox(width: 22, height: 22,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: kDim)))
-          : null,
+    return Semantics(
+      image: true,
+      // Loading and failed are different facts and must not both read as silence — an unannounced
+      // empty tile is indistinguishable from no image at all.
+      label: _loading ? 'Loading ${widget.label}' : '${widget.label} — could not be loaded',
+      child: Container(
+        color: kCard,
+        child: _loading
+            ? const Center(
+                child: SizedBox(width: 22, height: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: kDim)))
+            : null,
+      ),
     );
   }
 }
@@ -9086,7 +9151,9 @@ class _MoviePreview extends StatelessWidget {
         child: Stack(alignment: Alignment.center, children: [
           AspectRatio(
             aspectRatio: 16 / 9,
-            child: post.thumb != null ? MediaImage(cid: post.thumb!) : Container(color: kCard),
+            child: post.thumb != null
+                ? MediaImage(cid: post.thumb!, label: 'Video thumbnail, post by ${post.handle}')
+                : Container(color: kCard),
           ),
           Container(
             width: 54,
@@ -9410,34 +9477,53 @@ class _Actions extends StatelessWidget {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        _act(Icons.chat_bubble_outline, replies > 0 ? '$replies' : '', kDim, onReply),
+        _act(Icons.chat_bubble_outline, replies > 0 ? '$replies' : '', kDim, onReply,
+            _say(replies, 'reply', 'replies', 'Reply')),
         Builder(builder: (ctx) => _act(Icons.repeat, reposts > 0 ? '$reposts' : '',
             reposted ? const Color(0xFF4DD0A7) : kDim,
-            onQuote == null ? onRepost : () => _repostMenu(ctx))),
+            onQuote == null ? onRepost : () => _repostMenu(ctx),
+            // The state belongs in the label: the only cue that you already reposted is the icon's
+            // colour, which is exactly the kind of meaning a screen reader cannot reach.
+            '${_say(reposts, 'repost', 'reposts', 'Repost')}${reposted ? ', reposted by you' : ''}')),
         _act(liked ? Icons.thumb_up : Icons.thumb_up_outlined, likes > 0 ? '$likes' : '',
-            liked ? kAccent : kDim, onLike),
+            liked ? kAccent : kDim, onLike,
+            '${_say(likes, 'like', 'likes', 'Like')}${liked ? ', liked by you' : ''}'),
         // views (impressions) — non-interactive, like X's view counter
-        _act(Icons.bar_chart, views > 0 ? _compact(views) : '', kDim, null),
+        _act(Icons.bar_chart, views > 0 ? _compact(views) : '', kDim, null,
+            _say(views, 'view', 'views', 'No views yet')),
         // XNO this post has gathered
         if (tipsXno > 0)
-          Row(children: [
-            const XnoGlyph(size: 13, color: Color(0xFF4DD0A7), weight: 0.18),
-            const SizedBox(width: 4),
-            Text(tipsXno.toStringAsFixed(2),
-                style: const TextStyle(color: Color(0xFF4DD0A7), fontSize: 13, fontWeight: FontWeight.w600)),
-          ]),
+          Semantics(
+            label: '${tipsXno.toStringAsFixed(2)} XNO tipped to this post',
+            child: ExcludeSemantics(
+              child: Row(children: [
+                const XnoGlyph(size: 13, color: Color(0xFF4DD0A7), weight: 0.18),
+                const SizedBox(width: 4),
+                Text(tipsXno.toStringAsFixed(2),
+                    style: const TextStyle(color: Color(0xFF4DD0A7), fontSize: 13, fontWeight: FontWeight.w600)),
+              ]),
+            ),
+          ),
         // the tip action carries the Ӿ mark — payments are native XNO
-        InkWell(
-          onTap: onTip,
-          borderRadius: BorderRadius.circular(20),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-            child: Row(children: [
-              const XnoGlyph(size: 16, color: kAccent, weight: 0.16),
-              const SizedBox(width: 5),
-              Text(pending > 0 ? pending.toStringAsFixed(2) : 'Tip',
-                  style: const TextStyle(color: kAccent, fontSize: 13)),
-            ]),
+        Semantics(
+          button: true,
+          // The Ӿ glyph is a custom painter, so there is nothing here for a screen reader to read at
+          // all — this control was previously silent, and it moves money.
+          label: pending > 0 ? 'Tip, ${pending.toStringAsFixed(2)} XNO pending' : 'Tip this post',
+          child: ExcludeSemantics(
+            child: InkWell(
+              onTap: onTip,
+              borderRadius: BorderRadius.circular(20),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                child: Row(children: [
+                  const XnoGlyph(size: 16, color: kAccent, weight: 0.16),
+                  const SizedBox(width: 5),
+                  Text(pending > 0 ? pending.toStringAsFixed(2) : 'Tip',
+                      style: const TextStyle(color: kAccent, fontSize: 13)),
+                ]),
+              ),
+            ),
           ),
         ),
       ],
@@ -9467,22 +9553,39 @@ class _Actions extends StatelessWidget {
     );
   }
 
-  Widget _act(IconData icon, String label, Color color, VoidCallback? onTap) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(20),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-        child: Row(children: [
-          Icon(icon, size: 18, color: color),
-          if (label.isNotEmpty) ...[
-            const SizedBox(width: 5),
-            Text(label, style: TextStyle(color: color, fontSize: 13)),
-          ],
-        ]),
+  /// One action. `say` is what a screen reader announces — without it this row is five identical
+  /// unlabelled targets and a loose number, because an icon carries no text and "3" on its own does
+  /// not say three of what.
+  Widget _act(IconData icon, String label, Color color, VoidCallback? onTap, String say) {
+    return Semantics(
+      button: onTap != null,
+      enabled: onTap != null,
+      label: say,
+      // The glyph has no meaning to announce and the count is already inside `say`; left visible to
+      // semantics it is read a second time, as a bare digit with no noun.
+      child: ExcludeSemantics(
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(20),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            child: Row(children: [
+              Icon(icon, size: 18, color: color),
+              if (label.isNotEmpty) ...[
+                const SizedBox(width: 5),
+                Text(label, style: TextStyle(color: color, fontSize: 13)),
+              ],
+            ]),
+          ),
+        ),
       ),
     );
   }
+
+  /// "3 replies", "1 reply", "Reply" — a count that reads as a sentence rather than as a label with
+  /// a number stapled on.
+  static String _say(int n, String one, String many, String none) =>
+      n <= 0 ? none : (n == 1 ? '1 $one' : '$n $many');
 }
 
 // ---- comments: signed off-chain replies; each can be tipped like a post ----
@@ -9824,6 +9927,7 @@ class _CommentsSheetState extends State<CommentsSheet> {
               : IconButton(
                   onPressed: _submit,
                   icon: const Icon(Icons.send, color: kAccent),
+                  tooltip: 'Send',
                 ),
         ]),
       ),
