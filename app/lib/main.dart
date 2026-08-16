@@ -1505,6 +1505,21 @@ class Api {
     }
   }
 
+  // wallet: this account's on-chain transactions, newest first. The wallet showed a balance but
+  // never how it got there, so a tip arriving was invisible unless you watched the number change.
+  static Future<List<Map<String, dynamic>>> history({int count = 50}) async {
+    final w = gWallet;
+    if (w == null) return [];
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/history?account=${w.account}&count=$count'))
+          .timeout(const Duration(seconds: 30));
+      final d = jsonDecode(r.body) as Map<String, dynamic>;
+      return ((d['history'] as List?) ?? []).cast<Map<String, dynamic>>();
+    } catch (_) {
+      return [];
+    }
+  }
+
   // wallet: claim any pending receivable blocks into the account.
   // ON-DEVICE SIGNED: each receive/open block is built + signed locally, sequentially.
   static Future<Map<String, dynamic>?> receive() async {
@@ -2110,6 +2125,18 @@ class _FeedScreenState extends State<FeedScreen> {
   final Set<String> _settling = {};        // creators with a settle in flight — blocks re-entrant settles
   bool _settleBusy = false;                 // guards the manual batch settle against a double-tap
   final Map<String, String> _handleOf = {}; // account -> handle, for the settle bar
+
+  /// account -> handle for the transaction list. A nano_ address identifies nobody, so pair it with
+  /// whatever name this device has actually seen that account post under. _handleOf is populated by
+  /// the settle bar; the feed carries the rest. Unknown accounts simply stay addresses — never guess.
+  Map<String, String> _knownHandles() {
+    final m = <String, String>{..._handleOf};
+    for (final p in _posts) {
+      if (p.account.isNotEmpty && p.handle.isNotEmpty) m[p.account] = p.handle;
+    }
+    if (_account.isNotEmpty) m[_account] = _handle;
+    return m;
+  }
   // reshare/media attribution LOCKED at tip time (per creator) — a later reshare can't claim it
   final Map<String, String> _reposterOf = {}; // author account -> resharer account to reward
   final Map<String, String> _mediaOf = {};    // author account -> media cid (to reward its host relay)
@@ -4080,7 +4107,7 @@ class _FeedScreenState extends State<FeedScreen> {
                       builder: (_, __) => Text(ProfileCache.I.displayName(_account, _handle),
                           style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
                     ),
-                    Text('@$_handle · ${xno.toStringAsFixed(3)} XNO', style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
+                    Text('@$_handle · ${xno.toStringAsFixed(5)} XNO', style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
                   ]),
                 ),
                 const Icon(Icons.chevron_right, color: kDim),
@@ -4174,6 +4201,29 @@ class _FeedScreenState extends State<FeedScreen> {
                 ),
               ]),
             ),
+            const SizedBox(height: 16),
+            // Transactions. The wallet showed a balance and no way to see how it got there, so an
+            // arriving tip was invisible unless you happened to notice the number move.
+            InkWell(
+              onTap: () {
+                Navigator.pop(ctx);
+                Navigator.of(context).push(MaterialPageRoute(
+                    builder: (_) => WalletHistoryScreen(handles: _knownHandles())));
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Row(children: [
+                  const Icon(Icons.receipt_long, color: kAccent, size: 20),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text('Transactions',
+                        style: TextStyle(color: kText, fontSize: 15, fontWeight: FontWeight.w700)),
+                  ),
+                  const Icon(Icons.chevron_right, color: kDim),
+                ]),
+              ),
+            ),
+            const Divider(height: 1, color: kLine),
             const SizedBox(height: 16),
             // send / receive Nano (mainnet — real XNO)
             Row(children: [
@@ -4469,7 +4519,7 @@ class _FeedScreenState extends State<FeedScreen> {
                 const SizedBox(width: 8),
                 const Text('Send Nano', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
                 const Spacer(),
-                Text('${xno.toStringAsFixed(3)} XNO', style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
+                Text('${xno.toStringAsFixed(5)} XNO', style: const TextStyle(color: kAccent, fontSize: 13, fontWeight: FontWeight.w600)),
               ]),
               const SizedBox(height: 14),
               TextField(
@@ -6373,10 +6423,16 @@ class _DmChatScreenState extends State<DmChatScreen> {
               ? const Center(child: CircularProgressIndicator(color: kAccent))
               : _msgs.isEmpty
                   ? const Center(child: Text('No messages yet — say hi 🔐', style: TextStyle(color: kDim)))
+                  // reverse: a chat should open on the NEWEST message. This list had no controller and
+                  // no reverse, so every conversation opened at the oldest message and you had to
+                  // scroll down to find what was just said. Reversed, index 0 is the bottom, so it
+                  // lands on the latest and new messages appear where the eye already is — and it
+                  // needs no post-frame scroll hack that fights the keyboard opening.
                   : ListView.builder(
+                      reverse: true,
                       padding: const EdgeInsets.all(14),
                       itemCount: _msgs.length,
-                      itemBuilder: (_, i) => _bubble(_msgs[i]),
+                      itemBuilder: (_, i) => _bubble(_msgs[_msgs.length - 1 - i]),
                     ),
         ),
         if (_err != null) Padding(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
@@ -6400,8 +6456,20 @@ class _DmChatScreenState extends State<DmChatScreen> {
             topLeft: const Radius.circular(16), topRight: const Radius.circular(16),
             bottomLeft: Radius.circular(out ? 16 : 4), bottomRight: Radius.circular(out ? 4 : 16)),
         ),
-        child: Text('${m['text']}',
-            style: TextStyle(color: out ? Colors.black : kText, fontSize: 15, height: 1.3)),
+        // The timestamp was always in the message map — sorted on, even — but never shown, so a DM
+        // thread read as one undated block. timeAgo() is the same helper the feed already uses.
+        child: Column(
+          crossAxisAlignment: out ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('${m['text']}',
+                style: TextStyle(color: out ? Colors.black : kText, fontSize: 15, height: 1.3)),
+            const SizedBox(height: 3),
+            Text(timeAgo((m['ts'] as int?) ?? 0),
+                style: TextStyle(
+                    color: out ? Colors.black.withValues(alpha: 0.55) : kDim, fontSize: 10.5)),
+          ],
+        ),
       ),
     );
   }
@@ -7034,12 +7102,15 @@ class _PostCardState extends State<PostCard> {
                   overflow: (longText && !_expanded) ? TextOverflow.ellipsis : TextOverflow.clip,
                   style: const TextStyle(color: kText, fontSize: 15, height: 1.35)),
             ),
-            // "Show more" opens the conversation (full text there), exactly like tapping the post body or
-            // "Show this thread" — so there's no inline-expand action fighting the open-thread tap. Only
-            // shows in the feed; the focused post in a thread starts expanded (full text, no "Show more").
+            // "Show more" EXPANDS the text in place. It used to open the thread instead, on the reasoning
+            // that an inline expand would fight the open-thread tap on the body. It doesn't — the body
+            // still opens the thread, and this is a separate target. What the old behaviour actually did
+            // was strand you: inside a thread, a long REPLY is not the focused post, so it stayed
+            // truncated and its "Show more" pushed ANOTHER thread view of the same conversation, showing
+            // the same truncated reply. There was no way to read a long reply at all.
             if (longText && !_expanded)
               GestureDetector(
-                onTap: widget.onOpenThread,
+                onTap: () => setState(() => _expanded = true),
                 child: const Padding(
                   padding: EdgeInsets.only(top: 4),
                   child: Text('Show more',
@@ -7050,11 +7121,15 @@ class _PostCardState extends State<PostCard> {
             if (p.kind == 'photo' && p.media != null)
               Padding(
                 padding: const EdgeInsets.only(top: 10),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(16),
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 380),
-                    child: SizedBox(width: double.infinity, child: MediaImage(cid: p.media!, fit: BoxFit.cover)),
+                child: GestureDetector(
+                  onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => PhotoScreen(cid: p.media!))),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(16),
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 380),
+                      child: SizedBox(width: double.infinity, child: MediaImage(cid: p.media!, fit: BoxFit.cover)),
+                    ),
                   ),
                 ),
               ),
@@ -7384,6 +7459,112 @@ class _MoviePreview extends StatelessWidget {
 }
 
 // full-screen video playback (plays the movie by CID via the IPFS gateway)
+// Full-screen photo with pinch-zoom. Photos in the feed had no tap handler at all, so a picture
+// could only ever be seen at feed size — no way in to read small text in a screenshot, for instance.
+// Deliberately no tap-to-dismiss: it fights InteractiveViewer's own pan/scale gestures. Back, or the
+// close button, both work.
+// Wallet transaction history. A nano_ address tells a human nothing, so each row leads with the
+// HANDLE when this device has seen that account post, and always shows the address underneath —
+// the pairing is the point: you recognise the name, and can still verify the account it maps to.
+class WalletHistoryScreen extends StatefulWidget {
+  const WalletHistoryScreen({super.key, this.handles = const {}});
+  final Map<String, String> handles;      // account -> handle, from whatever the feed has seen
+
+  @override
+  State<WalletHistoryScreen> createState() => _WalletHistoryScreenState();
+}
+
+class _WalletHistoryScreenState extends State<WalletHistoryScreen> {
+  List<Map<String, dynamic>>? _rows;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final h = await Api.history();
+    if (mounted) setState(() => _rows = h);
+  }
+
+  String _short(String a) => a.length > 22 ? '${a.substring(0, 13)}…${a.substring(a.length - 6)}' : a;
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = _rows;
+    return Scaffold(
+      backgroundColor: kBg,
+      appBar: AppBar(
+        backgroundColor: kBg, elevation: 0, iconTheme: const IconThemeData(color: kText),
+        title: const Text('Transactions', style: TextStyle(color: kText, fontWeight: FontWeight.w800)),
+      ),
+      body: rows == null
+          ? const Center(child: CircularProgressIndicator(color: kAccent))
+          : rows.isEmpty
+              ? const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(28),
+                    child: Text('No transactions yet.\nTips and payments will show up here.',
+                        textAlign: TextAlign.center, style: TextStyle(color: kDim, fontSize: 14, height: 1.5)),
+                  ),
+                )
+              : RefreshIndicator(
+                  color: kAccent,
+                  onRefresh: _load,
+                  child: ListView.separated(
+                    itemCount: rows.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1, color: kLine),
+                    itemBuilder: (_, i) {
+                      final r = rows[i];
+                      final incoming = '${r['type']}' == 'receive';
+                      final acct = '${r['account'] ?? ''}';
+                      final handle = widget.handles[acct];
+                      final xno = (double.tryParse('${r['amount'] ?? 0}') ?? 0) / 1e30;
+                      final ts = (r['ts'] as int?) ?? 0;
+                      return ListTile(
+                        leading: Icon(incoming ? Icons.south_west : Icons.north_east,
+                            color: incoming ? const Color(0xFF4DD0A7) : kDim, size: 20),
+                        title: Text(handle != null ? '@$handle' : _short(acct),
+                            style: const TextStyle(color: kText, fontSize: 14.5, fontWeight: FontWeight.w700)),
+                        subtitle: Text(handle != null ? _short(acct) : (ts > 0 ? timeAgo(ts) : ''),
+                            style: const TextStyle(color: kDim, fontSize: 11.5, fontFamily: 'monospace')),
+                        trailing: Text('${incoming ? '+' : '−'}${xno.toStringAsFixed(5)}',
+                            style: TextStyle(
+                                color: incoming ? const Color(0xFF4DD0A7) : kText,
+                                fontSize: 14, fontWeight: FontWeight.w800)),
+                      );
+                    },
+                  ),
+                ),
+    );
+  }
+}
+
+class PhotoScreen extends StatelessWidget {
+  const PhotoScreen({super.key, required this.cid});
+  final String cid;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: Center(
+        child: InteractiveViewer(
+          minScale: 1,
+          maxScale: 6,
+          child: MediaImage(cid: cid, fit: BoxFit.contain),
+        ),
+      ),
+    );
+  }
+}
+
 class VideoScreen extends StatefulWidget {
   final String cid;
   const VideoScreen({super.key, required this.cid});

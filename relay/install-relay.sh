@@ -245,7 +245,13 @@ PYOP
             say ''
             say "  Send it a tiny amount of XNO — any dust will do. The announce itself spends 4 raw"
             say "  (that is 0.000000000000000000000000004 XNO); the account just has to EXIST on-chain."
-            say "  Some faucets will open it for free. ${c_dim}The seed is in $SEEDF, mode 600 — back it up.${c_0}"
+            say ""
+            say "  ${c_b}Easiest way: send it from your own ӾChat app wallet.${c_0} This is a DIFFERENT key from"
+            say "  the account you post and receive tips with — that is why funds you already hold do not"
+            say "  count. In the app: tap your avatar (top left) → Send → paste the address above →"
+            say "  0.001 XNO is plenty. A faucet works too."
+            say ""
+            say "  ${c_dim}The seed is in $SEEDF, mode 600 — back it up.${c_0}"
             say ''
             say "  Then run this again:  sh $SELF --setup-operator"
         else

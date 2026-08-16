@@ -144,6 +144,36 @@ def api_me(acct):
             bal = '0'
     return json.dumps({'handle': 'you.xno', 'account': acct, 'balance': bal})
 
+
+def api_history(acct, count='50'):
+    """This account's on-chain transactions, newest first.
+
+    The wallet could show a balance but never how it got there, so a tip arriving was invisible
+    unless you happened to watch the number. Each entry carries the counterparty ACCOUNT; the app
+    pairs it with a handle when it knows one, because a nano_ address tells a human nothing.
+
+    Read-only and cached: this is a display, and the ledger read costs ~0.6s against a public RPC.
+    """
+    if not acct:
+        return json.dumps({'ok': False, 'error': 'account required', 'history': []})
+    try:
+        n = str(max(1, min(int(count or '50'), 200)))
+    except Exception:
+        n = '50'
+    try:
+        r = xc.rpc_cached({'action': 'account_history', 'account': acct, 'count': n}, ttl=15.0)
+    except Exception as e:
+        return json.dumps({'ok': False, 'error': str(e)[:120], 'history': []})
+    if isinstance(r, dict) and r.get('error'):
+        # "Account not found" just means never funded — an empty history, not a failure.
+        return json.dumps({'ok': True, 'account': acct, 'history': [], 'note': r['error']})
+    out = []
+    for x in (r.get('history') or []):
+        out.append({'type': x.get('type'), 'amount': x.get('amount', '0'),
+                    'account': x.get('account', ''), 'hash': x.get('hash', ''),
+                    'ts': int(x.get('local_timestamp') or 0)})
+    return json.dumps({'ok': True, 'account': acct, 'history': out})
+
 # The feed aggregation (spawn a helper, pull every relay, verify sigs) is far too heavy to run per
 # request — that made /api/feed the whole node's bottleneck (~4 req/s). Cache it for a few seconds:
 # clients read the cached JSON, and at most one thread re-aggregates per window (others serve stale
@@ -470,6 +500,7 @@ def route(path, query, body):
     if path.startswith('/api/media'):
         with ipc_lock('media'):
             put('/tmp/xc_media_cid.txt', q('cid')); spawn('xc_media.py'); return read('/tmp/xc_media_result.json', '{}')
+    if path.startswith('/api/history'):      return api_history(q('account'), q('count'))
     if path.startswith('/api/me'):           return api_me(q('account'))
     if path.startswith('/api/status'):       return api_status()
     if path.startswith('/api/announcement'):  return api_announcement()
