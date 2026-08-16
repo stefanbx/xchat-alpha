@@ -511,6 +511,11 @@ fetch "$SRC/relay/xc_relayd.py"    "$XC_HOME/xc_relayd.py"
 fetch "$SRC/backend/xc_common.py"  "$XC_HOME/xc_common.py"
 fetch "$SRC/relay/xc_admin.py"     "$XC_HOME/xc_admin.py"
 fetch "$SRC/backend/xc_workd.py"   "$XC_HOME/xc_workd.py"
+# The self-announce helper. It used to ship only with --with-node, which meant a RELAY-ONLY install —
+# the default one-liner — had no way to announce itself even when the operator had done everything
+# right. A relay is exactly the thing that should be findable, so it gets the helper too. It imports
+# xc_common by name, which is why it lands next to the copy fetched above.
+fetch "$SRC/backend/xc_reldir.py"  "$XC_HOME/xc_reldir.py"
 fetch "$SRC/relay/work/nano_work_cl.c" "$XC_HOME/nano_work_cl.c" 2>/dev/null || true
 "$PY" -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$XC_HOME/xc_relayd.py" \
     || die "the downloaded relay is not valid Python — the download was truncated or tampered with"
@@ -879,10 +884,13 @@ PYCFG
     # Register the node on the XNO ledger so the app can rediscover it from an unstoppable source.
     # Idempotent (xc_reldir ensure re-commits only when the announced url changed); needs a one-time-funded
     # operator seed in operator.seed. Backgrounded + non-fatal: it never blocks serving.
-    if [ "$WITH_NODE" = 1 ] && [ -s "$XC_HOME/operator.seed" ]; then
+    # NOT gated on WITH_NODE any more. It was, because xc_reldir.py only existed under node/ — so a
+    # relay-only install never even attempted an announce, and its operator had no way to discover why.
+    RELDIR="$XC_HOME/node/xc_reldir.py"; [ -f "$RELDIR" ] || RELDIR="$XC_HOME/xc_reldir.py"
+    if [ -s "$XC_HOME/operator.seed" ] && [ -f "$RELDIR" ]; then
         ( sleep 25
           XC_RELAY_OPERATOR_SEED="$(cat "$XC_HOME/operator.seed")" NODE_PUBLIC_URL="$ANNOUNCE_URL" \
-            "$PY" "$XC_HOME/node/xc_reldir.py" ensure "$ANNOUNCE_URL" >>"$XC_HOME/selfannounce.log" 2>&1
+            "$PY" "$RELDIR" ensure "$ANNOUNCE_URL" >>"$XC_HOME/selfannounce.log" 2>&1
         ) &
     fi
     AWAKE=$(awake_prefix)
