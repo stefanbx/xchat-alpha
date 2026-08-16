@@ -40,7 +40,7 @@ seed** — and post.  ·  **Read the design** → [`docs/WHITEPAPER.md`](docs/WH
 | `backend/` | The node: `kt_server.py` + the helper programs it runs. **Pure Python, any OS** |
 | `relay/` | `xc_relayd.py` — a relay. Pure Python, run one yourself |
 | `apk/` | Pre-built signed Android APK + checksums |
-| `docs/` | Whitepaper |
+| `docs/` | Whitepaper, and the working plans — [privacy & decentralization](docs/PRIVACY-AND-DECENTRALIZATION.md), [anonymity](docs/ANONYMITY.md), [push & production](docs/PUSH-AND-PRODUCTION.md), [speed & gaps](docs/SPEED-AND-GAPS.md) |
 | `test/` | The interop and end-to-end tests behind the "your seed never leaves" claim |
 
 ## Install the app
