@@ -47,6 +47,114 @@ def free_port():
     return p
 
 
+# ------------------------------------------------------------------------------------------------
+# The regression that 2.5.0 shipped and 2.5.1 fixed, guarded so it cannot come back quietly.
+#
+# WHAT HAPPENED: the push feature added _dm_watch, a background thread to catch messages from a
+# different node. Its first version ran the DM inbox helper on a loop WHILE HOLDING ipc_lock('dm') —
+# the same lock every real inbox read needs. The helper also fetched relays serially at a 4s timeout
+# each, so with a couple of dead relays in the set one run took ~10s. A background poller holding a
+# shared lock for 10s at a time starved every real /api/dm_inbox and /api/dm_key_get behind it, and
+# the phone hung on "cannot read my DMs".
+#
+# WHY THE ORIGINAL TESTS MISSED IT: they ran against a single CLEAN isolated relay, where the fetch
+# is instant, so the lock was never held long enough to starve anything. The bug only appears when
+# the fetch is SLOW, which is the normal state of a real relay set. A green suite hid it.
+#
+# So the two invariants below are stated against the SOURCE and against BEHAVIOUR, not against a
+# happy-path timing that a fast test relay satisfies for the wrong reason.
+# ------------------------------------------------------------------------------------------------
+import re as _re
+
+_KT_SRC = open(os.path.join(BACKEND, 'kt_server.py')).read()
+_DM_SRC = open(os.path.join(BACKEND, 'xc_dm.py')).read()
+
+
+def _func_body(src, name):
+    m = _re.search(r'\ndef %s\(.*?\n(?=\S)' % _re.escape(name), src, _re.S)
+    return m.group(0) if m else None
+
+
+print('--- the background watcher must never contend with the reads it serves ---')
+_watch = _func_body(_KT_SRC, '_dm_watch')
+check(_watch is not None, '_dm_watch still exists (renamed? update this guard)')
+if _watch:
+    # A background poller that takes the DM lock is the whole bug. If a future edit re-adds cross-node
+    # fan-out under the lock "for correctness", this fails loudly instead of shipping the outage again.
+    # Match the ACQUISITION (`with ipc_lock(`), not the bare word, so the explanatory prose in the
+    # function's own comments — which names ipc_lock precisely to say it must not be used — is not
+    # itself mistaken for the mistake.
+    check('with ipc_lock(' not in _watch,
+          '_dm_watch does NOT take ipc_lock — it must not serialize with real DM requests')
+    check('spawn(' not in _watch,
+          '_dm_watch does NOT spawn the helper — it reads the local relay in-process instead')
+    check('RELAY_ORIGIN' in _watch,
+          '_dm_watch reads the node\'s own loopback relay, which is fast and lock-free')
+
+print('\n--- the inbox helper must fetch relays in PARALLEL, not one dead one at a time ---')
+# The other half: even out of the lock, a serial fan-out over a slow set is slow. Behavioural, with
+# real stub relays, because "is it parallel" is a timing property a source scan cannot prove.
+STUB_DELAY = 1.5
+
+
+class _SlowRelay:
+    """Answers /relays instantly (so discovery finds it) and /dm slowly (so serial-vs-parallel shows)."""
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        port = free_port()
+        self.url = f'http://127.0.0.1:{port}'
+        u = self.url
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path.startswith('/relays'):
+                    body = json.dumps({'relays': [u], 'peers': []}).encode()
+                elif self.path.startswith('/dm'):
+                    time.sleep(STUB_DELAY)                 # a slow/dead-ish relay
+                    body = json.dumps({'account': '', 'dms': []}).encode()
+                else:
+                    body = b'{}'
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.srv = ThreadingHTTPServer(('127.0.0.1', port), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.srv.shutdown()
+
+
+_stubs = [_SlowRelay() for _ in range(4)]
+try:
+    env = dict(os.environ, XC_ISOLATE='1',
+               XCHAT_BOOTSTRAP=','.join(s.url for s in _stubs))
+    for f in ('/tmp/xc_dm_acct.txt', '/tmp/xc_dm_since.txt'):
+        open(f, 'w').write('nano_1x' if 'acct' in f else '0')
+    try:
+        os.remove('/tmp/xc_dm_auth.json')
+    except OSError:
+        pass
+    t0 = time.time()
+    subprocess.run([sys.executable, 'xc_dm.py', 'inbox'], cwd=BACKEND, env=env, timeout=30)
+    dt = time.time() - t0
+    # Serial over 4 relays would be ~4 x STUB_DELAY = 6s. Parallel is ~1 x STUB_DELAY plus discovery.
+    # The threshold sits well below the serial time and above the parallel time, so it fails only if
+    # the fan-out actually went serial.
+    check(dt < STUB_DELAY * 2.5,
+          f'four {STUB_DELAY}s relays are fetched in parallel, not in series ({dt:.1f}s)',
+          f'{dt:.1f}s — serial would be ~{STUB_DELAY * 4:.0f}s')
+finally:
+    for s in _stubs:
+        s.stop()
+
+
 PORT = free_port()
 BASE = f'http://127.0.0.1:{PORT}'
 env = dict(os.environ,
