@@ -23,7 +23,18 @@ _DEFAULT_WORK = 'https://rpcproxy.bnano.info/proxy,https://nanoslo.0x.no/proxy,h
 WORK_RPCS = [u.strip().rstrip('/') for u in
              (os.environ.get('XC_WORK_RPC', '') + ',' + _DEFAULT_WORK).split(',') if u.strip()]
 LOCAL_WORK = os.environ.get('XC_WORK_LOCAL', '1') != '0'       # on-box CPU as the never-down last resort
-_LOCAL_DIFF = int(os.environ.get('XC_WORK_LOCAL_DIFFICULTY', 'fffffff800000000'), 16)   # mainnet send threshold
+# Nano has TWO epoch-2 work thresholds and they are not close: send/change needs fffffff8_00000000
+# (~2^29 tries) while receive/open needs only fffffe00_00000000 (~2^23) — SIXTY-FOUR times cheaper.
+# Asking for the send threshold on every block is valid but wildly wasteful, and on a node whose only
+# PoW is public RPC or a shared vCPU it is the difference between a receive landing and timing out.
+# Measured on a real stuck open: 67.5s at the send threshold, 11.4s at the correct one.
+_SEND_DIFF = int(os.environ.get('XC_WORK_LOCAL_DIFFICULTY', 'fffffff800000000'), 16)
+_RECV_DIFF = int(os.environ.get('XC_WORK_RECV_DIFFICULTY', 'fffffe0000000000'), 16)
+_LOCAL_DIFF = _SEND_DIFF                       # kept: the default when a caller has no subtype
+
+def diff_for(subtype):
+    # Anything that only ADDS funds (receive, open) uses the cheap threshold; everything else pays full.
+    return _RECV_DIFF if str(subtype) in ('receive', 'open') else _SEND_DIFF
 
 # DISCOVERED work sources. The lists above have to be configured by whoever runs the node; this one
 # finds work the same way the app finds everything else — by walking the relay gossip. Relays that can
@@ -111,17 +122,23 @@ def _rpc_retry(o, tries=4):
     raise last
 
 
-def _work_ok(work, root):
+def _work_ok(work, root, difficulty=None):
     # One C-level hash. Cheap enough to run on anything we didn't compute ourselves.
     try:
-        return bool(xc._ext.work_validate(int(work, 16), bytes.fromhex(root), _LOCAL_DIFF))
+        return bool(xc._ext.work_validate(int(work, 16), bytes.fromhex(root),
+                                          _LOCAL_DIFF if difficulty is None else difficulty))
     except Exception:
         return False
 
 
-def _work_via(url, root, timeout):
+def _work_via(url, root, timeout, difficulty=None):
+    # ASK for the threshold we need. A provider given no difficulty computes at ITS default (usually
+    # send), so a receive silently costs 64x more than it has to even when the provider is willing.
+    req = {'action': 'work_generate', 'hash': root}
+    if difficulty is not None:
+        req['difficulty'] = '%016x' % difficulty
     r = urllib.request.urlopen(urllib.request.Request(
-        url, json.dumps({'action': 'work_generate', 'hash': root}).encode(),
+        url, json.dumps(req).encode(),
         {'Content-Type': 'application/json'}), timeout=timeout)
     d = json.loads(r.read())
     if d.get('work') and 'error' not in d:
@@ -129,10 +146,13 @@ def _work_via(url, root, timeout):
     raise ValueError(str(d.get('error') or 'no work'))
 
 
-def _work_local(root):
-    # Zero-dependency last resort: compute PoW on THIS box via nanopy. Slow (~1 min on a shared vCPU at
-    # mainnet difficulty) but it can't be down. Send-difficulty work is also valid for receive/open.
-    return '%016x' % xc._ext.work_generate(bytes.fromhex(root), _LOCAL_DIFF, os.urandom(128))
+def _work_local(root, difficulty=None):
+    # Zero-dependency last resort: compute PoW on THIS box via nanopy. It cannot be down, but on a
+    # shared vCPU the send threshold takes ~a minute — which is why using the RECEIVE threshold for a
+    # receive matters most here: same box, ~64x less work, and a receive that actually completes.
+    return '%016x' % xc._ext.work_generate(bytes.fromhex(root),
+                                           _LOCAL_DIFF if difficulty is None else difficulty,
+                                           os.urandom(128))
 
 
 # --- work PRECACHE: after a settle we compute the account's NEXT frontier's work in the BACKGROUND, so
@@ -149,12 +169,16 @@ def _cache_load():
         return {}
 
 
-def _cache_valid(root):
+def _cache_valid(root, difficulty=None):
+    # Validate against the difficulty THIS block needs, not a fixed one. The precache is filled at send
+    # difficulty, which is harder, so it stays usable for a receive — but the reverse must never happen:
+    # handing cheap receive-grade work to a send would broadcast a block the network drops.
     w = _cache_load().get(root)
     if not w:
         return None
     try:
-        return w if xc._ext.work_validate(int(w, 16), bytes.fromhex(root), _LOCAL_DIFF) else None
+        need = _LOCAL_DIFF if difficulty is None else difficulty
+        return w if xc._ext.work_validate(int(w, 16), bytes.fromhex(root), need) else None
     except Exception:
         return None
 
@@ -170,7 +194,7 @@ def _cache_put(root, work):
         pass
 
 
-def _compute_work_rpc(root):
+def _compute_work_rpc(root, difficulty=None):
     # external work only (I/O-bound, cheap): local work server, then the work RPCs RACED (first valid wins,
     # so one moody endpoint can't stall a leg; XC_WORK_RPC dPoW is in the race and wins when set), then the
     # general RPC cycle. Returns None if every external source failed.
@@ -195,7 +219,7 @@ def _compute_work_rpc(root):
     if WORK_RPCS or peers:
         pool = len(WORK_RPCS) + len(peers)
         ex = ThreadPoolExecutor(max_workers=min(8, max(1, pool)))
-        futs = [ex.submit(_work_via, url, root, 15) for url in WORK_RPCS]
+        futs = [ex.submit(_work_via, url, root, 15, difficulty) for url in WORK_RPCS]
         futs += [ex.submit(_work_via_relay, url, root, 20) for url in peers]
         winner = None
         try:
@@ -204,7 +228,7 @@ def _compute_work_rpc(root):
                     cand = f.result()
                 except Exception:
                     cand = None
-                if cand and _work_ok(cand, root):       # a fast answer at the wrong difficulty is not a win
+                if cand and _work_ok(cand, root, difficulty):   # a fast answer at the wrong difficulty is not a win
                     winner = cand
                     break
         except Exception:
@@ -213,24 +237,34 @@ def _compute_work_rpc(root):
         if winner:
             return winner
     try:
-        w = _rpc_retry({'action': 'work_generate', 'hash': root}).get('work')
-        if w and _work_ok(w, root):
+        req = {'action': 'work_generate', 'hash': root}
+        if difficulty is not None:
+            req['difficulty'] = '%016x' % difficulty
+        w = _rpc_retry(req).get('work')
+        if w and _work_ok(w, root, difficulty):
             return w
     except Exception:
         pass
     return None
 
 
-def work_for(root):
+def work_for(root, difficulty=None):
     # (0) a precomputed, locally-VERIFIED cache hit -> instant. Then external RPCs, then on-box CPU (never
     # down). PoW is never money-sensitive: a wrong/absent work just makes `process` reject (no funds move).
-    hit = _cache_valid(root)
+    hit = _cache_valid(root, difficulty)
     if hit:
         return hit
-    w = _compute_work_rpc(root)
-    if not w and LOCAL_WORK:                           # every external source down -> compute it here (~1 min)
-        w = _work_local(root)
+    w = _compute_work_rpc(root, difficulty)
+    if not w and LOCAL_WORK:                           # every external source down -> compute it here
+        # This is the branch that matters most on a hosted node with no GPU and flaky public RPCs: it is
+        # the one that always eventually runs. At the send threshold a shared vCPU needs ~a minute, which
+        # is longer than the proxy in front of it will wait — so a receive would be computed and then
+        # thrown away by a timeout, forever. At the receive threshold it is ~64x less work.
+        w = _work_local(root, difficulty)
     if w:
+        # Cache under the difficulty it SATISFIES. Storing receive-grade work unqualified would let a
+        # later send pick it up and broadcast a block the network drops; _cache_valid re-checks against
+        # what the caller needs, so the only requirement here is that we never claim more than we have.
         _cache_put(root, w)                            # idempotent: a retry of the same block is now instant
     return w
 
@@ -272,7 +306,7 @@ try:
     prev = block.get('previous', '0' * 64)
     # work is over the previous hash, or (for an OPEN block, previous == 0) the account's public key
     root = prev if set(prev) != {'0'} else xc.nano_to_pub(block['account'])
-    block['work'] = work_for(root)
+    block['work'] = work_for(root, diff_for(subtype))
     # retry the broadcast too: `process` is idempotent for a given signed block (same hash), so a
     # burst-throttled retry can't double-spend — it just lands the block the first attempt couldn't.
     r = _rpc_retry({'action': 'process', 'json_block': 'true', 'subtype': subtype, 'block': block})
