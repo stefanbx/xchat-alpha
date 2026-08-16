@@ -2186,10 +2186,16 @@ class Api {
       // a relay for anyone's. The node cannot forge this: it holds no seed.
       final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final auth = w.signMsg(w.dmInboxMsg(ats));
+      // A hard timeout matters more than it looks: without it, a slow or wedged node hangs this
+      // request indefinitely, the poll never completes, and the thread shows a spinner over an empty
+      // conversation forever — which is exactly what "everything is laggy, I cannot read my DMs"
+      // was. With it, a slow node degrades to "show what the on-device store already holds, try
+      // again next tick" instead of freezing the screen.
       final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'
           '${since > 0 ? '&since=$since' : ''}'
           '&ts=$ats&sig=${Uri.encodeQueryComponent(auth['sig']!)}'
-          '&pub=${Uri.encodeQueryComponent(auth['pub']!)}'));
+          '&pub=${Uri.encodeQueryComponent(auth['pub']!)}'))
+          .timeout(const Duration(seconds: 12));
       final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
       final convos = <String, List<Map<String, dynamic>>>{};
       // The peer's DM key, kept per conversation: attachments are sealed to this same box, so the

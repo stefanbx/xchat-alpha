@@ -596,32 +596,30 @@ _dm_seen = {}                                             # account -> newest ts
 def _dm_watch():
     """Cover the case the fast path cannot: a sender on a DIFFERENT node.
 
-    This is still a poll — but ONE per node on behalf of every open stream, rather than one per
-    client. Ten people in an app used to mean ten pollers; now it means one, and the clients hold a
-    stream that costs nothing while idle.
+    Reads the node's OWN loopback relay directly, in-process. It does NOT spawn xc_dm.py and does NOT
+    take ipc_lock('dm') — and that is the whole point of this version.
+    -------------------------------------------------------------------------------------------------
+    The first version did both, and it took the node down for anyone trying to read their DMs. The
+    inbox helper fans out to every relay in the set (several of them dead quick-tunnels at a 4s
+    timeout each), so a single run takes ~10s. Running that under the shared DM lock on a continuous
+    loop meant the lock was held ~10 of every ~14 seconds — and every real /api/dm_inbox and
+    /api/dm_key_get, which need the same lock, starved behind it. "Everything is laggy, I cannot read
+    my DMs" was exactly this.
 
-    Only accounts with a live stream are polled. Nobody watching means no work at all, which matters
-    because most nodes are somebody's laptop.
+    A background poller must never contend with the requests it exists to help. The local relay
+    already holds every gossiped DM record, answers in well under a second, and needs no lock because
+    it touches none of the /tmp files the helper races on. All this loop needs is the newest
+    timestamp per watched account, which one cheap local GET gives it.
     """
     while True:
         try:
             accounts = dm_watched_accounts()
-            if not accounts:
-                time.sleep(DM_WATCH)
-                continue
             for acc in accounts:
                 try:
-                    with ipc_lock('dm'):
-                        put('/tmp/xc_dm_acct.txt', acc)
-                        # Ask only for what is newer than the last thing we nudged about. On the very
-                        # first pass that is 0, i.e. everything — deliberately: we have no idea what
-                        # the client holds, and one redundant nudge costs a fetch the client was
-                        # going to do anyway.
-                        put('/tmp/xc_dm_since.txt', str(int(_dm_seen.get(acc, 0))))
-                        spawn('xc_dm.py', 'inbox')
-                        res = read('/tmp/xc_dm_result.json', '{}')
+                    url = '%s/dm?account=%s' % (RELAY_ORIGIN, urllib.parse.quote(acc, safe=''))
+                    d = json.loads(urllib.request.urlopen(url, timeout=3).read())
                     newest = 0
-                    for m in (json.loads(res or '{}').get('dms') or []):
+                    for m in (d.get('dms') or []):
                         newest = max(newest, int(m.get('ts') or 0))
                     # Strictly newer, or a quiet conversation re-nudges on every pass forever.
                     if newest > _dm_seen.get(acc, 0):

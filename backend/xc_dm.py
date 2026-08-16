@@ -104,10 +104,24 @@ else:                                                      # inbox: return RAW c
                                                urllib.parse.quote(a['pub']))
         except Exception:
             qs = ''
-    seen = set(); dms = []
-    for r in RELAYS:
+    # Fetch every relay IN PARALLEL. Serially, one dead quick-tunnel at the 4s timeout blocks all the
+    # others behind it, so an inbox read cost ~10s with a few dead relays in the set — slow on its own
+    # and, run under the node's DM lock, slow enough to starve every other DM request (that outage is
+    # written up in kt_server's _dm_watch). In parallel the whole fan-out costs the SLOWEST single
+    # relay, ~4s worst case, and a healthy set answers in well under a second.
+    import concurrent.futures as _cf
+
+    def _one(r):
         try:
-            for m in json.loads(urllib.request.urlopen(r + '/dm?account=' + acc + qs, timeout=4).read()).get('dms', []):
+            return json.loads(urllib.request.urlopen(
+                r + '/dm?account=' + acc + qs, timeout=4).read()).get('dms', [])
+        except Exception:
+            return []
+
+    seen = set(); dms = []
+    with _cf.ThreadPoolExecutor(max_workers=max(1, len(RELAYS))) as ex:
+        for got in ex.map(_one, RELAYS):
+            for m in got:
                 k = (m.get('from'), m.get('ts'))
                 if k in seen:
                     continue
@@ -115,7 +129,5 @@ else:                                                      # inbox: return RAW c
                 if since and int(m.get('ts') or 0) < since:
                     continue
                 dms.append(m)
-        except Exception:
-            pass
     json.dump({'ok': True, 'account': acc, 'since': since, 'dms': dms},
               open('/tmp/xc_dm_result.json', 'w'))
