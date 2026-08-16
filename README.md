@@ -214,6 +214,13 @@ Honest list of what's known-missing, not a wish list. Each line says why it isn'
   hypothetical.
 - **P2P media between phones.** Parked: peers won't be paid for serving what relays already give away.
 
+Engineering, not features:
+
+- **Wire `./deploy/stamp-release.sh --check` into CI.** It needs no publisher key and fails when the
+  in-app banner names a version other than the one being released, or has expired — the check that
+  was missing while the banner sat on "2.3.9 is live" for three releases. Running it per PR turns
+  that from something you notice in production into something that fails a build.
+
 ## License
 
 Released for research and experimentation. See [`LICENSE`](LICENSE).
