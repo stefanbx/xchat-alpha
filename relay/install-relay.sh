@@ -1062,6 +1062,8 @@ print("node   : online, ledger height", d.get("height"))' 2>/dev/null || echo "n
 print("source :", "GPU" if d.get("gpu_bin") else "CPU"); \
 print("solved :", d.get("gpu",0)+d.get("cpu",0), "blocks ·", d.get("cached",0), "served from cache"); \
 print("average:", d.get("avg_s"), "seconds a block")' 2>/dev/null || echo "work server not running" ;;
+    update)   sh "$SELF" --update ;;
+    check-update) sh "$SELF" --check-update ;;
     stop)     sh "$SELF" --stop ;;
     start)    sh "$SELF" --start ;;
     restart)  sh "$SELF" --stop && sh "$SELF" --start ;;
