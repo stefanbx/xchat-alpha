@@ -6359,42 +6359,91 @@ class DmChatScreen extends StatefulWidget {
 
 class _DmChatScreenState extends State<DmChatScreen> {
   List<Map<String, dynamic>> _msgs = [];
-  bool _loading = true, _sending = false;
+  // Messages typed here but not yet echoed back by the relay. Shown immediately, greyed with a clock,
+  // so sending doesn't feel like the message vanished for a second — the thing every chat app does.
+  final List<Map<String, dynamic>> _pending = [];
+  bool _loading = true, _sending = false, _emoji = false;
   String? _err;
   final _ctl = TextEditingController();
+  Timer? _poll;
 
   @override
   void initState() {
     super.initState();
     _load();
+    // A conversation that only loads once is a mailbox, not a chat: a reply landed on the relay and
+    // you had to back out of the thread and re-open it to see it. Poll while the thread is on screen.
+    _poll = Timer.periodic(const Duration(seconds: 5), (_) => _load(quiet: true));
   }
 
   @override
-  void dispose() { _ctl.dispose(); super.dispose(); }
+  void dispose() { _poll?.cancel(); _ctl.dispose(); super.dispose(); }
 
-  Future<void> _load() async {
+  Future<void> _load({bool quiet = false}) async {
     final convos = await Api.dmInbox();
+    if (!mounted) return;
     final mine = convos.firstWhere((c) => c['peer'] == widget.peer, orElse: () => {});
-    if (mounted) setState(() {
-      _msgs = ((mine['messages'] as List?) ?? []).cast<Map<String, dynamic>>();
-      _loading = false;
-    });
+    final next = ((mine['messages'] as List?) ?? []).cast<Map<String, dynamic>>();
+    // Retire each optimistic bubble once the real one comes back. Match on text + a loose timestamp
+    // window: the relay stamps its own receipt time, so requiring equality would leave a permanent
+    // duplicate on screen.
+    final before = _pending.length;
+    _pending.removeWhere((p) => next.any((m) =>
+        m['outgoing'] == true && m['text'] == p['text'] &&
+        (((m['ts'] as int?) ?? 0) - ((p['ts'] as int?) ?? 0)).abs() <= 120));
+    // A quiet poll that changed nothing must not setState — otherwise every 5s it rebuilds the list
+    // under the reader and fights a long-press selection.
+    if (quiet && next.length == _msgs.length && _pending.length == before && !_loading) return;
+    setState(() { _msgs = next; _loading = false; });
   }
 
   Future<void> _send() async {
     final text = _ctl.text.trim();
-    if (text.isEmpty) return;
-    setState(() { _sending = true; _err = null; });
+    if (text.isEmpty || _sending) return;
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    setState(() {
+      _sending = true; _err = null; _emoji = false;
+      _pending.add({'text': text, 'ts': ts, 'outgoing': true, 'pending': true});
+      _ctl.clear();                       // clear NOW; the optimistic bubble is the receipt
+    });
     final r = await Api.dmSend(widget.peer, text);
     if (!mounted) return;
     if (r != null && r['ok'] == true) {
-      _ctl.clear();
-      if (mounted) FocusScope.of(context).unfocus();   // close the keyboard/typing view after sending
       await _load();
       if (mounted) setState(() => _sending = false);
     } else {
-      setState(() { _sending = false; _err = (r?['error'] ?? 'send failed').toString(); });
+      // Hand the text back instead of eating it — the composer was cleared optimistically, so a
+      // failed send would otherwise destroy what was typed.
+      setState(() {
+        _sending = false;
+        _pending.removeWhere((p) => p['ts'] == ts && p['text'] == text);
+        _ctl.text = text;
+        _ctl.selection = TextSelection.collapsed(offset: text.length);
+        _err = (r?['error'] ?? 'send failed').toString();
+      });
     }
+  }
+
+  bool _sameDay(int a, int b) {
+    final x = DateTime.fromMillisecondsSinceEpoch(a * 1000);
+    final y = DateTime.fromMillisecondsSinceEpoch(b * 1000);
+    return x.year == y.year && x.month == y.month && x.day == y.day;
+  }
+
+  String _clock(int ts) {
+    final d = DateTime.fromMillisecondsSinceEpoch(ts * 1000);
+    return '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+  }
+
+  String _dayLabel(int ts) {
+    final d = DateTime.fromMillisecondsSinceEpoch(ts * 1000);
+    final now = DateTime.now();
+    final days = DateTime(now.year, now.month, now.day)
+        .difference(DateTime(d.year, d.month, d.day)).inDays;
+    if (days == 0) return 'Today';
+    if (days == 1) return 'Yesterday';
+    const mo = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return days < 365 ? '${d.day} ${mo[d.month - 1]}' : '${d.day} ${mo[d.month - 1]} ${d.year}';
   }
 
   @override
@@ -6428,12 +6477,15 @@ class _DmChatScreenState extends State<DmChatScreen> {
                   // scroll down to find what was just said. Reversed, index 0 is the bottom, so it
                   // lands on the latest and new messages appear where the eye already is — and it
                   // needs no post-frame scroll hack that fights the keyboard opening.
-                  : ListView.builder(
-                      reverse: true,
-                      padding: const EdgeInsets.all(14),
-                      itemCount: _msgs.length,
-                      itemBuilder: (_, i) => _bubble(_msgs[_msgs.length - 1 - i]),
-                    ),
+                  : Builder(builder: (_) {
+                      final rows = _rows();
+                      return ListView.builder(
+                        reverse: true,
+                        padding: const EdgeInsets.all(14),
+                        itemCount: rows.length,
+                        itemBuilder: (_, i) => rows[rows.length - 1 - i],
+                      );
+                    }),
         ),
         if (_err != null) Padding(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
             child: Text(_err!, style: const TextStyle(color: Color(0xFFEF6C9B), fontSize: 12.5))),
@@ -6442,62 +6494,168 @@ class _DmChatScreenState extends State<DmChatScreen> {
     );
   }
 
-  Widget _bubble(Map<String, dynamic> m) {
+  // Build the thread as rows (day chips + bubbles) rather than one bubble per message, so consecutive
+  // messages from the same person read as a block the way they do in Messenger/WhatsApp instead of a
+  // ladder of identical rounded boxes each restating the time.
+  List<Widget> _rows() {
+    final all = [..._msgs, ..._pending];        // optimistic sends sit at the end, i.e. newest
+    const groupWindow = 300;                    // 5 min: past that, a message starts a new block
+    final rows = <Widget>[];
+    for (var i = 0; i < all.length; i++) {
+      final m = all[i];
+      final ts = (m['ts'] as int?) ?? 0;
+      final prev = i > 0 ? all[i - 1] : null;
+      final next = i + 1 < all.length ? all[i + 1] : null;
+      final prevTs = (prev?['ts'] as int?) ?? 0;
+      final nextTs = (next?['ts'] as int?) ?? 0;
+      final newDay = prev == null || !_sameDay(prevTs, ts);
+      if (newDay) rows.add(_dayChip(ts));
+      final cont = !newDay && prev['outgoing'] == m['outgoing'] && (ts - prevTs).abs() < groupWindow;
+      final endsBlock = next == null || next['outgoing'] != m['outgoing'] ||
+          !_sameDay(ts, nextTs) || (nextTs - ts).abs() >= groupWindow;
+      rows.add(_bubble(m, cont: cont, showTime: endsBlock));
+    }
+    return rows;
+  }
+
+  Widget _dayChip(int ts) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 4),
+            decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: kLine)),
+            child: Text(_dayLabel(ts),
+                style: const TextStyle(color: kDim, fontSize: 11, fontWeight: FontWeight.w600)),
+          ),
+        ),
+      );
+
+  Widget _bubble(Map<String, dynamic> m, {bool cont = false, bool showTime = true}) {
     final out = m['outgoing'] == true;
+    final pending = m['pending'] == true;
+    const r16 = Radius.circular(16), r5 = Radius.circular(5);
     return Align(
       alignment: out ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 3),
-        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
-        constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.72),
-        decoration: BoxDecoration(
-          color: out ? kAccent : kCard,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(16), topRight: const Radius.circular(16),
-            bottomLeft: Radius.circular(out ? 16 : 4), bottomRight: Radius.circular(out ? 4 : 16)),
-        ),
-        // The timestamp was always in the message map — sorted on, even — but never shown, so a DM
-        // thread read as one undated block. timeAgo() is the same helper the feed already uses.
-        child: Column(
-          crossAxisAlignment: out ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text('${m['text']}',
-                style: TextStyle(color: out ? Colors.black : kText, fontSize: 15, height: 1.3)),
-            const SizedBox(height: 3),
-            Text(timeAgo((m['ts'] as int?) ?? 0),
-                style: TextStyle(
-                    color: out ? Colors.black.withValues(alpha: 0.55) : kDim, fontSize: 10.5)),
-          ],
+      child: Opacity(
+        opacity: pending ? 0.6 : 1,             // "on its way" without a second widget
+        child: Container(
+          // Tight inside a block, loose between blocks — the spacing IS the grouping cue.
+          margin: EdgeInsets.only(top: cont ? 2 : 8),
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+          constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.78),
+          decoration: BoxDecoration(
+            color: out ? kAccent : kCard,
+            // Only the last bubble of a block keeps its tail; the ones above square off against it.
+            borderRadius: BorderRadius.only(
+              topLeft: out ? r16 : (cont ? r5 : r16),
+              topRight: out ? (cont ? r5 : r16) : r16,
+              bottomLeft: out ? r16 : (showTime ? r5 : r16),
+              bottomRight: out ? (showTime ? r5 : r16) : r16),
+          ),
+          // The timestamp was always in the message map — sorted on, even — but never shown, so a DM
+          // thread read as one undated block. Clock time, not "16m": relative ages are for a feed you
+          // skim, while a conversation you re-read needs to say when something was actually said.
+          child: Column(
+            crossAxisAlignment: out ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('${m['text']}',
+                  style: TextStyle(color: out ? Colors.black : kText, fontSize: 15, height: 1.3)),
+              if (showTime) ...[
+                const SizedBox(height: 3),
+                Row(mainAxisSize: MainAxisSize.min, children: [
+                  if (pending)
+                    Padding(padding: const EdgeInsets.only(right: 3),
+                        child: Icon(Icons.schedule, size: 11,
+                            color: out ? Colors.black.withValues(alpha: 0.55) : kDim)),
+                  Text(_clock((m['ts'] as int?) ?? 0),
+                      style: TextStyle(
+                          color: out ? Colors.black.withValues(alpha: 0.55) : kDim, fontSize: 10.5)),
+                ]),
+              ],
+            ],
+          ),
         ),
       ),
     );
+  }
+
+  // A picker that ships WITH the app, rather than relying on the device keyboard's emoji key. That
+  // reliance is what "I can't use emoji in the DM" actually was: on a keyboard where the emoji key is
+  // absent or swapped for voice input there is no way in at all, and the fix can't live in our code.
+  static const _emojis = [
+    '😀','😃','😄','😁','😆','😅','🤣','😂','🙂','🙃','😉','😊','😍','🥰','😘','😗',
+    '🤗','🤔','🤨','😐','😑','🙄','😏','😴','🤤','😪','😵','🤯','🥳','😎','🤓','🧐',
+    '😕','🙁','😢','😭','😤','😠','😡','🤬','😱','😳','🥵','🥶','😬','🤝','🙏','👍',
+    '👎','👌','✌️','🤞','💪','👏','🙌','👀','🔥','✨','⭐','💯','✅','❌','⚡','🎉',
+    '❤️','🧡','💛','💚','💙','💜','🖤','💔','💸','🪙','🚀','🛠️','📡','🌐','🔐','👋',
+  ];
+
+  void _insertEmoji(String e) {
+    final t = _ctl.text;
+    final sel = _ctl.selection;
+    final start = sel.start < 0 ? t.length : sel.start;
+    final end = sel.end < 0 ? t.length : sel.end;
+    _ctl.text = t.replaceRange(start, end, e);
+    _ctl.selection = TextSelection.collapsed(offset: start + e.length);
+    setState(() {});                    // the send button enables off text length
   }
 
   Widget _composer() {
     return SafeArea(
       top: false,
       child: Container(
-        padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
         decoration: const BoxDecoration(color: kCard, border: Border(top: BorderSide(color: kLine))),
-        child: Row(children: [
-          Expanded(
-            child: TextField(
-              controller: _ctl,
-              style: const TextStyle(color: kText, fontSize: 15),
-              minLines: 1, maxLines: 4,
-              textInputAction: TextInputAction.send,
-              onSubmitted: (_) => _send(),
-              decoration: const InputDecoration(
-                hintText: 'Encrypted message…',
-                hintStyle: TextStyle(color: kDim), border: InputBorder.none,
-                contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 10)),
-            ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(4, 4, 4, 4),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+              IconButton(
+                onPressed: () {
+                  // Close the system keyboard when opening ours, or the two stack and bury the thread.
+                  if (!_emoji) FocusScope.of(context).unfocus();
+                  setState(() => _emoji = !_emoji);
+                },
+                icon: Icon(_emoji ? Icons.keyboard : Icons.emoji_emotions_outlined,
+                    color: _emoji ? kAccent : kDim),
+                tooltip: _emoji ? 'Keyboard' : 'Emoji',
+              ),
+              Expanded(
+                child: TextField(
+                  controller: _ctl,
+                  style: const TextStyle(color: kText, fontSize: 15),
+                  minLines: 1, maxLines: 5,
+                  textInputAction: TextInputAction.send,
+                  onTap: () { if (_emoji) setState(() => _emoji = false); },
+                  onSubmitted: (_) => _send(),
+                  decoration: const InputDecoration(
+                    hintText: 'Encrypted message…',
+                    hintStyle: TextStyle(color: kDim), border: InputBorder.none,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 4, vertical: 10)),
+                ),
+              ),
+              _sending
+                  ? const Padding(padding: EdgeInsets.all(10),
+                      child: SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: kAccent)))
+                  : IconButton(onPressed: _send, icon: const Icon(Icons.send, color: kAccent)),
+            ]),
           ),
-          _sending
-              ? const Padding(padding: EdgeInsets.all(10),
-                  child: SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: kAccent)))
-              : IconButton(onPressed: _send, icon: const Icon(Icons.send, color: kAccent)),
+          if (_emoji)
+            SizedBox(
+              height: 210,
+              child: GridView.builder(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 8, mainAxisSpacing: 2, crossAxisSpacing: 2),
+                itemCount: _emojis.length,
+                itemBuilder: (_, i) => InkWell(
+                  onTap: () => _insertEmoji(_emojis[i]),
+                  borderRadius: BorderRadius.circular(8),
+                  child: Center(child: Text(_emojis[i], style: const TextStyle(fontSize: 24))),
+                ),
+              ),
+            ),
         ]),
       ),
     );
