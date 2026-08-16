@@ -11,7 +11,7 @@
 #   python3 xc_reldir.py announce URL [URL ...]     # each URL self-announces as its own relay
 #   python3 xc_reldir.py resolve                    # scan the ledger -> relays (+ persist the list)
 #   python3 xc_reldir.py engine                     # machine-readable form for the engine endpoint
-import sys, json, time, urllib.request
+import os, sys, json, time, urllib.request
 import xc_common as xc
 
 _HEALTH = '/tmp/xc_relay_health.json'  # rolling window of the last N up/down samples per relay
@@ -160,7 +160,7 @@ def engine():  # machine-readable form for the engine's /api/relaydir endpoint
            'health': health}
     # NB: do NOT overwrite the bootstrap file with only the ledger set — that would drop this node's
     # own co-located relay. onchain_relays() already caches the discovered set; _bootstrap unions them.
-    with open('/tmp/xc_relaydir.json', 'w') as f:
+    with open('/tmp/xc_relaydir_%s.json' % os.environ.get('XC_NS', ''), 'w') as f:
         json.dump(doc, f)
     print(json.dumps(doc))
     return 0

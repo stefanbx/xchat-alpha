@@ -77,6 +77,10 @@ def main():
         return 0
 
     env = dict(os.environ)
+    # Nothing under test may reach the live relay mesh. Set here as well as in the individual tests,
+    # because the tests that spin up a relay or a node all inherit the same hazard: this repo is
+    # normally checked out on a machine that is ALSO running a real node, and the two share /tmp.
+    env['XC_ISOLATE'] = '1'
     dd = dart_dir()
     if dd:
         env['PATH'] = dd + os.pathsep + env['PATH']

@@ -1062,6 +1062,11 @@ _KNOWN_RELAYS = '/tmp/xc_known_relays.json'  # the list the client keeps: reconn
 _ONCHAIN_FAIL_TTL = 20   # a FAILED scan is retried far sooner than a good one — but not on every spawn
 
 def onchain_relays(ttl=120):  # SCAN the ledger for self-announced relays (no directory, no SPOF)
+    # Isolation has to cover THIS too, not just _bootstrap(). Callers reach the ledger set directly —
+    # /api/relaydir does — so gating only the bootstrap left a test able to see, and gossip to, the
+    # live mesh through a side door, cache file and all.
+    if os.environ.get('XC_ISOLATE') == '1':
+        return []
     try:                                            # short on-disk cache: one ledger scan per helper wave, not per spawn
         c = json.load(open(_ONCHAIN_CACHE))
         if 'relays' in c:                           # honor an EMPTY result too — see below
@@ -1097,6 +1102,8 @@ def onchain_relays(ttl=120):  # SCAN the ledger for self-announced relays (no di
     return known_relays() if failed else relays
 
 def known_relays():  # the persisted list — used to reconnect directly before any fresh scan
+    if os.environ.get('XC_ISOLATE') == '1':
+        return []                      # see _bootstrap(): no ambient discovery under isolation
     try:
         return json.load(open(_KNOWN_RELAYS)).get('relays', [])
     except Exception:
@@ -1106,6 +1113,20 @@ def known_relays():  # the persisted list — used to reconnect directly before 
 # relay URL, no directory owner) -> the persisted "known relays" list (resilient reconnect if a scan
 # momentarily fails) -> an explicit override file / env -> the local dev relays.
 def _bootstrap():
+    # XC_ISOLATE: use XCHAT_BOOTSTRAP and NOTHING else. The union below is right for a real node but
+    # is unsafe for a test, and there was no way to opt out. A test would set XCHAT_BOOTSTRAP to its
+    # own throwaway relay and still get the ledger set, the known-relay cache and whatever
+    # /tmp/xchat_bootstrap.txt happened to hold — a file a REAL node running on the same machine
+    # rewrites periodically. So an isolated test that cleared all three at startup could still have
+    # them reappear underneath it mid-run and discover the live mesh.
+    #
+    # That is not theoretical: the e2e test posts and asserts the head gossiped to >=1 relay, so every
+    # time the race landed it published a real, permanent post to the production feed. 54 copies of
+    # "hello from an on-device signature" accumulated there from ordinary test runs before anyone
+    # asked why the post count was climbing.
+    if os.environ.get('XC_ISOLATE') == '1':
+        s = [u.rstrip('/') for u in os.environ.get('XCHAT_BOOTSTRAP', '').split(',') if u.strip()]
+        return s or ['http://127.0.0.1:1']      # unroutable: isolated and misconfigured beats leaking
     # UNION of every source, ledger first — a node keeps its own co-located relay AND adds the ones
     # it discovers on-chain, instead of a discovery replacing (and starving) the local set.
     s = list(onchain_relays()) + list(known_relays())

@@ -384,7 +384,12 @@ def api_channels():
 RELAYDIR_TTL = float(os.environ.get('XC_RELAYDIR_TTL', '180'))
 _relaydir_ts = [0.0]
 _relaydir_lock = threading.Lock()
-_RELAYDIR_CACHE = '/tmp/xc_relaydir_cache.json'
+# Namespaced per instance (XC_NS = port), like the wallet above. These were FIXED /tmp paths, so
+# every node on one machine shared them: a throwaway test node served the relay set that the real node
+# running beside it had cached, and vice-versa. That is how an isolated test could report the live mesh
+# on /api/relaydir while its own discovery was correctly confined to a loopback relay.
+_RELAYDIR_CACHE = '/tmp/xc_relaydir_cache_%s.json' % NS
+_RELAYDIR_OUT = '/tmp/xc_relaydir_%s.json' % NS
 _RELAYDIR_WARMING = '{"source":"warming","relays":[],"active":[],"count":0,"health":[],"rendezvous":[]}'
 def api_relaydir():
     # The relay-directory panel does an on-chain scan + per-relay pings. A COLD scan can take ~80s and
@@ -397,8 +402,8 @@ def api_relaydir():
         def _bg():
             try:
                 spawn('xc_reldir.py', 'engine')
-                if os.path.exists('/tmp/xc_relaydir.json'):
-                    os.replace('/tmp/xc_relaydir.json', _RELAYDIR_CACHE)
+                if os.path.exists(_RELAYDIR_OUT):
+                    os.replace(_RELAYDIR_OUT, _RELAYDIR_CACHE)
             finally:
                 try:
                     _relaydir_lock.release()

@@ -121,8 +121,13 @@ def main():
         if os.path.exists(f):
             os.remove(f)
     open('/tmp/xchat_bootstrap.txt', 'w').write(relay_url + '\n')
+    # XC_ISOLATE=1 is what actually makes this deterministic. Clearing the three SHARED files is not
+    # enough on a machine that also runs a real node: that node rewrites /tmp/xchat_bootstrap.txt on
+    # its own schedule, so it can reappear mid-run and hand this test the live relay mesh. Since the
+    # post check below asserts the head gossiped to >=1 relay, that leaked real posts into the
+    # production feed whenever the timing lined up.
     env = {**os.environ, 'XCHAT_BOOTSTRAP': relay_url, 'XC_NS': str(node_port),
-           'XC_NANO_RPC': DEAD_RPC}
+           'XC_NANO_RPC': DEAD_RPC, 'XC_ISOLATE': '1'}
 
     procs = []
     try:
@@ -146,6 +151,18 @@ def main():
         me = api(node_port, f'/api/me?account={acct}')
         check(me.get('account') == acct, 'identity comes from the device', me)
         check(not os.path.exists(f'/tmp/xc_wallet_seed_{node_port}.txt'), 'the node stores no seed')
+
+        # ---- CONTAINMENT: prove we are talking to nothing but our own relay, BEFORE we post ----
+        # This check exists because its absence cost something real: the post below gossips a signed
+        # head to every relay in scope, so the moment ambient discovery leaked in, the test published
+        # to the live network. Assert the blast radius first; a leak must fail here, loudly, and not
+        # be discovered later by counting strangers' feeds.
+        dirs = api(node_port, '/api/relaydir')
+        reach = [u for u in (dirs.get('active') or []) + (dirs.get('relays') or [])]
+        outside = [u for u in reach if '127.0.0.1' not in u and 'localhost' not in u]
+        check(not outside, 'discovery is contained to the throwaway relay', outside)
+        if outside:
+            sys.exit('REFUSING TO POST: this test can see relays it does not own: %s' % outside)
 
         # ---- POST: prepare (app-signed event) -> sign the head over the returned CID -> submit ----
         text = 'hello from an on-device signature'
