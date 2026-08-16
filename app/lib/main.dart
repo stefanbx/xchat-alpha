@@ -21,6 +21,7 @@ import 'package:battery_plus/battery_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:nanodart/nanodart.dart' show Blake2b, NanoHelpers;   // Blake2b for DmCtl.keyOf
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:crypto/crypto.dart' show sha256;
@@ -450,6 +451,68 @@ class Notifs {
   }
 }
 
+// SEALED CONTROL MESSAGES — the envelope reactions, read receipts and anything after them ride in.
+//
+// A control message is an ordinary DM: same sealing, same relay path, same "relays hold ciphertext
+// and nothing else". It differs only in that the recipient's client ACTS on it instead of showing it.
+// That is deliberate — a relay must not be able to tell a reaction from a sentence, or it would learn
+// the shape of a conversation it is not allowed to read.
+//
+// FORMAT is one line and nothing else:   xchat:ctl/1 <type> <json>
+//
+// Whole-message, not a prefix on a normal message, so a client that understands it can suppress the
+// bubble entirely rather than rendering a stray line under someone's text.
+//
+// SUPPRESS-UNKNOWN is the forward-compatibility rule and the reason for the version in the tag: a
+// client that meets a type it does not know still recognises the envelope, so it hides the message
+// rather than printing machine text at the reader. Today's build therefore stays quiet in front of
+// whatever ships next, without being taught about it.
+//
+// HONEST LIMIT: a client that predates this — and real users are on older builds, we watched an
+// operator sit two releases behind all day — has no idea what the envelope is and will render the
+// raw line as a message. That is the same trade the quote format made, and it is why control
+// messages must stay LOW FREQUENCY. A reaction now and then is a tolerable oddity in an old client;
+// a read receipt per message opened would be a flood, which is exactly why receipts should batch to
+// one per conversation rather than one per message.
+class DmCtl {
+  static const tag = 'xchat:ctl/1 ';
+
+  /// A stable id for a message that BOTH sides can compute. The ciphertext is the one thing sender
+  /// and recipient hold identically, so its digest names a message without either side inventing an
+  /// id or a relay having to assign one. Truncated: this only has to be unique within a conversation.
+  static String keyOf(String ciphertext) =>
+      NanoHelpers.byteToHex(Blake2b.digest256([Uint8List.fromList(utf8.encode(ciphertext))]))
+          .toLowerCase()
+          .substring(0, 16);
+
+  static String encode(String type, Map<String, dynamic> data) =>
+      '$tag$type ${jsonEncode(data)}';
+
+  /// Parse a control message, or null if this is ordinary text. Never throws: a malformed envelope
+  /// from a peer must not be able to break the thread it appears in.
+  static ({String type, Map<String, dynamic> data})? parse(String text) {
+    final t = text.trim();
+    if (!t.startsWith(tag) || t.contains('\n')) return null;
+    final rest = t.substring(tag.length);
+    final sp = rest.indexOf(' ');
+    if (sp <= 0) return null;
+    final type = rest.substring(0, sp);
+    try {
+      final j = jsonDecode(rest.substring(sp + 1));
+      if (j is! Map) return null;
+      return (type: type, data: j.cast<String, dynamic>());
+    } catch (_) {
+      // A recognised envelope with unreadable payload is still an envelope: report it so the caller
+      // HIDES it. Falling back to null here would print the raw line at the reader instead.
+      return (type: type, data: const <String, dynamic>{});
+    }
+  }
+
+  /// True for anything that should not be drawn as a chat bubble — including types this build has
+  /// never heard of. See SUPPRESS-UNKNOWN above.
+  static bool isControl(String text) => parse(text) != null;
+}
+
 // ON-DEVICE MESSAGE STORE — decrypt each DM once, ever.
 //
 // A poll opens EVERY ciphertext in the inbox and throws the plaintext away, so cost grows linearly
@@ -497,14 +560,17 @@ class DmStore {
           if (v['p'] != null)
             {
               'from': v['f'], 'outgoing': v['o'] == true, 'text': v['t'],
-              'ts': v['s'], 'peer': v['p'], 'peer_pk': v['k'],
+              'ts': v['s'], 'peer': v['p'], 'peer_pk': v['k'], 'id': v['i'],
             }
       ];
 
   static void put(String ct, String text, int ts,
       {required String from, required bool outgoing, required String peer, required String peerPk}) {
     if (_mem.containsKey(ct)) return;
-    _mem[ct] = {'t': text, 's': ts, 'f': from, 'o': outgoing, 'p': peer, 'k': peerPk};
+    // 'i' is the message id BOTH sides can compute from the ciphertext — what a reaction or a read
+    // receipt points at. Derived here so it is stored once rather than hashed on every rebuild.
+    _mem[ct] = {'t': text, 's': ts, 'f': from, 'o': outgoing, 'p': peer, 'k': peerPk,
+                'i': DmCtl.keyOf(ct)};
     _dirty = true;
   }
 
@@ -7078,7 +7144,13 @@ class _DmChatScreenState extends State<DmChatScreen> {
   // messages from the same person read as a block the way they do in Messenger/WhatsApp instead of a
   // ladder of identical rounded boxes each restating the time.
   List<Widget> _rows() {
-    var all = [..._msgs, ..._pending];          // optimistic sends sit at the end, i.e. newest
+    // Control messages are ACTED on, never drawn. Suppressing them here — before grouping, day
+    // chips or search — means a reaction can never open a day separator of its own or leave a gap
+    // between two messages that belong together. Unknown types are suppressed too: see DmCtl.
+    var all = [
+      for (final m in [..._msgs, ..._pending])
+        if (!DmCtl.isControl('${m['text']}')) m
+    ];
     if (_query.isNotEmpty) {
       // Search the BODY, not the raw text: a hit inside the "> " quote of a reply would otherwise
       // match the message that quoted it as well as the original, which reads as a duplicate.
