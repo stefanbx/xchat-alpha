@@ -143,6 +143,15 @@
     <div class="cmd"><span class="p">$</span><code id="cmd">curl -fsSL https://xchat-alpha-node.fly.dev/relay.sh | sh</code></div>
     <button class="cta2" id="copy" style="margin-top:12px" type="button">Copy the install command</button>
     <p class="muted" style="margin:14px 0 0;font-size:13px">
+      <b style="color:var(--ink)">Keeping it up to date.</b> Run
+      <span class="mono" style="color:var(--accent2)">sh ~/.xchat-relay/install-relay.sh --status</span>
+      any time — it tells you if it is running, whether people can reach you, and whether a newer
+      version exists. To update, one command:
+      <span class="mono" style="color:var(--accent2)">sh ~/.xchat-relay/install-relay.sh --update</span>.
+      It asks you nothing and keeps everything that is yours — your payout address, your keys, your
+      stored posts.
+    </p>
+    <p class="muted" style="margin:14px 0 0;font-size:13px">
       <b style="color:var(--ink)">What it does to your computer.</b> Everything goes into one folder
       (<span class="mono">~/.xchat-relay</span>). Nothing else is touched. It cannot post as you or
       touch your money — a relay only stores messages other people already signed. It also opens a

@@ -41,7 +41,12 @@
 #                                         operator.seed, mode 600 — back it up.
 #
 #   sh install-relay.sh --status      what's running, the public URL, and whether you're announced
+#   sh install-relay.sh --update      get the latest code, keeping your address, keys and data
+#   sh install-relay.sh --check-update   just say whether a newer version exists
 #   sh install-relay.sh --uninstall   stop it and delete ~/.xchat-relay
+#
+# --status tells you when an update is available. Updating never asks you anything again and never
+# touches your payout address, operator key, worker config, stored posts or IPFS repo.
 set -eu
 
 XC_HOME="${XC_RELAY_HOME:-$HOME/.xchat-relay}"
@@ -126,6 +131,8 @@ while [ $# -gt 0 ]; do
         --uninstall)       ACTION=uninstall ;;
         --setup-worker)    ACTION=setup-worker ;;
         --setup-operator)  ACTION=setup-operator ;;
+        --update)          ACTION=install; NOPROMPT=1 ;;   # refresh code in place, ask nothing
+        --check-update)    ACTION=check-update ;;
         --worker-name)     shift; WORKER_NAME="${1:-}"; [ -n "$WORKER_NAME" ] || die "--worker-name needs a value" ;;
         --worker-name=*)   WORKER_NAME="${1#*=}" ;;
         --help|-h)         ACTION=help ;;
@@ -140,7 +147,25 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# The installed code's fingerprint. A hash of the installer itself rather than a version string:
+# nothing to remember to bump, and it changes exactly when the shipped code changes.
+installed_fp() { [ -f "$XC_HOME/installed.fp" ] && cat "$XC_HOME/installed.fp" || echo ''; }
+remote_fp() {
+    t=$(mktemp 2>/dev/null || echo /tmp/xcfp.$$)
+    if fetch "$SRC/relay/install-relay.sh" "$t" 2>/dev/null; then
+        shasum -a 256 "$t" 2>/dev/null | cut -c1-16 || sha256sum "$t" 2>/dev/null | cut -c1-16
+    fi
+    rm -f "$t"
+}
+
 case "$ACTION" in
+    check-update)
+        have=$(installed_fp); want=$(remote_fp)
+        if [ -z "$want" ]; then warn "could not reach $SRC to check for updates"
+        elif [ -z "$have" ]; then say "installed version unknown (installed before update checks existed)"
+        elif [ "$have" = "$want" ]; then ok "up to date"
+        else say "an update is available — run:  sh $SELF --update"; fi
+        exit 0 ;;
     status)
         if pgrep -f "$XC_HOME/run.sh" >/dev/null 2>&1; then ok "relay is running"
         else warn "relay is not running"; fi
@@ -181,6 +206,12 @@ case "$ACTION" in
         fi
         if [ -s "$XC_HOME/selfannounce.log" ]; then
             say "last announce: $(tail -n 1 "$XC_HOME/selfannounce.log")"
+        fi
+        have=$(installed_fp); want=$(remote_fp)
+        if [ -n "$want" ] && [ -n "$have" ] && [ "$have" != "$want" ]; then
+            say ""
+            warn "an update is available"
+            say "  Update in place, keeping your address, keys and data:  sh $SELF --update"
         fi
         say ""
         say "settings:   http://127.0.0.1:$ADMIN_PORT"
@@ -526,6 +557,10 @@ fetch "$SRC/relay/work/nano_work_cl.c" "$XC_HOME/nano_work_cl.c" 2>/dev/null || 
 "$PY" -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$XC_HOME/xc_relayd.py" \
     || die "the downloaded relay is not valid Python — the download was truncated or tampered with"
 fetch "$SRC/relay/install-relay.sh" "$SELF" && chmod +x "$SELF"   # so --status/--uninstall work later
+# Fingerprint what we just installed, so --status and --check-update can tell the operator when the
+# shipped code has moved on. A relay has no self-update path like the app's signed releases, so
+# without this an operator has no way to know a fix exists short of being told.
+( shasum -a 256 "$SELF" 2>/dev/null || sha256sum "$SELF" 2>/dev/null ) | cut -c1-16 > "$XC_HOME/installed.fp" 2>/dev/null || true
 ok "relay downloaded ($(wc -c < "$XC_HOME/xc_relayd.py" | tr -d ' ') bytes)"
 
 step "setting up Python (nanopy — signature checks + your relay account)"
@@ -576,8 +611,20 @@ fi
 # stdin to read from, so ask the terminal directly.
 # `[ -r /dev/tty ]` is true even where opening it fails (cron, a CI shell, a detached run), and the
 # failure prints a raw `sh: /dev/tty: Device not configured` at the reader. Actually open it first.
+# Re-running the installer IS how you update, so this must not treat an existing install as blank.
+# It read only the environment, then prompted with an empty default — and pressing Enter wrote
+# RELAY_ACCT="", silently switching the relay to "takes no payments". An operator updating to get a
+# bug fix could stop being paid, with one warning line scrolling past as the only signal. Read what
+# is already configured first, and if something is there, keep it without asking.
 ACCT="${RELAY_ACCT:-}"
-if [ -z "$ACCT" ] && { : < /dev/tty; } 2>/dev/null; then
+if [ -z "$ACCT" ] && [ -f "$XC_HOME/config.json" ]; then      # what the running relay actually uses
+    ACCT=$(sed -n 's/.*"relay_acct"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$XC_HOME/config.json" | head -1)
+fi
+if [ -z "$ACCT" ] && [ -f "$XC_HOME/run.sh" ]; then           # fallback: the generated supervisor
+    ACCT=$(sed -n 's/^export RELAY_ACCT="\(.*\)"$/\1/p' "$XC_HOME/run.sh" | head -1)
+fi
+[ -n "$ACCT" ] && ok "payout address kept: $ACCT"
+if [ -z "$ACCT" ] && [ "${NOPROMPT:-0}" != 1 ] && { : < /dev/tty; } 2>/dev/null; then
     say ''
     say "  Your relay can be paid (pinning fees, tip splits). Paste the ӾChat address you want"
     say "  that money to land in — it's in the app under your profile. ${c_dim}Press Enter to skip.${c_0}"
