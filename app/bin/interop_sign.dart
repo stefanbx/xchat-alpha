@@ -53,6 +53,14 @@ void daemon(NanoWallet w) {
         print(jsonEncode({'ct': w.dmSeal(req['peer'] as String, req['text'] as String)}));
       case 'open':
         print(jsonEncode({'text': w.dmOpen(req['peer'] as String, req['ct'] as String)}));
+      case 'caps_sig':                                 // sign the sealed-sender capability advertisement
+        print(jsonEncode(w.signMsg(w.dmKeyCapsMsg(req['ts'] as int, req['caps'] as String))));
+      case 'seal_sealed':                              // build a sealed-sender outer envelope {epk, ct}
+        print(jsonEncode(w.dmSealSealed(req['peer'] as String, req['text'] as String)));
+      case 'open_sealed':                              // open the outer seal → {f, k, i} or null
+        print(jsonEncode({'outer': w.dmOpenSealedOuter(req['epk'] as String, req['ct'] as String)}));
+      case 'caps':                                     // what this build advertises
+        print(jsonEncode({'caps': NanoWallet.dmCaps}));
       case 'quit':
         return;
       default:
