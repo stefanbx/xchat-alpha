@@ -395,6 +395,14 @@ REP_HALFLIFE = float(os.environ.get('XC_REP_HALFLIFE', str(30 * 86400)))   # rep
 REP_TTL      = float(os.environ.get('XC_REP_TTL', '300'))       # cache an account's reputation this long
 REP_TELEPORT = float(os.environ.get('XC_REP_TELEPORT', '0.5'))  # EigenTrust anchor back to on-chain pre-trust
 REP_ITERS    = int(os.environ.get('XC_REP_ITERS', '25'))        # trust-propagation iterations to convergence
+# The aggregated-feed cache. Written by xc_feed.py, read by kt_server (served to clients) and xc_labels.
+# Its PATH is env-driven so a deployment can point it at PERSISTENT storage: on /tmp it is wiped on every
+# redeploy/reboot, which forced a cold 3-8s re-aggregation (the whole relay fan-out + reputation RPCs +
+# content fetch) as the FIRST request after each deploy blocked on rebuilding it from nothing. Pointed at
+# a persistent volume, the last aggregation survives the restart, so that first request serves it
+# instantly and refreshes in the background — the same warm path every later request already takes.
+FEED_CACHE = os.environ.get('XC_FEED_CACHE', '/tmp/xc_feed_agg.json')
+
 _rep_cache = {}
 # DISK-BACKED rep cache. Each account_rep miss is a ~0.66s mainnet RPC, and the feed re-aggregates every
 # few seconds in a FRESH helper process — so an in-memory-only cache re-fetched every reporter's rep on

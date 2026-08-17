@@ -191,27 +191,45 @@ FEED_TTL = float(os.environ.get('XC_FEED_TTL', '12'))
 _feed_ts = [0.0]
 _feed_lock = threading.Lock()
 
+def _refresh_feed_bg():
+    # Rebuild the aggregation OFF the request path. spawn() is a blocking subprocess.run — run inline it
+    # made the one request that won the refresh eat the whole aggregation (a full relay fan-out + rep
+    # RPCs + content fetch). Warm that is ~1s, but right after a redeploy the persisted cache is stale
+    # AND the in-memory freshness clock is 0, so that first request hit exactly this refresh and wore
+    # the cold 3-8s itself. On a thread, every request serves the cache instantly; the refresh lands a
+    # beat later for the next poll. Holds _feed_lock for the whole run (handed over by the caller) so at
+    # most one aggregation runs at a time; releases it here no matter how spawn exits.
+    try:
+        spawn('xc_feed.py')
+    finally:
+        _feed_lock.release()
+
 def api_feed(query=None):
     now = time.time()
-    if not os.path.exists('/tmp/xc_feed_agg.json'):
-        # COLD START (fresh node, or a redeploy cleared /tmp): BLOCK on the first aggregation so the very
-        # first feed is never empty. Only one caller aggregates per TTL window; others wait on the lock,
-        # then read the fresh file. If it fails, they fall through to empty fast (no thundering herd).
+    if not os.path.exists(xc.FEED_CACHE):
+        # COLD START — no cache anywhere. With FEED_CACHE on a PERSISTENT volume this is now a genuine
+        # first-ever boot (not every redeploy), so blocking the very first request to rebuild it — rather
+        # than serving an empty feed — is a once-in-a-node-lifetime cost, not a per-deploy one. Only one
+        # caller aggregates per TTL window; others wait on the lock, then read the fresh file. If it
+        # fails, they fall through to empty fast (no thundering herd).
         with _feed_lock:
-            if not os.path.exists('/tmp/xc_feed_agg.json') and time.time() - _feed_ts[0] > FEED_TTL:
+            if not os.path.exists(xc.FEED_CACHE) and time.time() - _feed_ts[0] > FEED_TTL:
                 _feed_ts[0] = time.time()
                 spawn('xc_feed.py')
     elif now - _feed_ts[0] > FEED_TTL and _feed_lock.acquire(blocking=False):
+        # A cache EXISTS but is stale: serve it right now, refresh on a background thread. _feed_ts is
+        # advanced BEFORE the thread starts so a burst of requests in the same window all fall through
+        # to the instant serve rather than each queuing another refresh.
+        _feed_ts[0] = now
         try:
-            _feed_ts[0] = now                                # warm refresh: serve the stale cache meanwhile
-            spawn('xc_feed.py')
-        finally:
-            _feed_lock.release()
+            threading.Thread(target=_refresh_feed_bg, daemon=True).start()
+        except Exception:
+            _feed_lock.release()                             # never leak the lock if the thread won't start
     # The aggregation file is a CACHE that must persist for FEED_TTL, so read it WITHOUT consuming it —
     # unlike a one-shot helper result. (read() deletes what it reads; using it here defeated the cache
     # and re-aggregated on every request, which is what made the feed blink slow-or-empty.)
     try:
-        content = open('/tmp/xc_feed_agg.json').read() or '{}'
+        content = open(xc.FEED_CACHE).read() or '{}'
     except Exception:
         content = '{}'
     blocks = read('/tmp/xc_onchain_count.txt', '0') or '0'

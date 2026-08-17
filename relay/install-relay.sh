@@ -866,6 +866,14 @@ export PATH="$XC_HOME/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PAT
 # repo (or fails outright on a machine that has only the one). Point it at a persistent path instead.
 # A fresh machine still needs `ipfs init` once; this only stops a working repo from evaporating.
 export IPFS_PATH="${IPFS_PATH:-$HOME/.ipfs}"
+# Feed caches under XC_HOME (persistent), not /tmp (wiped on reboot). On /tmp, every reboot forced the
+# node's first feed request to rebuild the whole aggregation from scratch — a full relay fan-out, a
+# burst of ~0.66s reputation RPCs, and a cold content fetch, all blocking that request for 3-8s. Now
+# every relay is a node, so this cold start is every operator's problem; persisting the last
+# aggregation makes that first post-reboot request serve instantly and refresh in the background.
+export XC_FEED_CACHE="${XC_FEED_CACHE:-$XC_HOME/feed_agg.json}"
+export XC_CONTENT_CACHE="${XC_CONTENT_CACHE:-$XC_HOME/content-cache}"
+export XC_REP_CACHE="${XC_REP_CACHE:-$XC_HOME/rep_cache.json}"
 cd "$XC_HOME"
 echo "$$" > "$XC_HOME/supervisor.pid"
 

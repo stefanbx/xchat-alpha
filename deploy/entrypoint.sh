@@ -20,6 +20,15 @@ else
     echo "WARNING: check the [mounts] volume in fly.toml, and whether the volume is full"
 fi
 mkdir -p "$STORE_DIR"
+# The feed caches go on the persistent volume too. On /tmp they were wiped on every redeploy, so the
+# FIRST feed request after each deploy blocked 3-8s rebuilding the whole aggregation from nothing — a
+# full relay fan-out, a burst of ~0.66s reputation RPCs, and a cold IPFS content fetch, all on the
+# request. Persisted, the last aggregation survives the restart: that first request serves it instantly
+# and refreshes in the background (the warm path). The content + reputation caches persist for the same
+# reason — so the background refresh after a deploy is cheap instead of re-fetching every CID and rep.
+export XC_FEED_CACHE="$STORE_DIR/feed_agg.json"
+export XC_CONTENT_CACHE="$STORE_DIR/content-cache"
+export XC_REP_CACHE="$STORE_DIR/rep_cache.json"
 export IPFS_PATH="$STORE_DIR/ipfs"
 mkdir -p "$IPFS_PATH"
 rm -f "$IPFS_PATH/repo.lock"        # a hard restart can leave a stale lock that blocks the daemon
