@@ -30,28 +30,56 @@ def verify(pub, msg, sig):
 
 
 def post(path, obj):
-    ok = 0
-    for r in RELAYS:
+    # Fan out to every relay IN PARALLEL. Serially, one dead relay blocks the whole write behind its
+    # 4s timeout — and with a relay in the set down (a sleeping laptop, a churned tunnel), that is why
+    # sending a DM would spin for 15-30s while the recipient's own relay timed out. This is the send
+    # side of the same fix already applied to the inbox read: the fan-out now costs the SLOWEST single
+    # relay (~4s worst case), not the sum, so one down relay can no longer stall a send for everyone.
+    import concurrent.futures as _cf
+    body = json.dumps(obj).encode()
+
+    def _one(r):
         try:
-            urllib.request.urlopen(urllib.request.Request(r + path, json.dumps(obj).encode(),
-                                   {'Content-Type': 'application/json'}), timeout=4).read()
-            ok += 1
+            urllib.request.urlopen(urllib.request.Request(
+                r + path, body, {'Content-Type': 'application/json'}), timeout=4).read()
+            return 1
         except Exception:
-            pass
-    return ok
+            return 0
+
+    if not RELAYS:
+        return 0
+    with _cf.ThreadPoolExecutor(max_workers=len(RELAYS)) as ex:
+        return sum(ex.map(_one, RELAYS))
 
 
 def peer_dm_pk(account):                                   # fetch + verify a peer's signed DM public key
-    for r in RELAYS:
+    # Query relays IN PARALLEL and take the first VERIFIED key. Serially, a dead relay ahead of a live
+    # one cost its full 4s timeout before the key was even fetched — and this runs BEFORE every send,
+    # so it stacked with the send fan-out to make "message a peer" spin. The verification is per-record
+    # (signature bound to the account), so accepting whichever verified answer returns first is safe:
+    # a relay cannot forge a key, only fail to have one.
+    import concurrent.futures as _cf
+
+    def _one(r):
         try:
-            rec = json.loads(urllib.request.urlopen(r + '/dmkey?account=' + account, timeout=4).read()).get('record')
+            rec = json.loads(urllib.request.urlopen(
+                r + '/dmkey?account=' + account, timeout=4).read()).get('record')
             if not rec:
-                continue
+                return None
             msg = xc.sig_canon('dmkey', rec['account'], rec['ts'], rec['dm_pk'])
-            if rec['account'] == account and xc.pub_to_addr(rec['pub']) == account and verify(rec['pub'], msg, rec['sig']):
+            if rec['account'] == account and xc.pub_to_addr(rec['pub']) == account \
+               and verify(rec['pub'], msg, rec['sig']):
                 return rec['dm_pk']
         except Exception:
             pass
+        return None
+
+    if not RELAYS:
+        return None
+    with _cf.ThreadPoolExecutor(max_workers=len(RELAYS)) as ex:
+        for pk in ex.map(_one, RELAYS):
+            if pk:
+                return pk
     return None
 
 

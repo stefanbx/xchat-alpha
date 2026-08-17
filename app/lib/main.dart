@@ -2225,6 +2225,18 @@ class Api {
     return _convosFromStore();
   }
 
+  /// The conversation list straight from the on-device store, no network. Loads the store (fast,
+  /// local) and returns what it holds, so the inbox can paint IMMEDIATELY instead of spinning for the
+  /// seconds a cold /api/dm_inbox takes. dmInbox() then refreshes it in the background. A returning
+  /// user has their whole history on disk already — making them wait on the network to see it was the
+  /// 15s spinner this removes.
+  static Future<List<Map<String, dynamic>>> dmInboxCached() async {
+    final w = gWallet;
+    if (w == null) return [];
+    await DmStore.load(w);
+    return _convosFromStore();
+  }
+
   /// Every conversation, rebuilt from the on-device store — never from a network response. An
   /// incremental response carries only the NEW messages and a failed one carries none, so building a
   /// thread from a response would shrink it (or empty it); the store has the whole history. Kept
@@ -7158,10 +7170,26 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
   @override
   void initState() {
     super.initState();
-    _load();
+    _showCachedThenRefresh();
   }
 
   List<GroupChat> _groups = [];
+
+  /// Paint the on-device store first (instant), then refresh from the network. A returning user's
+  /// conversations are already on disk, so making them watch a cold-fetch spinner to see them was
+  /// pure waited-for-nothing. Only drops the spinner if the cache actually has something — an empty
+  /// cache keeps the spinner rather than flashing "No messages" before the fetch answers.
+  Future<void> _showCachedThenRefresh() async {
+    final cached = await Api.dmInboxCached();
+    if (mounted && _loading && cached.isNotEmpty) {
+      setState(() {
+        _convos = cached.where((x) => !widget.isBlocked('${x['peer']}')).toList();
+        _groups = GroupChat.extract(cached);
+        _loading = false;
+      });
+    }
+    await _load();
+  }
 
   Future<void> _load() async {
     final c = await Api.dmInbox();
