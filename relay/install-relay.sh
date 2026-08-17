@@ -1158,12 +1158,18 @@ except Exception:
     log "public url: $URL (mode=$MODE)"
 
     # Optional Cloudflare Worker front: a stable, short workers.dev url that reverse-proxies to this node.
-    # It fixes two things for a home node — a quick tunnel's hostname is too long for the 32-byte on-chain
-    # announce AND it churns every restart. Drop a worker.conf next to this file (WORKER_URL + KV_NAMESPACE_ID)
-    # and the node keeps the worker's KV pointed at the current tunnel url, then announces the FIXED worker
-    # url on-chain. Without worker.conf we announce the tunnel url directly (only works for hosts <=32 bytes).
+    # It fixes two things a QUICK tunnel has — its hostname is too long for the 32-byte on-chain announce
+    # AND it churns every restart. Drop a worker.conf (WORKER_URL + KV_NAMESPACE_ID) and the node keeps
+    # the worker's KV pointed at the current tunnel url, then announces the FIXED worker url on-chain.
+    #
+    # ONLY in quick mode. The other modes hand back an address that is already short and stable enough
+    # to announce directly — a *.lhr.life name, a Tailscale funnel name, or the operator's own domain —
+    # so the worker front is pointless there. Worse, a leftover worker.conf from an earlier Cloudflare
+    # setup would otherwise HIJACK the announce: switch a relay to --localhost-run and it would serve on
+    # lhr.life but still announce the dead Cloudflare worker, and clients would get 530. Gate it on the
+    # mode that actually needs it.
     ANNOUNCE_URL="$URL"
-    if [ -f "$XC_HOME/worker.conf" ]; then
+    if [ "$MODE" = quick ] && [ -f "$XC_HOME/worker.conf" ]; then
         . "$XC_HOME/worker.conf"
         ANNOUNCE_URL="${WORKER_URL:-$URL}"
         if [ -n "$KV_NAMESPACE_ID" ]; then

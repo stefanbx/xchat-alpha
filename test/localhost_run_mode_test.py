@@ -163,6 +163,14 @@ r = run()
 check('forever-free' in r['logs'],
       'points at localhost.run forever-free so a churning name can be made permanent', r['logs'][:200])
 
+print('\n--- a leftover Cloudflare worker.conf must not hijack a Cloudflare-free tunnel ---')
+# The announce reads worker.conf and announces WORKER_URL when present. If that ran in lhr mode, a
+# relay switched off Cloudflare would serve on lhr.life but still announce the DEAD Cloudflare worker,
+# and clients would get 530. The worker front is only meaningful for quick tunnels (long, churning
+# name), so it is gated on quick mode; every other mode announces its own short, stable URL directly.
+check(re.search(r'if \[ "\$MODE" = quick \] && \[ -f "\$XC_HOME/worker\.conf" \]', SRC) is not None,
+      'the worker front (WORKER_URL announce + kv_push) is gated on quick mode only')
+
 print('\n--- the flag maps to the mode, and the branch lives in run.sh ---')
 check('--localhost-run)' in SRC and 'USE_LHR=1' in SRC, '--localhost-run sets USE_LHR')
 check(re.search(r'elif \[ "\$USE_LHR" = 1 \];\s*then MODE=lhr', SRC) is not None,
