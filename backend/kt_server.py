@@ -420,6 +420,51 @@ def api_dm_blind_read(body):
     except Exception as e:
         return json.dumps({'error': 'blind read failed: %s' % e})
 
+def api_dm_inbox(query):
+    # IN-PROCESS mailbox read — the SAME relay fan-out xc_dm.py did, but without the per-poll subprocess
+    # spawn (~130ms of interpreter start-up + imports) and without ipc_lock('dm'). The DM poll is the
+    # hottest read in the app (every ~5s per open thread, plus the badge refresh), so that fixed spawn
+    # tax dominated it — the incremental `since=` shrinks the payload but the spawn cost it anyway. Here
+    # it is a direct fan-out (a few ms), exactly like api_dm_blind_read. Behaviour is unchanged: the
+    # prove-ownership auth (ts/sig/pub) is passed straight through to the relays, and results are deduped
+    # and `since`-filtered the way xc_dm.py did. No shared /tmp files, so no lock is needed.
+    q = lambda k: (query.get(k, [''])[0])
+    acc = q('account')
+    try:
+        since = int(q('since') or 0)
+    except ValueError:
+        since = 0
+    qs = ''
+    if q('sig') and q('pub') and q('ts'):
+        try:
+            qs = '&ts=%d&sig=%s&pub=%s' % (int(q('ts')),
+                                           urllib.parse.quote(q('sig')), urllib.parse.quote(q('pub')))
+        except Exception:
+            qs = ''
+    import concurrent.futures as _cf
+    relays = xc.discover_relays()
+
+    def _one(r):
+        try:
+            return json.loads(urllib.request.urlopen(
+                r + '/dm?account=' + acc + qs, timeout=4).read()).get('dms', [])
+        except Exception:
+            return []
+
+    seen, dms = set(), []
+    if relays:
+        with _cf.ThreadPoolExecutor(max_workers=max(1, len(relays))) as ex:
+            for got in ex.map(_one, relays):
+                for m in got:
+                    k = (m.get('from'), m.get('ts'))
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    if since and int(m.get('ts') or 0) < since:
+                        continue
+                    dms.append(m)
+    return json.dumps({'ok': True, 'account': acc, 'since': since, 'dms': dms})
+
 def api_head(acct):
     # the account's current signed head (seq + cid) across relays — the app re-signs it with a fresh
     # expiry to republish (keep it alive past TTL). A public read; no seed.
@@ -848,16 +893,7 @@ def route(path, query, body):
     # the read path they replace). Neither takes ipc_lock('dm') — see api_dm_blind_read.
     if path.startswith('/api/relay_readkey'): return api_relay_readkey(q('relay'))
     if path.startswith('/api/dm_blind_read'): return api_dm_blind_read(body)
-    if path.startswith('/api/dm_inbox'):
-        with ipc_lock('dm'):
-            put('/tmp/xc_dm_acct.txt', q('account'))
-            put('/tmp/xc_dm_since.txt', q('since') or '0')   # incremental: only ciphertext at/after
-            # Proof the caller owns this mailbox, passed straight through to the relays. Reading a
-            # mailbox exposes who an account talks to, so it should cost a signature; the node has
-            # no seed and cannot forge one.
-            put('/tmp/xc_dm_auth.json', json.dumps({'ts': q('ts'), 'sig': q('sig'), 'pub': q('pub')})
-                if q('sig') else '')
-            spawn('xc_dm.py','inbox');       return read('/tmp/xc_dm_result.json','{}')
+    if path.startswith('/api/dm_inbox'): return api_dm_inbox(query)
 
     if path.startswith('/api/blob_put'):
         with ipc_lock('blob'):
