@@ -2167,8 +2167,18 @@ class Api {
   static Future<List<Map<String, dynamic>>> dmInbox() async {
     final w = gWallet;
     if (w == null) return [];
+    // Load the store BEFORE the fetch and build the result FROM it afterwards — on success AND on
+    // failure. The store is the source of truth: every message we have ever decrypted, persisted and
+    // sealed to our own key. The network poll only ADDS newly-arrived ciphertext to it; it can never
+    // be the thing that decides what is shown.
+    //
+    // Returning [] on a slow/failed poll — which this used to do in the catch below — is what made
+    // DMs flicker: an empty result wiped the on-screen thread, and the next good poll restored it, so
+    // the user watched messages vanish and reappear. The 12s timeout added to stop DMs hanging is
+    // exactly what made a failed poll common enough to see. A poll that fetched nothing must SHOW
+    // nothing new, not show nothing at all.
+    await DmStore.load(w);          // decrypt-once cache; no-op after the first call; never throws
     try {
-      await DmStore.load(w);          // decrypt-once cache; no-op after the first call
       // INCREMENTAL FETCH. The store holds everything already read, so a poll only needs ciphertext
       // that is NEW. Two safeguards, because `since` on its own is not correct:
       //
@@ -2186,21 +2196,12 @@ class Api {
       // a relay for anyone's. The node cannot forge this: it holds no seed.
       final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final auth = w.signMsg(w.dmInboxMsg(ats));
-      // A hard timeout matters more than it looks: without it, a slow or wedged node hangs this
-      // request indefinitely, the poll never completes, and the thread shows a spinner over an empty
-      // conversation forever — which is exactly what "everything is laggy, I cannot read my DMs"
-      // was. With it, a slow node degrades to "show what the on-device store already holds, try
-      // again next tick" instead of freezing the screen.
       final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'
           '${since > 0 ? '&since=$since' : ''}'
           '&ts=$ats&sig=${Uri.encodeQueryComponent(auth['sig']!)}'
           '&pub=${Uri.encodeQueryComponent(auth['pub']!)}'))
           .timeout(const Duration(seconds: 12));
       final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
-      final convos = <String, List<Map<String, dynamic>>>{};
-      // The peer's DM key, kept per conversation: attachments are sealed to this same box, so the
-      // chat screen needs it to decrypt them and would otherwise have to re-fetch it per image.
-      final peerKeys = <String, String>{};
       for (final m in dms) {
         final outgoing = m['from'] == w.account;
         final peerAcc = '${outgoing ? m['to'] : m['from']}';
@@ -2217,26 +2218,36 @@ class Api {
             from: '${m['from']}', outgoing: outgoing, peer: peerAcc, peerPk: peerPk);
       }
       await DmStore.flush(w);           // persist what was new, sealed to our own key
-
-      // Threads are rebuilt from the STORE, not from the response. An incremental response carries
-      // only NEW messages, so building from it would shrink every conversation to the last few.
-      for (final m in DmStore.all()) {
-        final peerAcc = '${m['peer']}';
-        peerKeys[peerAcc] = '${m['peer_pk']}';
-        (convos[peerAcc] ??= []).add(m);
-      }
-      for (final lst in convos.values) {
-        lst.sort((a, b) => (a['ts'] as int).compareTo(b['ts'] as int));
-      }
-      final out = convos.entries
-          .map((e) => {'peer': e.key, 'messages': e.value, 'last_ts': e.value.last['ts'],
-                       'peer_pk': peerKeys[e.key] ?? ''})
-          .toList();
-      out.sort((a, b) => (b['last_ts'] as int).compareTo(a['last_ts'] as int));
-      return out.cast<Map<String, dynamic>>();
     } catch (_) {
-      return [];
+      // A slow or failed poll adds nothing new; it must not REMOVE what the store already holds. Do
+      // not return here — fall through and rebuild from the store as it stands.
     }
+    return _convosFromStore();
+  }
+
+  /// Every conversation, rebuilt from the on-device store — never from a network response. An
+  /// incremental response carries only the NEW messages and a failed one carries none, so building a
+  /// thread from a response would shrink it (or empty it); the store has the whole history. Kept
+  /// separate so the "always show the store, whatever the network did" rule lives in one place.
+  static List<Map<String, dynamic>> _convosFromStore() {
+    final convos = <String, List<Map<String, dynamic>>>{};
+    // The peer's DM key, kept per conversation: attachments are sealed to this same box, so the chat
+    // screen needs it to decrypt them and would otherwise have to re-fetch it per image.
+    final peerKeys = <String, String>{};
+    for (final m in DmStore.all()) {
+      final peerAcc = '${m['peer']}';
+      peerKeys[peerAcc] = '${m['peer_pk']}';
+      (convos[peerAcc] ??= []).add(m);
+    }
+    for (final lst in convos.values) {
+      lst.sort((a, b) => (a['ts'] as int).compareTo(b['ts'] as int));
+    }
+    final out = convos.entries
+        .map((e) => {'peer': e.key, 'messages': e.value, 'last_ts': e.value.last['ts'],
+                     'peer_pk': peerKeys[e.key] ?? ''})
+        .toList();
+    out.sort((a, b) => (b['last_ts'] as int).compareTo(a['last_ts'] as int));
+    return out.cast<Map<String, dynamic>>();
   }
 
   // profile: signed portable record (display name, bio, avatar/banner CIDs) keyed by account
