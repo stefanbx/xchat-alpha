@@ -116,7 +116,7 @@ for prev, args, want, label in [
     ('WITH_NODE=0', [], '0', 'an existing --no-node install stays off'),
     ('WITH_NODE=1', ['--no-node'], '0', 'an explicit --no-node still overrides the inherited value'),
     ('WITH_NODE=0', ['--with-node'], '1', 'an explicit --with-node still wins'),
-    (None, [], '0', 'a fresh install (no run.sh) defaults to relay-only'),
+    (None, [], '1', 'a fresh install (no run.sh) defaults to a NODE (every relay serves /api)'),
 ]:
     got = with_node(prev, args)
     check(got == want, label, f'got {got}, want {want}')

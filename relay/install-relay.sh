@@ -72,18 +72,26 @@ ADMIN_PORT="${XC_ADMIN_PORT:-7402}"
 # The work server. Not 7500 by default: that port is a common spot for other Nano work daemons, and
 # picking up somebody else's DEV-difficulty server would produce instant work that mainnet rejects.
 WORKD_PORT="${XC_WORKD_PORT:-7503}"
-# The NODE is optional (--with-node). A relay stores and serves other people's signed bytes; a node is
-# the API your own app talks to — it reads the ledger, aggregates the feed across relays, and adds the
-# proof-of-work that a tip waits on. Running one locally is what makes YOUR tips fast, because the work
-# is then done by this machine instead of a public RPC that is frequently down.
+# EVERY relay is a node by default (--no-node opts out). A relay stores and serves other people's
+# signed bytes; a node is the /api layer an app talks to — it reads the ledger, aggregates the feed
+# across relays, and adds the proof-of-work a tip waits on. Two reasons it is the default now: running
+# one locally makes YOUR tips fast (work done here, not on a flaky public RPC), and — the bigger one —
+# every node is a place a client can fail over to, so the network survives any single node dying.
 NODE_PORT="${XC_NODE_PORT:-8790}"
-# Default OFF for a first install, but INHERIT whatever an existing install chose. --update is
-# documented as keeping your setup, and it did not keep this one: a relay installed --with-node came
-# back after an update with WITH_NODE=0, so kt_server was gone, the tunnel pointed at the relay
-# instead of the node, and every /api path 404'd. From outside that looks exactly like a broken
-# tunnel — which is how it went unnoticed on the maintainer's own relay. An explicit --with-node or
-# --no-node on the command line still wins; this only supplies the default.
-WITH_NODE="${XC_WITH_NODE:-0}"
+# Default ON for a first install — EVERY relay is a node — because that is what makes the network
+# survive losing any single host. Clients need /api, and ONLY a node serves it; a relay-only install
+# holds data nobody's app can read directly. When every announced relay is a node, the client's
+# ledger-driven failover (healEndpointsFromLedger) has a real pool to heal onto, so one node going
+# down — even the main one on Fly — doesn't strand anyone. A relay-only default made the announced
+# pool full of /api dead-ends: proven by blocking the Fly node and watching the app fall back to the
+# ONE other node that happened to serve /api. `--no-node` still opts out for a deliberately light,
+# storage-only relay.
+#
+# INHERIT whatever an existing install chose, so --update never silently flips a running relay: a
+# relay installed --with-node once came back after an update with WITH_NODE=0, kt_server gone, the
+# tunnel pointing at the relay instead of the node, every /api path 404'ing — invisible from outside,
+# exactly like a broken tunnel. An explicit --with-node / --no-node on the command line still wins.
+WITH_NODE="${XC_WITH_NODE:-1}"
 if [ -z "${XC_WITH_NODE:-}" ] && [ -f "$XC_HOME/run.sh" ]; then
     _prev=$(sed -n 's/^WITH_NODE=\([01]\)$/\1/p' "$XC_HOME/run.sh" | head -1)
     [ -n "$_prev" ] && WITH_NODE="$_prev"
