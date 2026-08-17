@@ -11,12 +11,22 @@ data = None
 try:
     data = subprocess.check_output(['ipfs', 'cat', cid], env={**os.environ, 'IPFS_PATH': xc.IPFS_PATH}, timeout=10)
 except Exception:
-    # Fetch from a peer relay's cache. The timeout must fit a whole RELEASE APK (~20 MB) pulled across
-    # relays, not just a thumbnail — 5 s silently failed the in-app update download. Skip our own loopback
-    # relay (it's why we're here — it doesn't have it) so we spend the time on a peer that might.
-    for r in xc.discover_relays():
-        if '127.0.0.1' in r or 'localhost' in r:
-            continue
+    # Fetch from a relay's cache. Try OUR OWN loopback relay FIRST: it is local, instant, and for
+    # anything this node stored — DM attachments especially, but also pinned media — it reliably HAS
+    # the blob. Only fall through to peers for media the loopback never cached. The timeout must fit a
+    # whole RELEASE APK (~20 MB) pulled across relays, not just a thumbnail — 5 s silently failed the
+    # in-app update download.
+    #
+    # An earlier version SKIPPED the loopback relay entirely, on the assumption "it's why we're here —
+    # it doesn't have it". That holds for uncached FEED media, but is FALSE for DM attachments: the
+    # sender uploads the sealed blob to every relay including the loopback, so /api/media then returned
+    # b64:null and the image showed "unavailable" for BOTH sender and recipient whenever no PEER relay
+    # happened to hold it (e.g. a node whose only relay is local). Ordering loopback first fixes that
+    # and is faster in the common case; peers remain the fallback for genuinely-uncached media.
+    def _local(r):
+        return '127.0.0.1' in r or 'localhost' in r
+    relays = xc.discover_relays()
+    for r in sorted(relays, key=lambda r: 0 if _local(r) else 1):
         try:
             d = json.loads(urllib.request.urlopen(r + '/blob?cid=' + cid, timeout=90).read())
             if d.get('b64'):
