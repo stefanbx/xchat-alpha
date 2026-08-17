@@ -60,8 +60,6 @@ def peer_dm_pk(account):                                   # fetch + verify a pe
     # peer" spin. The verification is per-record (signature bound to the account), so accepting whichever
     # verified answer returns first is safe: a relay cannot forge a key, only fail to have one. The caps
     # signature is checked with the SAME account key, so a relay cannot forge a capability either.
-    import concurrent.futures as _cf
-
     def _one(r):
         try:
             rec = json.loads(urllib.request.urlopen(
@@ -82,10 +80,19 @@ def peer_dm_pk(account):                                   # fetch + verify a pe
 
     if not RELAYS:
         return None
-    with _cf.ThreadPoolExecutor(max_workers=len(RELAYS)) as ex:
-        for got in ex.map(_one, RELAYS):
-            if got:
-                return got
+    # Take the first VERIFIED key in COMPLETION order, not submission order. ThreadPoolExecutor.map
+    # yields in submission order, so a slow/dead FIRST relay's full 4s timeout was paid before a faster
+    # relay's ready answer could be read — on the path that runs before every send. Daemon workers feed
+    # a queue as they finish, so the fastest verified answer returns at once and the stragglers die with
+    # this short-lived process instead of blocking its exit.
+    import threading, queue as _q
+    out = _q.Queue()
+    for _r in RELAYS:
+        threading.Thread(target=lambda r=_r: out.put(_one(r)), daemon=True).start()
+    for _ in RELAYS:
+        got = out.get()
+        if got:
+            return got
     return None
 
 

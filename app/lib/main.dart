@@ -2330,7 +2330,8 @@ class Api {
   // only the node's IP. See docs/ANONYMITY.md §4 and wallet.dart's sealMailboxRead.
   static List<Map<String, dynamic>>? _blindRelays;  // eligible relays, each verified against the LEDGER
   static int _blindRelayAt = 0;                      // epoch secs of the last (re)resolution attempt
-  static bool _blindDisabled = false;                // nothing eligible this run — stop rescanning
+  static bool _blindDisabled = false;                // nothing eligible last try — back off, don't rescan
+  static String _blindRelayBase = '';                // the node (kBase) this set was resolved against
 
   /// Raw DM ciphertext records — via a BLIND read when relay keys are available, else the ordinary
   /// signed read straight to our node. `full` (the periodic full sweep) reads EVERY eligible relay and
@@ -2408,8 +2409,16 @@ class Api {
   /// hour — a ledger scan is not worth doing on every 5s poll. Capped so the full-sweep fan-out is small.
   static Future<List<Map<String, dynamic>>> _blindReadRelays() async {
     final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-    if (_blindRelays != null && now - _blindRelayAt < 3600) return _blindRelays!;
-    if (_blindDisabled && now - _blindRelayAt < 3600) return const [];
+    // The cache is scoped to the current node: a REPOINT invalidates it, because a relay chosen for the
+    // old node may be co-located with the new operator (privacy loss) or unknown to it (reads fall
+    // back). While the node is unchanged, keep an eligible set for an hour; but back off only ~3 min
+    // after a FAILED/empty resolution — a transient ledger-discovery blip (a rate-limited public RPC)
+    // must not silently disable the private read for a whole hour, though we still must not rescan the
+    // ledger on every 5s poll.
+    if (_blindRelayBase == kBase) {
+      if (_blindRelays != null && now - _blindRelayAt < 3600) return _blindRelays!;
+      if (_blindDisabled && now - _blindRelayAt < 180) return const [];
+    }
     final w = gWallet;
     if (w == null) return const [];
     final out = <Map<String, dynamic>>[];
@@ -2459,11 +2468,13 @@ class Api {
     if (out.isNotEmpty) {
       _blindRelays = out;
       _blindRelayAt = now;
+      _blindRelayBase = kBase;
       _blindDisabled = false;
       return out;
     }
     _blindDisabled = true;
-    _blindRelayAt = now;                                    // nothing eligible; don't rescan every poll
+    _blindRelayAt = now;                                    // nothing eligible; back off ~3 min, then retry
+    _blindRelayBase = kBase;
     return const [];
   }
 
