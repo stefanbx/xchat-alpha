@@ -151,6 +151,43 @@ check('rebuilding it' not in hb,
 check('Never rebuild' in SRC or 'never rebuild' in SRC,
       'and the reason is written down next to the code')
 
+print('\n--- run.sh must DEFINE every local function it CALLS ---')
+# The bug that kept an operator down: kv_push was defined at the top of install-relay.sh but CALLED
+# only inside the generated run.sh supervisor. The installer runs fine; the supervisor does not — it
+# hits "kv_push: not found" on every tunnel churn and the worker never re-points, serving 530 forever
+# while --status looks healthy. The earlier tests ran kv_push in isolation and never noticed it was
+# missing from the one script that actually calls it.
+#
+# So: extract the run.sh heredoc, and assert every locally-defined helper the supervisor calls is also
+# defined WITHIN the supervisor. This is the general invariant, and it would have caught the bug.
+_m = re.search(r"cat >> \"\$XC_HOME/run\.sh\" <<'EOF'\n(.*?)\n^EOF$", SRC, re.S | re.M)
+check(_m is not None, 'found the run.sh heredoc (renamed? update this test)')
+if _m:
+    runsh = _m.group(1)
+    all_funcs = set(re.findall(r'(?m)^([a-z_][a-z0-9_]*)\(\)\s*\{', SRC))
+    runsh_defs = set(re.findall(r'(?m)^([a-z_][a-z0-9_]*)\(\)\s*\{', runsh))
+
+    def is_called_in(name, text):
+        # the function name as a COMMAND: at a statement start, not as its own definition or a substring
+        for m in re.finditer(r'(?:^|;|&&|\|\||\bthen\b|\belse\b|\bdo\b|\()\s*(%s)\b' % re.escape(name),
+                             text, re.M):
+            line = text[text.rfind('\n', 0, m.start()) + 1: text.find('\n', m.start())]
+            if name + '()' in line:          # the definition line itself
+                continue
+            if line.lstrip().startswith('#'):  # a comment
+                continue
+            return True
+        return False
+
+    missing = sorted(f for f in all_funcs
+                     if is_called_in(f, runsh) and f not in runsh_defs)
+    check(not missing,
+          'every local function the supervisor calls is defined inside run.sh',
+          'missing from run.sh: ' + ', '.join(missing) if missing else '')
+    # Name kv_push explicitly, since it is the one that regressed and the one operators depend on.
+    check('kv_push' in runsh_defs,
+          'kv_push is defined inside run.sh (the supervisor calls it on churn to re-point the worker)')
+
 print('\n%s — %d checks, %d failure(s)' % ('FAIL' if fails else 'PASS', checks, len(fails)))
 for f in fails:
     print('  - ' + f)

@@ -172,49 +172,11 @@ done
 # nothing to remember to bump, and it changes exactly when the shipped code changes.
 # Point the worker's KV at the tunnel we are actually serving on, and MAKE A FAILURE VISIBLE.
 #
-# This is the bug that took a node off the air for a day without anyone noticing. The push ran in a
-# background subshell, its output went to kv-update.log, and NOTHING checked whether it worked. When
-# the Cloudflare OAuth token expired, every push after that failed with "Authentication error [code:
-# 10000]"; the tunnel went on churning, so KV kept pointing at a hostname that no longer resolved;
-# the worker faithfully proxied to it and Cloudflare answered 530. Meanwhile --status printed a green
-# tick next to the worker URL, because it only ever read worker.conf.
-#
-# Same shape as the tunnel bug fixed earlier in this file: a LIVE tunnel is not a WORKING tunnel, and
-# a CONFIGURED worker address is not a WORKING one. Anything that can silently stop being true has to
-# be probed, not assumed.
-#
-# Leaves kv-failed behind on failure with a one-line reason; --status reads it and clears when a push
-# later succeeds.
-kv_push() {  # kv_push <namespace-id> <url>
-    _ns="$1"; _u="$2"
-    if ! command -v npx >/dev/null 2>&1; then
-        echo "npx not found — cannot update the worker's backend URL" > "$XC_HOME/kv-failed"
-        return 1
-    fi
-    # Capture THIS run's output on its own before appending it. kv-update.log is append-only across
-    # every restart the machine has ever had, so classifying by grepping the whole file means a
-    # months-old auth error relabels today's unrelated network failure as an expired login — sending
-    # the operator to re-authenticate something that was never the problem. Diagnose from what just
-    # happened, not from the history.
-    _out=$(mktemp 2>/dev/null || echo "/tmp/xckv.$$")
-    if npx wrangler kv key put --remote --namespace-id="$_ns" backend "$_u" >"$_out" 2>&1; then
-        cat "$_out" >> "$XC_HOME/kv-update.log"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] backend -> $_u" >> "$XC_HOME/kv-update.log"
-        rm -f "$_out" "$XC_HOME/kv-failed"
-        return 0
-    fi
-    cat "$_out" >> "$XC_HOME/kv-update.log"
-    # Name the likely cause rather than "it failed". An expired OAuth token is by far the common one,
-    # and the remedy is a single command the operator would otherwise have to go and find.
-    if grep -qiE 'Authentication error|code: 10000|Unauthorized|401' "$_out" 2>/dev/null; then
-        echo "Cloudflare login expired — run: cd $XC_HOME/cf-worker && npx wrangler login" \
-            > "$XC_HOME/kv-failed"
-    else
-        echo "could not write the backend URL to KV — see $XC_HOME/kv-update.log" > "$XC_HOME/kv-failed"
-    fi
-    rm -f "$_out"
-    return 1
-}
+# kv_push (point the worker's KV at the current tunnel) is defined INSIDE the run.sh heredoc below,
+# not here — it is only ever called by the supervisor loop, which runs from run.sh. Defining it at
+# this top level put it in install-relay.sh but NOT in run.sh, so the loop hit "kv_push: not found"
+# on every tunnel churn and the worker never re-pointed. It moved next to log() and the other
+# run.sh-local helpers; test/worker_front_test.py now asserts run.sh actually defines what it calls.
 
 installed_fp() { [ -f "$XC_HOME/installed.fp" ] && cat "$XC_HOME/installed.fp" || echo ''; }
 remote_fp() {
@@ -891,6 +853,40 @@ cd "$XC_HOME"
 echo "$$" > "$XC_HOME/supervisor.pid"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# Point the worker's KV at the tunnel we are serving on. This function is CALLED by the serve loop
+# below (on startup and whenever the tunnel churns), so it must be DEFINED here, inside run.sh — the
+# supervisor runs from run.sh, not from install-relay.sh, and a function that lives only in the
+# installer is "kv_push: not found" every time the loop reaches it. That was a real outage: an
+# operator's tunnel churned on every sleep/wake, the re-point silently failed, and the worker served
+# 530 forever while --status looked healthy. See kv_push_defined_in_runsh in test/worker_front_test.py.
+# Leaves kv-failed behind on failure with a one-line reason; --status reads it and clears on success.
+kv_push() {  # kv_push <namespace-id> <url>
+    _ns="$1"; _u="$2"
+    if ! command -v npx >/dev/null 2>&1; then
+        echo "npx not found — cannot update the worker's backend URL" > "$XC_HOME/kv-failed"
+        return 1
+    fi
+    # Capture THIS run's output before appending it: kv-update.log is append-only across every restart
+    # the machine has ever had, so classifying by grepping the whole file would let a months-old auth
+    # error relabel today's unrelated network failure as an expired login.
+    _out=$(mktemp 2>/dev/null || echo "/tmp/xckv.$$")
+    if npx wrangler kv key put --remote --namespace-id="$_ns" backend "$_u" >"$_out" 2>&1; then
+        cat "$_out" >> "$XC_HOME/kv-update.log"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] backend -> $_u" >> "$XC_HOME/kv-update.log"
+        rm -f "$_out" "$XC_HOME/kv-failed"
+        return 0
+    fi
+    cat "$_out" >> "$XC_HOME/kv-update.log"
+    if grep -qiE 'Authentication error|code: 10000|Unauthorized|401' "$_out" 2>/dev/null; then
+        echo "Cloudflare login expired — run: cd $XC_HOME/cf-worker && npx wrangler login" \
+            > "$XC_HOME/kv-failed"
+    else
+        echo "could not write the backend URL to KV — see $XC_HOME/kv-update.log" > "$XC_HOME/kv-failed"
+    fi
+    rm -f "$_out"
+    return 1
+}
 
 # RUNNING OVERNIGHT. A laptop that goes to sleep stops being a relay, so the relay is launched under a
 # sleep inhibitor. The choice of inhibitor matters: macOS `caffeinate -s` prevents idle sleep ONLY
