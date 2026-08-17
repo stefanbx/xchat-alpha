@@ -40,6 +40,12 @@
 #                                         exist on-chain. The seed is written to ~/.xchat-relay/
 #                                         operator.seed, mode 600 — back it up.
 #
+#   sh install-relay.sh --localhost-run   free SSH reverse tunnel, NO account and NO Cloudflare. The
+#                                         relay dials out to localhost.run over SSH (works behind NAT
+#                                         and a changing home IP) and gets a short *.lhr.life name —
+#                                         short enough to announce on-chain DIRECTLY, so no worker
+#                                         front is needed. Register the printed key at localhost.run
+#                                         for a name that never changes. Needs `ssh` (openssh-client).
 #   sh install-relay.sh --tailscale   free PERMANENT address via Tailscale Funnel, no domain needed.
 #                                         Install tailscale, run `tailscale up`, enable Funnel for the
 #                                         tailnet, then use this. Unlike the default quick tunnel the
@@ -143,6 +149,7 @@ ACTION=install
 DOMAIN=''
 TUNNEL_TOKEN=''
 USE_TAILSCALE=0
+USE_LHR=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --status)          ACTION=status ;;
@@ -163,6 +170,7 @@ while [ $# -gt 0 ]; do
         --tunnel-token)    shift; TUNNEL_TOKEN="${1:-}"; [ -n "$TUNNEL_TOKEN" ] || die "--tunnel-token needs a value" ;;
         --tunnel-token=*)  TUNNEL_TOKEN="${1#*=}" ;;
         --tailscale)       USE_TAILSCALE=1 ;;
+        --localhost-run)   USE_LHR=1 ;;   # free SSH reverse tunnel, no account, no Cloudflare
         *) die "unknown option: $1  (try --help)" ;;
     esac
     shift
@@ -538,6 +546,7 @@ esac
 if   [ -n "$DOMAIN" ] && [ -n "$TUNNEL_TOKEN" ]; then MODE=named
 elif [ -n "$DOMAIN" ];                          then MODE=direct
 elif [ "$USE_TAILSCALE" = 1 ];                  then MODE=tailscale
+elif [ "$USE_LHR" = 1 ];                         then MODE=lhr
 else                                                 MODE=quick
 fi
 PUBLIC_URL=''
@@ -1080,6 +1089,64 @@ except Exception:
         }
         URL="https://$URL"
         CF_PID=''                       # funnel runs inside the tailscaled daemon, not as our child
+    elif [ "$MODE" = lhr ]; then
+        # localhost.run: a FREE SSH reverse tunnel — no account, no Cloudflare, nothing to rate-limit
+        # the way the quick-tunnel endpoint does. The relay dials OUT to localhost.run over SSH, which
+        # works from behind any NAT and survives a changing home IP (an outbound connection does not
+        # care what your public IP is); localhost.run holds the stable public address and forwards
+        # back down the pipe.
+        #
+        # The win over Cloudflare: the name it hands back (xxxxx.lhr.life) is SHORT enough to fit the
+        # 32-byte on-chain announce, so it goes on-chain DIRECTLY — no worker front, no KV, no wrangler,
+        # none of the layer that broke. Register lhr_key.pub at https://localhost.run for a subdomain
+        # that never changes; without that it churns on reconnect, which the on-chain re-announce below
+        # already absorbs.
+        : > "$XC_HOME/tunnel.log"
+        TUNNEL_PORT="$PORT"; [ "$WITH_NODE" = 1 ] && TUNNEL_PORT="$NODE_PORT"
+        if ! command -v ssh >/dev/null 2>&1; then
+            log "ssh is not installed — install openssh-client (Debian: sudo apt install openssh-client), then restart"
+            sleep 60; continue
+        fi
+        # Connect as the ANONYMOUS user (nokey@). localhost.run's default user requires a REGISTERED
+        # key and answers "Permission denied (publickey)" otherwise — verified against the real
+        # service. nokey@ needs nothing and hands back a free *.lhr.life name that works out of the box.
+        # ExitOnForwardFailure: if the remote port can't be bound, ssh EXITS rather than sitting there
+        # connected-but-not-forwarding, so the supervisor rebuilds instead of serving nothing. Keepalive
+        # holds an idle tunnel open. Host keys go in our own file, not the service account's ~/.ssh.
+        ssh -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile="$XC_HOME/lhr_known_hosts" \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+            -R 80:localhost:$TUNNEL_PORT nokey@localhost.run >>"$XC_HOME/tunnel.log" 2>&1 &
+        CF_PID=$!
+        URL=''; i=0
+        while [ $i -lt 60 ]; do
+            # Match the TUNNEL host (*.lhr.life) ONLY. The welcome banner also prints
+            # https://admin.localhost.run and https://localhost.run/docs — matching *.localhost.run
+            # too would grab a documentation link and announce THAT on-chain. Caught against the real
+            # banner; the stub in the test now reproduces it.
+            URL=$(grep -oiE 'https://[a-z0-9][a-z0-9-]*\.lhr\.life' "$XC_HOME/tunnel.log" 2>/dev/null | head -1)
+            [ -n "$URL" ] && break
+            kill -0 $CF_PID 2>/dev/null || break
+            sleep 1; i=$((i + 1))
+        done
+        if [ -z "$URL" ]; then
+            kill $CF_PID 2>/dev/null || true; wait $CF_PID 2>/dev/null || true
+            TFAIL=$((TFAIL + 1))
+            TWAIT=$((15 * TFAIL * TFAIL)); [ "$TWAIT" -gt 600 ] && TWAIT=600
+            log "localhost.run tunnel did not come up (attempt $TFAIL); retrying in ${TWAIT}s. Last lines:"
+            tail -3 "$XC_HOME/tunnel.log" 2>/dev/null | sed 's/^/  lhr: /'
+            sleep "$TWAIT"; continue
+        fi
+        TFAIL=0
+        # A keyless tunnel gets a NEW *.lhr.life name each reconnect, which the on-chain re-announce
+        # below absorbs (the name is short enough to announce directly). For a name that NEVER changes
+        # — so the announce happens once and a sleeping laptop stops re-announcing on every wake —
+        # sign up free and register a key. One-time nudge, not on every restart.
+        [ -f "$XC_HOME/.lhr_hint_shown" ] || {
+            log "localhost.run tunnel up (free, keyless). For a name that never changes, register a key:"
+            log "  https://localhost.run/docs/forever-free/"
+            : > "$XC_HOME/.lhr_hint_shown"
+        }
     elif [ "$MODE" = named ]; then
         : > "$XC_HOME/tunnel.log"
         "$CF" tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" >>"$XC_HOME/tunnel.log" 2>&1 &

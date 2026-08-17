@@ -74,7 +74,7 @@ exit 0
 # The tailscale branch, lifted VERBATIM out of the installer. Extracting it rather than re-typing it
 # is the whole point: a hand-copied duplicate would keep passing after the real script changed.
 src = open(SCRIPT).read()
-m = re.search(r'^    elif \[ "\$MODE" = tailscale \]; then\n(.*?)^    elif \[ "\$MODE" = named \]; then',
+m = re.search(r'^    elif \[ "\$MODE" = tailscale \]; then\n(.*?)^    elif \[ "\$MODE" = \w+ \]; then',
               src, re.S | re.M)
 if not m:
     sys.exit('could not find the tailscale branch in install-relay.sh — did it move?')
