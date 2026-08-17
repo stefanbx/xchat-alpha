@@ -4,7 +4,9 @@ A companion to [PRIVACY-AND-DECENTRALIZATION.md](PRIVACY-AND-DECENTRALIZATION.md
 what the network can see. This one is about the harder question: **can a specific account be tied to a
 specific person**, and what would it take to keep it from being.
 
-Written 2026-08-16. Nothing here is implemented yet; the audit is.
+Written 2026-08-16. Since then several items have shipped: the funding warning (§1), sealed sender
+(§3), and the blind mailbox read that closes the read half of the IP↔account link (§4). Each is marked
+where it stands below.
 
 ---
 
@@ -76,9 +78,26 @@ The node sees an IP beside an account, and push made this continuous rather than
 held-open stream is a live "this person is awake" beacon. `/api/presence` publishes online status by
 design as well.
 
-There is no mixing and adding Tor is a large commitment. The tractable steps: make presence
-**opt-in** rather than automatic, and let the push stream be declined in favour of polling for anyone
-who would rather trade latency for not being observable.
+**Mailbox reads are now blind (implemented).** The sharpest edge here was the signed mailbox read:
+`/api/dm_inbox?account=…` names the account it reads, so the node saw `(IP, account)` on every 5s
+poll — and that binding was exactly what let an operator re-attach a hidden sender to a sealed message
+(sealed sender hides `from`, but if the same IP is known to be account A from its own reads, a sealed
+send from that IP is A's). That binding is closed with a one-hop onion. The client seals its read
+request — the account plus the ownership proof — to a chosen relay's X25519 read key and hands the
+node an opaque blob to forward. The node sees the IP but not the account; the relay sees the account
+but only the node's IP. No single operator holds the pair, as long as the client's node and the relay
+it seals to are run by different people. The relay's read key is signed by its ledger identity and the
+client verifies it against the account it discovered for that relay **off the ledger**, so a
+man-in-the-middle node cannot substitute its own key to unwrap the account. Capability-gated (relays
+advertise `caps:r1`; clients fall back to the ordinary signed read), so no flag day. Proven end to end
+in `test/blind_read_e2e_test.py`; crypto in `app/test/blind_read_test.dart`.
+
+**Still open.** This closes the *read* side only. Sending a DM and fetching a peer's key still reach
+the node from the client's IP (items 4-presence and 5-first-contact), and `/api/presence` still
+publishes online status. The tractable next steps: make presence **opt-in** rather than automatic, and
+let the push stream be declined in favour of polling. Removing IP entirely from every path is a
+transport problem (Tor / a mix), which stays a large commitment — the blind read is the structural win
+that does not need it.
 
 ### 5. First contact leaks intent
 To DM someone the client fetches their published DM key from a relay. The relay therefore learns you

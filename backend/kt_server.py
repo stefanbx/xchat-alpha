@@ -377,6 +377,49 @@ def api_pin_targets():
             pass
     return json.dumps({'relays': out})
 
+def _blind_relay_ok(relay):
+    """Only forward to a relay this node actually knows — never an arbitrary client-supplied URL, which
+    would make the node an open proxy (SSRF). Matched on the normalized URL the node itself discovered."""
+    if not relay:
+        return None
+    want = relay.rstrip('/')
+    for r in xc.discover_relays():
+        if r.rstrip('/') == want:
+            return want
+    return None
+
+def api_relay_readkey(relay):
+    # Proxy a relay's SIGNED read-key advertisement, so the client can fetch it without revealing its IP
+    # to that relay — the node stays the only IP-hop. The client verifies the signature against the
+    # relay's ledger account, so this node cannot substitute a key: a swapped one just fails that check
+    # and the client falls back to an ordinary read.
+    url = _blind_relay_ok(relay)
+    if not url:
+        return json.dumps({'error': 'unknown relay'})
+    try:
+        return urllib.request.urlopen(url + '/relaykey', timeout=4).read().decode()
+    except Exception as e:
+        return json.dumps({'error': 'relaykey fetch failed: %s' % e})
+
+def api_dm_blind_read(body):
+    # BLIND MAILBOX READ forwarder — the fix for IP<->account correlation. The body {relay, epk, ct}
+    # carries a read request sealed to the relay's key; this node forwards it and pipes the sealed reply
+    # straight back. The node sees the client IP and which relay, but NOT the account (inside `ct`) and
+    # NOT the reply (also sealed): no single operator holds (client IP, account). Deliberately OUTSIDE
+    # ipc_lock('dm') — it is one forward, and holding the DM lock across a network round-trip is exactly
+    # the starvation _dm_watch documents.
+    relay = body.get('relay', '') if isinstance(body, dict) else ''
+    url = _blind_relay_ok(relay)
+    if not url:
+        return json.dumps({'error': 'unknown relay'})
+    try:
+        payload = json.dumps({'epk': body.get('epk', ''), 'ct': body.get('ct', '')}).encode()
+        out = urllib.request.urlopen(urllib.request.Request(
+            url + '/dm_sealed_read', payload, {'Content-Type': 'application/json'}), timeout=8).read()
+        return out.decode()
+    except Exception as e:
+        return json.dumps({'error': 'blind read failed: %s' % e})
+
 def api_head(acct):
     # the account's current signed head (seq + cid) across relays — the app re-signs it with a fresh
     # expiry to republish (keep it alive past TTL). A public read; no seed.
@@ -800,6 +843,11 @@ def route(path, query, body):
         except Exception:
             pass                      # never let the notify path fail a send that already succeeded
         return out
+    # Blind mailbox read: fetch a relay's signed read key, then read through it so no single operator
+    # sees (client IP, account). Both match BEFORE /api/dm_inbox (distinct prefixes, but keep them near
+    # the read path they replace). Neither takes ipc_lock('dm') — see api_dm_blind_read.
+    if path.startswith('/api/relay_readkey'): return api_relay_readkey(q('relay'))
+    if path.startswith('/api/dm_blind_read'): return api_dm_blind_read(body)
     if path.startswith('/api/dm_inbox'):
         with ipc_lock('dm'):
             put('/tmp/xc_dm_acct.txt', q('account'))

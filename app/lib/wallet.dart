@@ -231,6 +231,67 @@ class NanoWallet {
     }
   }
 
+  // ---- blind mailbox read (breaks IP<->account correlation) ----
+  // A mailbox read names the account that owns it, so whoever serves it learns "this IP reads that
+  // account's DMs". Sealed sender hid the SENDER from the relay, but not this: the recipient must still
+  // name its own mailbox. The fix is a one-hop onion. The client seals the read request to a chosen
+  // relay's key and hands the blob to its node, which blind-forwards it. The node sees the client IP
+  // but not the account (it is inside the seal); the relay sees the account but only the node's IP. No
+  // single operator holds the pair — provided the client's node and that relay are run by different
+  // people. The reply comes back sealed to the SAME ephemeral key, so the node cannot read it either.
+  // See docs/ANONYMITY.md §4 and xc_relayd's /dm_sealed_read.
+
+  /// Verify a relay's signed read-key record against the account we discovered for that relay OFF THE
+  /// LEDGER, and return the read_pk to seal to (or null). Binding read_pk to the ledger identity is
+  /// what stops a MITM node from substituting its OWN key to unwrap the account: a swapped key carries
+  /// no signature from the relay's account, so this returns null and the caller falls back to a normal
+  /// read. This is the first on-device signature check in the app — until now every signature was
+  /// verified server-side, but the whole point here is NOT to have to trust the server.
+  String? relayReadPk(Map<String, dynamic> rec, String ledgerAccount) {
+    try {
+      final acct = '${rec['account']}', pub = '${rec['pub']}', readPk = '${rec['read_pk']}';
+      final sig = '${rec['sig']}';
+      if (acct.isEmpty || acct != ledgerAccount) return null;     // must be the relay's ledger identity
+      if (readPk.length != 64) return null;
+      if (NanoAccounts.createAccount(NanoAccountType.NANO, pub) != acct) return null;  // pub binds to acct
+      // ts is signed as a STRING on the relay (str(READ_TS)); '${rec['ts']}' reproduces it exactly.
+      final msg = sigCanon('relaykey', [acct, readPk, '${rec['ts']}']);
+      return verifySig(pub, msg, sig) ? readPk : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Ed25519-Blake2b verify of a canonical message, mirroring signMsg. Signing signs the raw UTF-8
+  /// bytes of the message (signMsg → _signHex(_hex(msg)) is exactly a signature over utf8(msg)), so
+  /// verification is over those same bytes.
+  ///
+  /// Uses the local BigInt backend on EVERY platform, not the signing split. nanodart signs correctly
+  /// but its TweetNaCl VERIFY path is broken for Nano's blake2b (cryptoHashOff takes the message length
+  /// as the digest size), so a valid signature fails there — the app never noticed because until now it
+  /// only ever signed. The BigInt verifyDetached is the same code the web build signs and verifies with,
+  /// exercised by test/ed25519_blake2b_test.dart. Verification runs rarely (a relay key per read
+  /// session), so the BigInt path's cost does not matter.
+  static bool verifySig(String pubHex, String msg, String sigHex) {
+    try {
+      return webed.verifyDetached(
+          Uint8List.fromList(utf8.encode(msg)), _bytesOfHex(sigHex), _bytesOfHex(pubHex));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Seal a mailbox-read request to a relay's verified read key. `request` is {account, ts, sig, pub,
+  /// since} — the same ownership proof the cleartext read carries, now sealed so the forwarding node
+  /// never sees it. Returns a handle with the wire fields {epk, ct} and the box that opens the reply.
+  BlindRead sealMailboxRead(String relayReadPkHex, Map<String, dynamic> request) {
+    final eph = pnacl.PrivateKey.generate();                      // throwaway; the node sees only eph.public
+    final box = pnacl.Box(
+        myPrivateKey: eph, theirPublicKey: pnacl.PublicKey(_bytesOfHex(relayReadPkHex)));
+    final ct = base64.encode(box.encrypt(Uint8List.fromList(utf8.encode(jsonEncode(request)))));
+    return BlindRead(_hexOfBytes(eph.publicKey), ct, box);
+  }
+
   // ---- DM attachments ----
   // Same box, raw bytes in and out. An attachment is stored as an ordinary blob on a relay, so if the
   // bytes went up as-is, "the relay only ever sees ciphertext" would hold for the words of a DM and be
@@ -310,4 +371,26 @@ class NanoWallet {
   static String groupId(String creator, String name, int createdTs) => _hexOfBytes(Blake2b.digest256([
         Uint8List.fromList(utf8.encode('xchat-group:$creator:${name.trim()}:$createdTs')),
       ])).substring(0, 32);
+}
+
+/// A blind mailbox read in flight: the wire fields to send through the node, plus the box (kept
+/// on-device, never transmitted) that opens the relay's sealed reply. crypto_box is symmetric in the
+/// shared secret, so the very same (ephemeral secret × relay read key) box that sealed the request
+/// opens the reply — no second key exchange, and the node holds neither half.
+class BlindRead {
+  final String epk; // ephemeral public key (hex) — travels to the relay so it can derive the shared box
+  final String ct;  // the sealed request (base64): {account, ts, sig, pub, since}, which the node cannot read
+  final pnacl.Box _box;
+  BlindRead(this.epk, this.ct, this._box);
+
+  /// Open the relay's sealed reply (base64) → decoded JSON, or null if it is not for us / is corrupt.
+  Map<String, dynamic>? openReply(String replyCtB64) {
+    try {
+      final p = utf8.decode(_box.decrypt(pnacl.EncryptedMessage.fromList(base64.decode(replyCtB64))));
+      final o = jsonDecode(p);
+      return o is Map<String, dynamic> ? o : null;
+    } catch (_) {
+      return null;
+    }
+  }
 }

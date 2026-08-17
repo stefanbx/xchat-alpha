@@ -176,6 +176,33 @@ class LedgerDiscovery {
     return null;
   }
 
+  // Relays with the NANO ACCOUNT that announced each one — read straight off the ledger, so the
+  // account<->url binding does not pass through any ӾChat node. This is the trust anchor for a blind
+  // mailbox read: the client seals its read to a relay's key only after checking that key is signed by
+  // the account the LEDGER (not the node) says owns that relay, so a node cannot substitute its own key.
+  static Future<List<Map<String, String>>> discoverRelays(
+      {int maxAccounts = 16, Duration deadline = const Duration(seconds: 25)}) async {
+    Future<List<Map<String, String>>> scan() async {
+      final accts = (await _announcedAccounts()).take(maxAccounts).toList();
+      final urls = await Future.wait(accts.map(_accountUrl));
+      final out = <Map<String, String>>[];
+      final seen = <String>{};
+      for (var i = 0; i < accts.length; i++) {
+        final u = urls[i];
+        if (u == null) continue;
+        final url = u.replaceAll(RegExp(r'/+$'), '');
+        if (seen.add(url)) out.add({'account': accts[i], 'url': url});
+      }
+      return out;
+    }
+
+    try {
+      return await scan().timeout(deadline);
+    } catch (_) {
+      return const [];
+    }
+  }
+
   // Full scan: every announced URL currently readable off the ledger. Best-effort, parallel, and
   // deadline-bounded so a slow/rate-limited public RPC can never hang the app.
   static Future<List<String>> discoverUrls(

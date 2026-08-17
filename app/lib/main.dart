@@ -2248,17 +2248,11 @@ class Api {
       final newest = DmStore.newestTs;
       final full = (_dmPoll++ % 10 == 0) || newest == 0;
       final since = full ? 0 : (newest - 600).clamp(0, newest);
-      // Prove we own this mailbox. Reading one exposes who an account talks to, when and how often
-      // — the bodies are sealed but `from`/`to`/`ts` are not — and until now any stranger could ask
-      // a relay for anyone's. The node cannot forge this: it holds no seed.
-      final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      final auth = w.signMsg(w.dmInboxMsg(ats));
-      final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'
-          '${since > 0 ? '&since=$since' : ''}'
-          '&ts=$ats&sig=${Uri.encodeQueryComponent(auth['sig']!)}'
-          '&pub=${Uri.encodeQueryComponent(auth['pub']!)}'))
-          .timeout(const Duration(seconds: 12));
-      final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
+      // Fetch the new ciphertext. Prefer a BLIND read (sealed to a ledger-anchored relay, forwarded by
+      // the node without seeing which mailbox) so the node cannot tie our IP to our account; fall back
+      // to the ordinary signed read whenever a blind one is unavailable — a privacy upgrade must never
+      // cost a delivered message. Either way the decrypt loop below is identical.
+      final dms = await _dmFetchRaw(w, since);
       // A sealed (v2) record hides its sender, so authorship is proven by opening the INNER seal under
       // the sender's LEDGER-published dm_pk. Resolve each `from` to that key at most once per sweep.
       final Map<String, String?> pkCache = {};
@@ -2304,6 +2298,98 @@ class Api {
       // not return here — fall through and rebuild from the store as it stands.
     }
     return _convosFromStore();
+  }
+
+  // ---- blind mailbox read (breaks IP<->account correlation) ----
+  // The ordinary read GETs /api/dm_inbox?account=... from our node, so the node sees our IP beside the
+  // account whose mailbox we read — enough to re-attach a sender to a sealed message by correlation.
+  // A blind read seals the request (account + ownership proof) to a relay's key and hands the node an
+  // opaque blob to forward: the node sees the IP but not the account, the relay sees the account but
+  // only the node's IP. See docs/ANONYMITY.md §4 and wallet.dart's sealMailboxRead.
+  static Map<String, dynamic>? _blindRelay;   // {url, account, read_pk}, verified against the LEDGER
+  static int _blindRelayAt = 0;               // epoch secs of the last (re)resolution attempt
+  static bool _blindDisabled = false;         // nothing eligible this run — stop rescanning every poll
+
+  /// Raw DM ciphertext records — via a BLIND read when a relay key is available, else the ordinary
+  /// signed read straight to our node. Both deliver the same records; the caller's decrypt loop does
+  /// not care which path produced them.
+  static Future<List<Map<String, dynamic>>> _dmFetchRaw(NanoWallet w, int since) async {
+    final blind = await _blindDmFetch(w, since);
+    if (blind != null) return blind;
+    // Fallback: ordinary signed read. The node cannot forge this proof — it holds no seed — but it does
+    // see (our IP, our account) together, which the blind path above is what avoids.
+    final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final auth = w.signMsg(w.dmInboxMsg(ats));
+    final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'
+        '${since > 0 ? '&since=$since' : ''}'
+        '&ts=$ats&sig=${Uri.encodeQueryComponent(auth['sig']!)}'
+        '&pub=${Uri.encodeQueryComponent(auth['pub']!)}'))
+        .timeout(const Duration(seconds: 12));
+    return ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
+  }
+
+  /// A blind read from the chosen relay, or null to fall back. NOTE ON COMPLETENESS: this reads ONE
+  /// relay, where the ordinary path fans out across all of them. A send already fans out to every
+  /// relay (xc_dm post()), so a healthy relay holds everything; the on-device store plus the periodic
+  /// full sweep cover a transient gap. Sealed fan-out across several relays is the follow-up for the
+  /// case where the chosen relay was down when a message was sent.
+  static Future<List<Map<String, dynamic>>?> _blindDmFetch(NanoWallet w, int since) async {
+    try {
+      final relay = await _blindReadRelay();
+      if (relay == null) return null;
+      final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final auth = w.signMsg(w.dmInboxMsg(ats));
+      final read = w.sealMailboxRead(relay['read_pk'] as String, {
+        'account': w.account, 'ts': ats, 'sig': auth['sig'], 'pub': auth['pub'], 'since': since,
+      });
+      final r = await http.post(Uri.parse('$kBase/api/dm_blind_read'),
+              headers: const {'content-type': 'application/json'},
+              body: jsonEncode({'relay': relay['url'], 'epk': read.epk, 'ct': read.ct}))
+          .timeout(const Duration(seconds: 12));
+      final resp = jsonDecode(r.body);
+      final ct = resp is Map ? resp['ct'] : null;
+      if (ct is! String || ct.isEmpty) return null;      // node/relay could not serve it → fall back
+      final reply = read.openReply(ct);
+      if (reply == null || reply['error'] != null) return null;
+      return ((reply['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
+    } catch (_) {
+      return null;                                       // never let the privacy path drop a message
+    }
+  }
+
+  /// Choose and cache a relay to seal blind reads to: one the LEDGER (not our node) says exists, whose
+  /// host differs from our node's, and whose read key is signed by its ledger account. Cached for an
+  /// hour — a privacy hop is not worth a ledger scan on every 5s poll.
+  static Future<Map<String, dynamic>?> _blindReadRelay() async {
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    if (_blindRelay != null && now - _blindRelayAt < 3600) return _blindRelay;
+    if (_blindDisabled && now - _blindRelayAt < 3600) return null;
+    final w = gWallet;
+    if (w == null) return null;
+    try {
+      final nodeHost = Uri.parse(kBase).host;
+      for (final rl in await LedgerDiscovery.discoverRelays()) {
+        final url = rl['url'] ?? '', acct = rl['account'] ?? '';
+        if (url.isEmpty || acct.isEmpty) continue;
+        if (Uri.parse(url).host == nodeHost) continue;   // must not be our own node's operator
+        try {
+          final r = await http
+              .get(Uri.parse('$kBase/api/relay_readkey?relay=${Uri.encodeQueryComponent(url)}'))
+              .timeout(const Duration(seconds: 6));
+          final rec = jsonDecode(r.body);
+          if (rec is! Map<String, dynamic>) continue;
+          final readPk = w.relayReadPk(rec, acct);       // verifies the signature binds read_pk to acct
+          if (readPk == null) continue;
+          _blindRelay = {'url': url, 'account': acct, 'read_pk': readPk};
+          _blindRelayAt = now;
+          _blindDisabled = false;
+          return _blindRelay;
+        } catch (_) {/* try the next relay */}
+      }
+    } catch (_) {/* discovery failed — fall back for now */}
+    _blindDisabled = true;
+    _blindRelayAt = now;                                 // nothing eligible; don't rescan every poll
+    return null;
   }
 
   /// The conversation list straight from the on-device store, no network. Loads the store (fast,

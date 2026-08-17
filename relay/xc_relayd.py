@@ -3,7 +3,7 @@
 # gossips relay membership (bootstrap + /relays), and expires stale heads (TTL). Independent
 # and swappable — run several; clients DISCOVER the set from a bootstrap, no hardcoding.
 # Usage: xc_relayd.py <port> <store.json> [bootstrap_url ...]
-import json, sys, os, time, threading, sqlite3, urllib.request, random, hashlib
+import json, sys, os, time, threading, sqlite3, urllib.request, random, hashlib, base64
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -878,6 +878,51 @@ try:
 except Exception:
     ID_KEY, ID_ACCT, ID_PUB = '', '', ''
 
+# --- BLIND MAILBOX READ (breaks IP<->account correlation) -----------------------------------------
+# A mailbox read names the account that owns it, so whoever serves the read learns "this IP reads that
+# account's DMs". Sealed sender hid the SENDER from the relay; it did nothing for this, because the
+# recipient still has to name its own mailbox. The fix is a one-hop onion: the client seals the read
+# request (account + ownership proof) to THIS RELAY'S key and hands the sealed blob to its node, which
+# blind-forwards it here. The node sees the client IP but not the account; this relay sees the account
+# but only the node's IP. No single operator holds the pair — as long as the client's node and the
+# relay it seals to are run by different people.
+#
+# The relay's read key is an X25519 keypair derived deterministically from the gossip identity seed and
+# SIGNED by the identity key, so a client can pin it to the relay's ledger-known account and a MITM
+# node cannot substitute its own key to unwrap the account. pynacl is the same dependency the DM path
+# already needs; if it is missing the relay simply does not advertise the capability and clients fall
+# back to the ordinary signed read (no flag day).
+try:
+    from nacl.public import PrivateKey as _NaPriv, PublicKey as _NaPub, Box as _NaBox
+    _NACL = True
+except Exception:
+    _NACL = False
+
+READ_SK = READ_PK = READ_SIG_PUB = READ_SIG = ''
+READ_TS = 0
+if _NACL and ID_KEY:
+    try:
+        _read_seed = hashlib.blake2b(bytes.fromhex(ID_KEY), digest_size=32,
+                                     person=b'xchat-relayrd').digest()
+        _read_priv = _NaPriv(_read_seed)
+        READ_SK = _read_priv                                  # the object, kept in memory only
+        READ_PK = bytes(_read_priv.public_key).hex()
+        READ_TS = int(time.time())
+        # Bind read_pk to the relay's ledger identity: account + key + ts, signed by ID_KEY. A client
+        # checks pub_to_addr(pub)==account==<the account it discovered for this relay off the ledger>.
+        _sl = dict(kv.split(' ', 1) for kv in
+                   xc._sign_lines(ID_KEY, xc.sig_canon('relaykey', ID_ACCT, READ_PK, str(READ_TS))))
+        READ_SIG = _sl.get('sig', ''); READ_SIG_PUB = _sl.get('pub', ID_PUB)
+    except Exception:
+        READ_SK = READ_PK = READ_SIG = ''
+
+def relaykey_record():
+    """The signed advertisement a client pins to this relay's ledger account. Empty if unavailable."""
+    if not (READ_PK and READ_SIG):
+        return None
+    return {'account': ID_ACCT, 'pub': READ_SIG_PUB, 'read_pk': READ_PK,
+            'ts': READ_TS, 'sig': READ_SIG, 'caps': 'r1'}
+
 def _announce_canon(acct, url, ts):
     return xc.sig_canon('relay_announce', acct, url, str(ts))
 
@@ -1245,6 +1290,15 @@ class H(BaseHTTPRequestHandler):
                         self._send(200, json.dumps({'work': d.get('work'), 'relay': RELAY_ACCT}))
                     except Exception as e:
                         self._send(503, json.dumps({'error': 'work generation failed: %s' % e}))
+        elif self.path.startswith('/relaykey'):
+            # This relay's X25519 read key for blind mailbox reads, signed by its identity. A client
+            # pins it to the ledger account it discovered for this relay, so a MITM node cannot swap it.
+            # Absent (no pynacl / no identity) → 404, and the client falls back to the ordinary read.
+            rec = relaykey_record()
+            if rec is None:
+                self._send(404, json.dumps({'error': 'blind read unavailable on this relay'}))
+            else:
+                self._send(200, json.dumps(rec))
         elif self.path.startswith('/relayacct'):
             # Capability advertisement. 'work' is what lets a node DISCOVER proof-of-work sources
             # instead of being configured with them: a relay with a GPU says so here, nodes learn it
@@ -1416,6 +1470,43 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({'ok': True, 'total': len(votes)}))
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
+        elif self.path.startswith('/dm_sealed_read'):
+            # BLIND MAILBOX READ. The body {epk, ct} carries a request sealed to this relay's read key;
+            # the account it names is inside `ct`, so the node that forwarded this never saw it. Open it,
+            # prove mailbox ownership exactly as the cleartext /dm read does, and seal the answer back
+            # under the SAME ephemeral key so the node cannot read the reply either — nor tell a hit from
+            # a miss, since the status is always 200 and both outcomes are ciphertext of similar size.
+            #
+            # MUST be matched before '/dm' — '/dm_sealed_read'.startswith('/dm') is true.
+            if not (_NACL and READ_SK):
+                self._send(404, json.dumps({'error': 'blind read unavailable'})); return
+            try:
+                env = json.loads(raw)
+                epk = _NaPub(bytes.fromhex(env['epk']))
+                box = _NaBox(READ_SK, epk)
+                inner = json.loads(box.decrypt(base64.b64decode(env['ct'])))
+                acc = inner.get('account', '')
+                ok, why = _mailbox_ok(acc, {'ts': str(inner.get('ts', '')),
+                                            'sig': inner.get('sig', ''), 'pub': inner.get('pub', '')})
+                if not ok:
+                    reply = {'error': why, 'dms': []}
+                else:
+                    try:
+                        since = int(inner.get('since', 0) or 0)
+                    except (TypeError, ValueError):
+                        since = 0
+                    mine = [m for m in dms if m.get('to') == acc or m.get('from') == acc]
+                    if since:
+                        mine = [m for m in mine if int(m.get('ts') or 0) >= since]
+                    reply = {'account': acc, 'dms': mine}
+                # Seal the reply to the client's ephemeral key (Box is symmetric in the shared secret,
+                # so (READ_SK, epk) here matches (esk, READ_PK) on the client). Node sees ciphertext only.
+                sct = base64.b64encode(bytes(box.encrypt(json.dumps(reply).encode()))).decode()
+                self._send(200, json.dumps({'v': 1, 'ct': sct}))
+            except Exception as e:
+                # A malformed/undecryptable envelope reveals nothing to seal back to, so answer in the
+                # clear — the caller learns its request never opened. No mailbox contents are exposed.
+                self._send(400, json.dumps({'error': 'bad sealed read: %s' % e}))
         elif self.path.startswith('/dm'):
             # store an encrypted DM (O(1) dedup by _dm_key: `mid` for sealed v2, else (from, ts)). The
             # relay only holds ciphertext, and the mailbox is a bounded ring — oldest drops past DM_MAX.

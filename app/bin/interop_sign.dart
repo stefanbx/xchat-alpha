@@ -42,6 +42,7 @@ void battery(NanoWallet w) {
 void daemon(NanoWallet w) {
   // announce the identity first, then sign whatever arrives, a line at a time
   print(jsonEncode({'account': w.account, 'pub': w.pub, 'dm_pub': w.dmPub}));
+  BlindRead? pendingRead; // the box from the last mailbox_seal, kept to open its reply on the next line
   String? line;
   while ((line = stdin.readLineSync()) != null) {
     if (line!.isEmpty) continue;
@@ -61,6 +62,15 @@ void daemon(NanoWallet w) {
         print(jsonEncode({'outer': w.dmOpenSealedOuter(req['epk'] as String, req['ct'] as String)}));
       case 'caps':                                     // what this build advertises
         print(jsonEncode({'caps': NanoWallet.dmCaps}));
+      case 'relaykey_verify':                          // verify a relay read-key record vs its ledger account
+        print(jsonEncode({'read_pk': w.relayReadPk(
+            (req['rec'] as Map).cast<String, dynamic>(), req['account'] as String)}));
+      case 'mailbox_seal':                             // seal a blind mailbox read → {epk, ct}; keep the box
+        pendingRead = w.sealMailboxRead(
+            req['read_pk'] as String, (req['request'] as Map).cast<String, dynamic>());
+        print(jsonEncode({'epk': pendingRead.epk, 'ct': pendingRead.ct}));
+      case 'mailbox_open':                             // open the relay's sealed reply with the kept box
+        print(jsonEncode({'reply': pendingRead?.openReply(req['reply_ct'] as String)}));
       case 'quit':
         return;
       default:
