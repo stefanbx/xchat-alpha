@@ -7172,6 +7172,19 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
       _groups = GroupChat.extract(c);
       _loading = false;
     });
+    // PREFETCH every peer's profile the moment the list loads, rather than waiting for each row's
+    // avatar to lazily fetch as it scrolls into view. Without this the inbox paints each conversation
+    // under its owner's DEFAULT handle ('you.xno' — which most accounts share) and only resolves to
+    // the real name a beat later, so a thread that reads "Jiован" in its header shows as "you.xno" in
+    // the list. ensure() de-dups and no-ops once cached, so this is cheap and idempotent.
+    for (final x in _convos) {
+      ProfileCache.I.ensure('${x['peer']}');
+    }
+    for (final g in _groups) {
+      for (final m in g.members) {
+        ProfileCache.I.ensure(m);
+      }
+    }
   }
 
   /// The name this person is shown under everywhere else in the app.
@@ -7354,7 +7367,12 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
                         leading: AuthorAvatar(account: peer, handle: handle, radius: 22),
                         title: AnimatedBuilder(
                           animation: ProfileCache.I,
-                          builder: (_, __) => Text(ProfileCache.I.displayName(peer, handle),
+                          // _handleOf, not the bare display name: when the profile has not loaded and
+                          // the handle is the shared default 'you.xno', it appends the account
+                          // discriminator so the row is distinguishable instead of reading like a
+                          // conversation with yourself. Once the profile resolves both show the same
+                          // real name ("Jiован").
+                          builder: (_, __) => Text(_handleOf(peer),
                               style: const TextStyle(color: kText, fontWeight: FontWeight.w700)),
                         ),
                         subtitle: last == null ? null : Text(
