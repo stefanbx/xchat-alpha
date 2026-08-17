@@ -1012,6 +1012,18 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         const SizedBox(height: 8),
         const Text("Next you'll confirm a few characters from your backup — the app can't recover this seed for you.",
             style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+        const SizedBox(height: 14),
+        // Set the anonymity model at creation, before any funds arrive: the account is public on the
+        // ledger, and how it is funded is what does or doesn't tie it to a real name. The receive sheet
+        // repeats this at each funding; here it lands first. See docs/ANONYMITY.md.
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: const [
+          Icon(Icons.public, size: 15, color: Color(0xFF4DD0A7)),
+          SizedBox(width: 8),
+          Expanded(
+            child: Text('This account is also public on the Nano ledger. Fund it in a way that isn\'t tied to your name to stay pseudonymous.',
+                style: TextStyle(color: kDim, fontSize: 12, height: 1.45)),
+          ),
+        ]),
         const Spacer(),
         _bigBtn('Continue', _saved ? kAccent : kLine, _saved ? Colors.black : kDim,
             _saved ? () => _startVerify() : null),
@@ -6671,6 +6683,31 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                   ),
                 ),
               ]),
+              // The single most important thing to say at the moment money is about to arrive: this
+              // account is PUBLIC and PERMANENT on the Nano ledger, and how it gets funded is what ties
+              // it — or doesn't — to a real name. Shown every time, not once, because the deanonymising
+              // mistake (a withdrawal from a KYC exchange) can happen at any funding, not just the first.
+              // Tap opens the full explanation. See docs/ANONYMITY.md §1 "Identity is money".
+              const SizedBox(height: 14),
+              InkWell(
+                onTap: () { Navigator.pop(ctx); _showFundingPrivacy(); },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                      color: const Color(0xFF4DD0A7).withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: const Color(0xFF4DD0A7).withValues(alpha: 0.32))),
+                  child: Row(children: [
+                    const Icon(Icons.public, size: 18, color: Color(0xFF4DD0A7)),
+                    const SizedBox(width: 10),
+                    const Expanded(
+                      child: Text('Public ledger: funding this account from a KYC exchange can link it to your real name.',
+                          style: TextStyle(color: kText, fontSize: 12.5, height: 1.35)),
+                    ),
+                    const Icon(Icons.chevron_right, size: 18, color: Color(0xFF4DD0A7)),
+                  ]),
+                ),
+              ),
               // The backup nag belongs HERE — at the moment you invite money in — rather than in front
               // of a claim. Blocking a claim never protected anything: the funds are already assigned
               // to this account on-chain, so losing the seed loses them whether or not they were
@@ -6697,6 +6734,58 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                   ),
                 ),
               ],
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // The full funding-privacy explanation, opened from the note on the receive sheet and once at
+  // wallet creation. Deliberately plain and non-alarmist: it describes how a public ledger works and
+  // the one mistake that undoes pseudonymity, rather than promising anonymity the app cannot give.
+  // Mirrors docs/ANONYMITY.md — "pseudonymous, with an audit trail on a public ledger".
+  void _showFundingPrivacy() {
+    Widget para(String s) => Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Text(s, style: const TextStyle(color: kDim, fontSize: 13.5, height: 1.5)),
+        );
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: kBg,
+      builder: (ctx) => SafeArea(
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Row(children: const [
+                Icon(Icons.public, size: 20, color: Color(0xFF4DD0A7)),
+                SizedBox(width: 10),
+                Text('Your account is public',
+                    style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 18)),
+              ]),
+              const SizedBox(height: 16),
+              para('Your identity here is a Nano account. The Nano ledger is public and permanent — anyone can look up this account\'s balance and every payment it has ever sent or received, forever.'),
+              para('If you fund it from an exchange that knows who you are (any KYC exchange), that withdrawal ties this account to your legal name. If you move funds between this account and another one of yours, the two become linkable as well.'),
+              para('To stay pseudonymous: fund this account in a way that isn\'t tied to your name, and keep it separate from accounts that are. What you post and who you message is end-to-end encrypted — but the money is not, because the ledger is shared by everyone.'),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                    color: kCard, borderRadius: BorderRadius.circular(10), border: Border.all(color: kLine)),
+                child: const Text('This is how a public ledger works — not something the app can hide for you.',
+                    style: TextStyle(color: kDim, fontSize: 12.5, height: 1.4)),
+              ),
+              const SizedBox(height: 18),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  style: FilledButton.styleFrom(backgroundColor: kAccent, foregroundColor: Colors.black),
+                  child: const Text('Got it', style: TextStyle(fontWeight: FontWeight.w800)),
+                ),
+              ),
             ]),
           ),
         ),
