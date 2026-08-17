@@ -289,6 +289,7 @@ class Settings {
   int reposterSplit; // % of a tip that rewards whoever reposted it
   bool notifyLike, notifyComment, notifyTip, notifyDm;
   bool readReceipts;   // tell the other side when you have read their messages
+  bool showPresence;   // publish "online now" via the FAST head heartbeat — OPT-IN; off keeps you private
   bool autoReceive;   // claim incoming XNO without being asked — what every Nano wallet does
   int forYouFreshness;      // For You ranking: 0 = popular, 1 = balanced, 2 = latest
   bool forYouBoostFollows;  // boost posts from people you follow
@@ -304,6 +305,7 @@ class Settings {
     this.notifyDm = true,
     this.autoReceive = true,
     this.readReceipts = true,
+    this.showPresence = false,
     this.forYouFreshness = 1,
     this.forYouBoostFollows = true,
     this.autoSweep = false,
@@ -329,6 +331,7 @@ class SettingsStore {
         notifyDm: m['notifyDm'] ?? true,
         autoReceive: m['autoReceive'] ?? true,
         readReceipts: m['readReceipts'] ?? true,
+        showPresence: m['showPresence'] ?? false,
         forYouFreshness: (m['forYouFreshness'] as num?)?.toInt() ?? 1,
         forYouBoostFollows: m['forYouBoostFollows'] ?? true,
         autoSweep: m['autoSweep'] ?? false,
@@ -352,6 +355,7 @@ class SettingsStore {
           'notifyDm': s.notifyDm,
           'autoReceive': s.autoReceive,
           'readReceipts': s.readReceipts,
+          'showPresence': s.showPresence,
           'forYouFreshness': s.forYouFreshness,
           'forYouBoostFollows': s.forYouBoostFollows,
           'autoSweep': s.autoSweep,
@@ -3035,6 +3039,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   StreamSubscription? _batSub, _connSub;
   Timer? _republishTimer, _gossipTimer, _feedTimer, _updateTimer, _presenceTimer;
   int _relayed = 0; // signed heads this phone has propagated (backfilled) this session
+  int _republishTick = 0; // gates the head republish: every tick = presence beacon, else keepalive only
   bool get _supporterActive => _supporterOn && _charging && _wifi;
 
   @override
@@ -3071,7 +3076,16 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       final p = _scroll.position;
       if (p.pixels > p.maxScrollExtent - 1200) _loadMore();
     });
-    _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) => Api.republish());
+    // Head republish. A fresh head within the node's ~150s presence window is what makes /api/presence
+    // report us "online", so the 45s cadence is really a presence BEACON — separate from keeping the
+    // head alive (its expiry is far longer). Presence is OPT-IN: with it on we republish every 45s (a
+    // live green dot); with it off — the default — we republish only ~every 20 min, enough to keep the
+    // head propagating to newly-joined relays without broadcasting a continuous "this person is awake"
+    // signal to anyone who polls /api/presence. Reads _settings live, so toggling takes effect next tick.
+    _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) {
+      _republishTick++;
+      if (_settings.showPresence || _republishTick % 27 == 0) Api.republish();   // 27*45s ≈ 20 min
+    });
     // quietly poll the feed so posts from OTHER devices appear on their own (no manual refresh)
     _feedTimer = Timer.periodic(const Duration(seconds: 12), (_) => _refreshFeedQuiet());
     // who's online — refresh the green dots a bit faster than the 45s head heartbeat so they feel live
@@ -5721,6 +5735,10 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                   _settings.readReceipts, (v) => _settings.readReceipts = v),
 
               section('Privacy'),
+              toggle('Show when I\'m online',
+                  'a live green dot while your app is open. Off (the default) keeps your activity private — nobody can poll for whether you\'re awake.',
+                  _settings.showPresence, (v) => _settings.showPresence = v),
+              const SizedBox(height: 6),
               ListTile(
                 contentPadding: EdgeInsets.zero,
                 leading: const Icon(Icons.block, color: kText, size: 20),
