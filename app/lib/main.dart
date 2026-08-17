@@ -2187,6 +2187,7 @@ class Api {
     // is safe by construction, not by flag day.
     final sealed = (info['caps'] ?? '').contains(NanoWallet.dmCaps);
     final Map<String, dynamic> record;
+    Map<String, dynamic>? selfRecord;   // sealed-sender only: a copy addressed to us, for device sync
     final String storeKey;
     if (sealed) {
       // SEALED SENDER: the relay never learns WE sent this. `to` stays visible (the recipient must be
@@ -2194,7 +2195,13 @@ class Api {
       // so two sealed records in the same second still dedup now that the relay cannot key on `from`.
       final env = w.dmSealSealed(peer, text);
       record = {'v': 2, 'to': to, 'ts': ts, 'mid': randHex(16), 'epk': env['epk'], 'ct': env['ct']};
-      storeKey = '${env['ct']}';
+      // SELF-COPY: also send a sealed record addressed to OURSELF so this sent message survives a seed
+      // restore or reaches a second device — a normal v2 record hides `from` and is addressed to the
+      // peer, so our own mailbox read never returns it. Store the local copy under the SELF-COPY's ct so
+      // the later poll that fetches it dedups (via DmStore.get) instead of showing the message twice.
+      final self = w.dmSealSealedSelf(to, peer, text);
+      selfRecord = {'v': 2, 'to': w.account, 'ts': ts, 'mid': randHex(16), 'epk': self['epk'], 'ct': self['ct']};
+      storeKey = '${self['ct']}';
     } else {
       final ct = w.dmSeal(peer, text);
       record = {'to': to, 'from': w.account, 'from_pk': w.dmPub, 'to_pk': peer, 'ct': ct, 'ts': ts};
@@ -2205,10 +2212,14 @@ class Api {
           headers: {'Content-Type': 'application/json'}, body: jsonEncode(record));
       final ok = jsonDecode(r.body)['ok'] == true;
       if (ok && sealed) {
-        // With `from` hidden the relay will NOT echo our own sealed message back to us (its mailbox
-        // matches `to`, and we are not the `to`). A v1 send got its sender-side copy from that echo;
-        // a sealed send must persist its OWN copy now or the sender loses their half of the thread on
-        // the next app start. We already hold the plaintext — record it directly, sealed to our key.
+        // Fire the self-copy to the network (best-effort — the local store below still holds it on this
+        // device if the mirror send fails; only cross-device sync depends on it landing).
+        try {
+          await http.post(Uri.parse('$kBase/api/dm_send'),
+              headers: {'Content-Type': 'application/json'}, body: jsonEncode(selfRecord));
+        } catch (_) {}
+        // Persist our own copy now (immediacy), keyed by the self-copy's ct so the poll that later
+        // fetches that same record from our mailbox recognises it and does not duplicate the bubble.
         await DmStore.load(w);
         DmStore.put(storeKey, text, ts, from: w.account, outgoing: true, peer: to, peerPk: peer);
         await DmStore.flush(w);
@@ -2251,8 +2262,9 @@ class Api {
       // Fetch the new ciphertext. Prefer a BLIND read (sealed to a ledger-anchored relay, forwarded by
       // the node without seeing which mailbox) so the node cannot tie our IP to our account; fall back
       // to the ordinary signed read whenever a blind one is unavailable — a privacy upgrade must never
-      // cost a delivered message. Either way the decrypt loop below is identical.
-      final dms = await _dmFetchRaw(w, since);
+      // cost a delivered message. Either way the decrypt loop below is identical. The full sweep reads
+      // EVERY eligible relay (completeness); incremental polls read one (speed).
+      final dms = await _dmFetchRaw(w, since, full);
       // A sealed (v2) record hides its sender, so authorship is proven by opening the INNER seal under
       // the sender's LEDGER-published dm_pk. Resolve each `from` to that key at most once per sweep.
       final Map<String, String?> pkCache = {};
@@ -2279,8 +2291,18 @@ class Api {
           if (realPk == null || realPk != claimedPk) continue;
           final plain = w.dmOpen(realPk, inner);
           if (plain == null) continue;
-          DmStore.put(ct, plain, (m['ts'] ?? 0) as int,
-              from: from, outgoing: false, peer: from, peerPk: realPk);
+          // SELF-COPY: a message WE sent, mirrored to our own mailbox so it syncs to a restored/second
+          // device. It carries the real recipient in `p`/`pk`; store it as OUTGOING to that peer rather
+          // than as an incoming self-DM. (Only we can have produced its inner, so `from == account` here
+          // is authenticated by the MAC, not just claimed.)
+          final selfPeer = outer['p'];
+          if (selfPeer is String && selfPeer.isNotEmpty && from == w.account) {
+            DmStore.put(ct, plain, (m['ts'] ?? 0) as int,
+                from: w.account, outgoing: true, peer: selfPeer, peerPk: '${outer['pk']}');
+          } else {
+            DmStore.put(ct, plain, (m['ts'] ?? 0) as int,
+                from: from, outgoing: false, peer: from, peerPk: realPk);
+          }
           continue;
         }
         // LEGACY (v1): sender/recipient identity and keys are on the record in the clear.
@@ -2306,15 +2328,16 @@ class Api {
   // A blind read seals the request (account + ownership proof) to a relay's key and hands the node an
   // opaque blob to forward: the node sees the IP but not the account, the relay sees the account but
   // only the node's IP. See docs/ANONYMITY.md §4 and wallet.dart's sealMailboxRead.
-  static Map<String, dynamic>? _blindRelay;   // {url, account, read_pk}, verified against the LEDGER
-  static int _blindRelayAt = 0;               // epoch secs of the last (re)resolution attempt
-  static bool _blindDisabled = false;         // nothing eligible this run — stop rescanning every poll
+  static List<Map<String, dynamic>>? _blindRelays;  // eligible relays, each verified against the LEDGER
+  static int _blindRelayAt = 0;                      // epoch secs of the last (re)resolution attempt
+  static bool _blindDisabled = false;                // nothing eligible this run — stop rescanning
 
-  /// Raw DM ciphertext records — via a BLIND read when a relay key is available, else the ordinary
-  /// signed read straight to our node. Both deliver the same records; the caller's decrypt loop does
-  /// not care which path produced them.
-  static Future<List<Map<String, dynamic>>> _dmFetchRaw(NanoWallet w, int since) async {
-    final blind = await _blindDmFetch(w, since);
+  /// Raw DM ciphertext records — via a BLIND read when relay keys are available, else the ordinary
+  /// signed read straight to our node. `full` (the periodic full sweep) reads EVERY eligible relay and
+  /// merges, so a message that landed only on some relays is still caught; incremental polls read one
+  /// relay for speed. Both paths deliver the same shape; the caller's decrypt loop does not care which.
+  static Future<List<Map<String, dynamic>>> _dmFetchRaw(NanoWallet w, int since, bool full) async {
+    final blind = await _blindDmFetch(w, since, full);
     if (blind != null) return blind;
     // Fallback: ordinary signed read. The node cannot forge this proof — it holds no seed — but it does
     // see (our IP, our account) together, which the blind path above is what avoids.
@@ -2328,15 +2351,38 @@ class Api {
     return ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
   }
 
-  /// A blind read from the chosen relay, or null to fall back. NOTE ON COMPLETENESS: this reads ONE
-  /// relay, where the ordinary path fans out across all of them. A send already fans out to every
-  /// relay (xc_dm post()), so a healthy relay holds everything; the on-device store plus the periodic
-  /// full sweep cover a transient gap. Sealed fan-out across several relays is the follow-up for the
-  /// case where the chosen relay was down when a message was sent.
-  static Future<List<Map<String, dynamic>>?> _blindDmFetch(NanoWallet w, int since) async {
+  /// Blind-read the mailbox. `all` reads EVERY eligible relay in parallel and merges — the completeness
+  /// backstop that closes the single-relay gap: a message that landed only on some relays (the one we
+  /// usually read was down when it was sent) is still caught. Otherwise it reads just the first relay.
+  /// Returns null ONLY when NO relay could serve it, so the caller falls back to the ordinary read; an
+  /// empty-but-successful read returns [] (an empty mailbox is a valid answer, not a failure).
+  static Future<List<Map<String, dynamic>>?> _blindDmFetch(NanoWallet w, int since, bool all) async {
     try {
-      final relay = await _blindReadRelay();
-      if (relay == null) return null;
+      final relays = await _blindReadRelays();
+      if (relays.isEmpty) return null;
+      final targets = all ? relays : relays.take(1).toList();
+      final results = await Future.wait(targets.map((r) => _blindReadOne(w, since, r)));
+      if (results.every((r) => r == null)) return null;    // every target failed → fall back
+      final seen = <String>{};
+      final merged = <Map<String, dynamic>>[];
+      for (final list in results) {
+        if (list == null) continue;
+        for (final m in list) {
+          // Dedup across relays the way the node does: by `mid` for sealed v2, else (from, ts).
+          final k = m['mid'] != null ? 'mid:${m['mid']}' : 'ft:${m['from']}:${m['ts']}';
+          if (seen.add(k)) merged.add(m);
+        }
+      }
+      return merged;
+    } catch (_) {
+      return null;                                        // never let the privacy path drop a message
+    }
+  }
+
+  /// One blind read against one relay. Returns its records, or null if that relay could not serve it.
+  static Future<List<Map<String, dynamic>>?> _blindReadOne(
+      NanoWallet w, int since, Map<String, dynamic> relay) async {
+    try {
       final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
       final auth = w.signMsg(w.dmInboxMsg(ats));
       final read = w.sealMailboxRead(relay['read_pk'] as String, {
@@ -2348,48 +2394,77 @@ class Api {
           .timeout(const Duration(seconds: 12));
       final resp = jsonDecode(r.body);
       final ct = resp is Map ? resp['ct'] : null;
-      if (ct is! String || ct.isEmpty) return null;      // node/relay could not serve it → fall back
+      if (ct is! String || ct.isEmpty) return null;
       final reply = read.openReply(ct);
       if (reply == null || reply['error'] != null) return null;
       return ((reply['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
     } catch (_) {
-      return null;                                       // never let the privacy path drop a message
+      return null;
     }
   }
 
-  /// Choose and cache a relay to seal blind reads to: one the LEDGER (not our node) says exists, whose
-  /// host differs from our node's, and whose read key is signed by its ledger account. Cached for an
-  /// hour — a privacy hop is not worth a ledger scan on every 5s poll.
-  static Future<Map<String, dynamic>?> _blindReadRelay() async {
+  /// Resolve and cache the relays to seal blind reads to: the ones the LEDGER (not our node) says exist,
+  /// whose host differs from our node's, and whose read key is signed by their ledger account. Cached an
+  /// hour — a ledger scan is not worth doing on every 5s poll. Capped so the full-sweep fan-out is small.
+  static Future<List<Map<String, dynamic>>> _blindReadRelays() async {
     final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-    if (_blindRelay != null && now - _blindRelayAt < 3600) return _blindRelay;
-    if (_blindDisabled && now - _blindRelayAt < 3600) return null;
+    if (_blindRelays != null && now - _blindRelayAt < 3600) return _blindRelays!;
+    if (_blindDisabled && now - _blindRelayAt < 3600) return const [];
     final w = gWallet;
-    if (w == null) return null;
+    if (w == null) return const [];
+    final out = <Map<String, dynamic>>[];
+
+    Future<void> tryAdd(String url, String acct) async {
+      if (out.any((e) => e['url'] == url)) return;
+      try {
+        final r = await http
+            .get(Uri.parse('$kBase/api/relay_readkey?relay=${Uri.encodeQueryComponent(url)}'))
+            .timeout(const Duration(seconds: 6));
+        final rec = jsonDecode(r.body);
+        if (rec is! Map<String, dynamic>) return;
+        final readPk = w.relayReadPk(rec, acct);            // verifies the sig binds read_pk to acct
+        if (readPk != null) out.add({'url': url, 'account': acct, 'read_pk': readPk});
+      } catch (_) {/* skip this relay */}
+    }
+
+    // DEBUG-ONLY hook, for a local relay NOT announced on the ledger (a test rig). It anchors read_pk to
+    // the account the /relaykey record SELF-REPORTS instead of one read off the ledger, so it TRUSTS THE
+    // NODE and gives up the MITM protection the ledger anchor provides — NEVER set in a shipped build.
+    // Inert unless compiled with --dart-define=XCHAT_DEBUG_BLIND_RELAY=<node-side relay url>.
+    const debugRelay = String.fromEnvironment('XCHAT_DEBUG_BLIND_RELAY');
+    if (debugRelay.isNotEmpty) {
+      try {
+        final r = await http
+            .get(Uri.parse('$kBase/api/relay_readkey?relay=${Uri.encodeQueryComponent(debugRelay)}'))
+            .timeout(const Duration(seconds: 6));
+        final rec = jsonDecode(r.body);
+        if (rec is Map<String, dynamic>) {
+          final acct = '${rec['account']}';                 // self-reported (debug: NOT ledger-anchored)
+          final readPk = w.relayReadPk(rec, acct);
+          if (readPk != null) out.add({'url': debugRelay, 'account': acct, 'read_pk': readPk});
+        }
+      } catch (_) {/* fall through to real discovery */}
+    }
     try {
       final nodeHost = Uri.parse(kBase).host;
       for (final rl in await LedgerDiscovery.discoverRelays()) {
+        if (out.length >= 5) break;                         // cap the full-sweep fan-out
         final url = rl['url'] ?? '', acct = rl['account'] ?? '';
         if (url.isEmpty || acct.isEmpty) continue;
-        if (Uri.parse(url).host == nodeHost) continue;   // must not be our own node's operator
-        try {
-          final r = await http
-              .get(Uri.parse('$kBase/api/relay_readkey?relay=${Uri.encodeQueryComponent(url)}'))
-              .timeout(const Duration(seconds: 6));
-          final rec = jsonDecode(r.body);
-          if (rec is! Map<String, dynamic>) continue;
-          final readPk = w.relayReadPk(rec, acct);       // verifies the signature binds read_pk to acct
-          if (readPk == null) continue;
-          _blindRelay = {'url': url, 'account': acct, 'read_pk': readPk};
-          _blindRelayAt = now;
-          _blindDisabled = false;
-          return _blindRelay;
-        } catch (_) {/* try the next relay */}
+        if (Uri.parse(url).host == nodeHost) continue;      // must not be our own node's operator
+        await tryAdd(url, acct);
       }
     } catch (_) {/* discovery failed — fall back for now */}
+
+    if (out.isNotEmpty) {
+      _blindRelays = out;
+      _blindRelayAt = now;
+      _blindDisabled = false;
+      return out;
+    }
     _blindDisabled = true;
-    _blindRelayAt = now;                                 // nothing eligible; don't rescan every poll
-    return null;
+    _blindRelayAt = now;                                    // nothing eligible; don't rescan every poll
+    return const [];
   }
 
   /// The conversation list straight from the on-device store, no network. Loads the store (fast,

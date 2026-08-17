@@ -217,6 +217,24 @@ class NanoWallet {
     };
   }
 
+  /// A sealed-sender copy of an OUTGOING message, addressed to OURSELF. A normal v2 record hides `from`
+  /// and is addressed to the peer, so it never appears in our own mailbox — which means a fresh device
+  /// (seed restore, second phone) can recover messages we RECEIVED but not ones we SENT. This mirror,
+  /// addressed to `to == account`, comes back in our own read, so our sent half syncs too. It carries
+  /// the real recipient in `p`/`pk` so the decode stores it as outgoing to that peer, and the inner is
+  /// sealed to our OWN dm key so any of our devices can open it. Authorship is still the MAC: only the
+  /// holder of our dm key can produce an inner that opens under it, so a forged self-copy cannot open.
+  Map<String, String> dmSealSealedSelf(String peerAccount, String peerPkHex, String text) {
+    final inner = dmSeal(dmPub, text);                 // sealed to OURSELF — openable on any of our devices
+    final payload = jsonEncode({'f': account, 'k': dmPub, 'i': inner, 'p': peerAccount, 'pk': peerPkHex});
+    final eph = pnacl.PrivateKey.generate();
+    final outer = pnacl.Box(myPrivateKey: eph, theirPublicKey: pnacl.PublicKey(_bytesOfHex(dmPub)));
+    return {
+      'epk': _hexOfBytes(eph.publicKey),
+      'ct': base64.encode(outer.encrypt(Uint8List.fromList(utf8.encode(payload)))),
+    };
+  }
+
   /// Open a sealed-sender envelope with our own dm key. Returns the decoded payload
   /// {f: from, k: from_pk_claimed, i: inner_ct}, or null if the outer seal is not addressed to us.
   /// The caller MUST verify `k` against the sender's ledger dm_pk, then open `i` with dmOpen(realPk, i).

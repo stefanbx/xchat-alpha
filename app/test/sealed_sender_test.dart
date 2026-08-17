@@ -63,4 +63,30 @@ void main() {
     // Opening under eve's REAL key would succeed — the seal is valid, it is simply eve's, not alice's.
     expect(bob.dmOpen(eve.dmPub, innerUnderEve), 'transfer the funds');
   });
+
+  test('a sealed send is mirrored to a self-copy only the SENDER can open, tagged with the real peer', () {
+    // A normal sealed record is addressed to the peer and hides `from`, so it never comes back in the
+    // SENDER's own mailbox — a fresh device (seed restore, second phone) could recover received messages
+    // but not sent ones. The self-copy is addressed to alice's OWN dm key and carries the recipient, so
+    // her sent half syncs too and renders as outgoing to bob.
+    final self = alice.dmSealSealedSelf(bob.account, bob.dmPub, 'see you at noon');
+
+    // Alice — on ANY device holding her seed — opens her own self-copy.
+    final outer = alice.dmOpenSealedOuter(self['epk']!, self['ct']!);
+    expect(outer, isNotNull);
+    expect(outer!['f'], alice.account, reason: 'authorship is alice (the MAC proves only she made it)');
+    expect(outer['p'], bob.account, reason: 'the real recipient — so the decode stores it as outgoing to bob');
+    expect(outer['pk'], bob.dmPub);
+    // The inner is sealed to alice HERSELF, so she opens it under her own dm key and recovers the text.
+    expect(alice.dmOpen(alice.dmPub, '${outer['i']}'), 'see you at noon');
+
+    // Bob — the named peer — CANNOT open the self-copy; it was addressed to alice, never to him.
+    expect(bob.dmOpenSealedOuter(self['epk']!, self['ct']!), isNull,
+        reason: 'the self-copy is sealed to alice, not bob — the relay/eavesdropper learns nothing');
+    // And a forger cannot fabricate a self-copy that opens under alice's key (they lack her dm secret),
+    // so authorship still holds: eve sealing an "inner" to alice does not open under alice's own key.
+    final forgedInner = eve.dmSeal(alice.dmPub, 'spoofed sent message');
+    expect(alice.dmOpen(alice.dmPub, forgedInner), isNull,
+        reason: 'inner sealed by eve does not open under alice-to-alice — a forged self-copy is dropped');
+  });
 }
