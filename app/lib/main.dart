@@ -266,6 +266,13 @@ String genSeed() {
   return List.generate(32, (_) => r.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
 }
 
+/// n random bytes as hex. Used for a sealed DM's message id, which must be unpredictable (it is the
+/// relay's dedup key now that `from` is hidden) and unlinkable to the sender.
+String randHex(int nBytes) {
+  final r = math.Random.secure();
+  return List.generate(nBytes, (_) => r.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+}
+
 // who you follow (local; small enough to also publish to relays for portability later)
 class FollowStore {
   static const _k = 'xchat_follows';
@@ -2046,22 +2053,33 @@ class Api {
     if (w == null) return;
     final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final s = w.signMsg(w.dmKeyMsg(ts, w.dmPub));
+    // Advertise that this client can READ sealed-sender records, signed separately so an old verifier
+    // ignores it and a new sender can trust it (a bare flag could be stripped to force a downgrade).
+    final cs = w.signMsg(w.dmKeyCapsMsg(ts, NanoWallet.dmCaps));
     try {
       await http.post(Uri.parse('$kBase/api/dm_key_set'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'account': w.account, 'dm_pk': w.dmPub, 'ts': ts, 'sig': s['sig'], 'pub': s['pub']}));
+          body: jsonEncode({'account': w.account, 'dm_pk': w.dmPub, 'ts': ts, 'sig': s['sig'], 'pub': s['pub'],
+                            'caps': NanoWallet.dmCaps, 'caps_sig': cs['sig']}));
     } catch (_) {}
   }
 
-  // fetch + verify a peer's DM public key (signed by their Nano key)
-  static Future<String?> dmKeyGet(String account) async {
+  // fetch + verify a peer's DM public key + capabilities (the node validates BOTH signatures — the
+  // dm_pk binding and the separate caps signature — so `caps` here is a claim the peer really made).
+  static Future<Map<String, String>?> dmKeyInfo(String account) async {
     try {
       final r = await http.get(Uri.parse('$kBase/api/dm_key_get?account=$account'));
-      return jsonDecode(r.body)['dm_pk'] as String?;
+      final j = jsonDecode(r.body);
+      final pk = j['dm_pk'] as String?;
+      if (pk == null) return null;
+      return {'dm_pk': pk, 'caps': '${j['caps'] ?? ''}'};
     } catch (_) {
       return null;
     }
   }
+
+  // Just the DM public key, for the paths where capabilities are irrelevant (authorship checks, etc.).
+  static Future<String?> dmKeyGet(String account) async => (await dmKeyInfo(account))?['dm_pk'];
 
   // encrypted DMs: seal ON-DEVICE (NaCl crypto_box), relay only the ciphertext — the node never
   // sees plaintext or any secret.
@@ -2160,15 +2178,42 @@ class Api {
   static Future<Map<String, dynamic>?> dmSend(String to, String text) async {
     final w = gWallet;
     if (w == null) return null;
-    final peer = await dmKeyGet(to);
-    if (peer == null) return {'ok': false, 'error': 'recipient has not enabled DMs yet'};
-    final ct = w.dmSeal(peer, text);
+    final info = await dmKeyInfo(to);
+    if (info == null) return {'ok': false, 'error': 'recipient has not enabled DMs yet'};
+    final peer = info['dm_pk']!;
     final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    // Send sealed ONLY to a recipient who has advertised (with a signature) that it can read the format.
+    // Otherwise fall back to v1, so an old install never receives a record it cannot open — the format
+    // is safe by construction, not by flag day.
+    final sealed = (info['caps'] ?? '').contains(NanoWallet.dmCaps);
+    final Map<String, dynamic> record;
+    final String storeKey;
+    if (sealed) {
+      // SEALED SENDER: the relay never learns WE sent this. `to` stays visible (the recipient must be
+      // addressable to pull their own mailbox); `from`/`from_pk`/`to_pk` are gone. `mid` is a random id
+      // so two sealed records in the same second still dedup now that the relay cannot key on `from`.
+      final env = w.dmSealSealed(peer, text);
+      record = {'v': 2, 'to': to, 'ts': ts, 'mid': randHex(16), 'epk': env['epk'], 'ct': env['ct']};
+      storeKey = '${env['ct']}';
+    } else {
+      final ct = w.dmSeal(peer, text);
+      record = {'to': to, 'from': w.account, 'from_pk': w.dmPub, 'to_pk': peer, 'ct': ct, 'ts': ts};
+      storeKey = ct;
+    }
     try {
       final r = await http.post(Uri.parse('$kBase/api/dm_send'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'to': to, 'from': w.account, 'from_pk': w.dmPub, 'to_pk': peer, 'ct': ct, 'ts': ts}));
-      return {'ok': jsonDecode(r.body)['ok'] == true, 'ts': ts};
+          headers: {'Content-Type': 'application/json'}, body: jsonEncode(record));
+      final ok = jsonDecode(r.body)['ok'] == true;
+      if (ok && sealed) {
+        // With `from` hidden the relay will NOT echo our own sealed message back to us (its mailbox
+        // matches `to`, and we are not the `to`). A v1 send got its sender-side copy from that echo;
+        // a sealed send must persist its OWN copy now or the sender loses their half of the thread on
+        // the next app start. We already hold the plaintext — record it directly, sealed to our key.
+        await DmStore.load(w);
+        DmStore.put(storeKey, text, ts, from: w.account, outgoing: true, peer: to, peerPk: peer);
+        await DmStore.flush(w);
+      }
+      return {'ok': ok, 'ts': ts};
     } catch (_) {
       return {'ok': false, 'error': 'send failed'};
     }
@@ -2214,16 +2259,40 @@ class Api {
           '&pub=${Uri.encodeQueryComponent(auth['pub']!)}'))
           .timeout(const Duration(seconds: 12));
       final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
+      // A sealed (v2) record hides its sender, so authorship is proven by opening the INNER seal under
+      // the sender's LEDGER-published dm_pk. Resolve each `from` to that key at most once per sweep.
+      final Map<String, String?> pkCache = {};
       for (final m in dms) {
-        final outgoing = m['from'] == w.account;
-        final peerAcc = '${outgoing ? m['to'] : m['from']}';
-        final peerPk = '${outgoing ? m['to_pk'] : m['from_pk']}';
         // Already-read messages come from the store; only genuinely NEW ciphertext is decrypted.
         // Keyed by ciphertext, which is safe HERE (unlike inside dmOpen) because this loop has
         // already established the message is addressed to us — a ciphertext that is not ours never
         // reaches put(), so it can never be served from get().
         final ct = '${m['ct']}';
-        if (DmStore.get(ct) != null) continue;            // already held — nothing to decrypt
+        if (ct.isEmpty || DmStore.get(ct) != null) continue;   // already held — nothing to decrypt
+        if (m['v'] == 2 || m['v'] == '2') {
+          // SEALED SENDER. The relay only ever saw an ephemeral key; the true identity is inside the
+          // outer seal. Open the outer with our dm key × the ephemeral key.
+          final outer = w.dmOpenSealedOuter('${m['epk']}', ct);
+          if (outer == null) continue;                    // outer seal is not addressed to us
+          final from = '${outer['f']}', claimedPk = '${outer['k']}', inner = '${outer['i']}';
+          if (from.isEmpty || claimedPk.isEmpty || inner.isEmpty) continue;
+          // Authorship check. A forger can put any `from` with their OWN key; the claim is only real if
+          // that key IS the sender's ledger-published dm_pk (which the node validates by signature).
+          // Resolve it and require an exact match, THEN open the inner under it — opening is the MAC
+          // proof that whoever wrote this held that key. Either test failing = a forged sender, dropped.
+          if (!pkCache.containsKey(from)) pkCache[from] = await dmKeyGet(from);
+          final realPk = pkCache[from];
+          if (realPk == null || realPk != claimedPk) continue;
+          final plain = w.dmOpen(realPk, inner);
+          if (plain == null) continue;
+          DmStore.put(ct, plain, (m['ts'] ?? 0) as int,
+              from: from, outgoing: false, peer: from, peerPk: realPk);
+          continue;
+        }
+        // LEGACY (v1): sender/recipient identity and keys are on the record in the clear.
+        final outgoing = m['from'] == w.account;
+        final peerAcc = '${outgoing ? m['to'] : m['from']}';
+        final peerPk = '${outgoing ? m['to_pk'] : m['from_pk']}';
         final plain = w.dmOpen(peerPk, ct);               // decrypts locally; null if not ours
         if (plain == null) continue;
         DmStore.put(ct, plain, (m['ts'] ?? 0) as int,

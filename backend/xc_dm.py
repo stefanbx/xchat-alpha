@@ -53,11 +53,13 @@ def post(path, obj):
 
 
 def peer_dm_pk(account):                                   # fetch + verify a peer's signed DM public key
-    # Query relays IN PARALLEL and take the first VERIFIED key. Serially, a dead relay ahead of a live
-    # one cost its full 4s timeout before the key was even fetched — and this runs BEFORE every send,
-    # so it stacked with the send fan-out to make "message a peer" spin. The verification is per-record
-    # (signature bound to the account), so accepting whichever verified answer returns first is safe:
-    # a relay cannot forge a key, only fail to have one.
+    # Returns {'dm_pk': ..., 'caps': ...} — caps is the peer's signed sealed-sender capability (empty if
+    # absent or its signature does not check). Query relays IN PARALLEL and take the first VERIFIED key.
+    # Serially, a dead relay ahead of a live one cost its full 4s timeout before the key was even
+    # fetched — and this runs BEFORE every send, so it stacked with the send fan-out to make "message a
+    # peer" spin. The verification is per-record (signature bound to the account), so accepting whichever
+    # verified answer returns first is safe: a relay cannot forge a key, only fail to have one. The caps
+    # signature is checked with the SAME account key, so a relay cannot forge a capability either.
     import concurrent.futures as _cf
 
     def _one(r):
@@ -69,7 +71,11 @@ def peer_dm_pk(account):                                   # fetch + verify a pe
             msg = xc.sig_canon('dmkey', rec['account'], rec['ts'], rec['dm_pk'])
             if rec['account'] == account and xc.pub_to_addr(rec['pub']) == account \
                and verify(rec['pub'], msg, rec['sig']):
-                return rec['dm_pk']
+                caps = rec.get('caps', ''); caps_sig = rec.get('caps_sig', '')
+                if not (caps and caps_sig
+                        and verify(rec['pub'], xc.sig_canon('dmkeycaps', rec['account'], rec['ts'], caps), caps_sig)):
+                    caps = ''
+                return {'dm_pk': rec['dm_pk'], 'caps': caps}
         except Exception:
             pass
         return None
@@ -77,9 +83,9 @@ def peer_dm_pk(account):                                   # fetch + verify a pe
     if not RELAYS:
         return None
     with _cf.ThreadPoolExecutor(max_workers=len(RELAYS)) as ex:
-        for pk in ex.map(_one, RELAYS):
-            if pk:
-                return pk
+        for got in ex.map(_one, RELAYS):
+            if got:
+                return got
     return None
 
 
@@ -90,12 +96,20 @@ if mode == 'register':
     sig = rec.get('sig', ''); pub = rec.get('pub', '')
     if not (xc.pub_to_addr(pub) == acc and verify(pub, xc.sig_canon('dmkey', acc, ts, dm_pk), sig)):
         json.dump({'ok': False, 'error': 'bad signature'}, open('/tmp/xc_dm_result.json', 'w')); sys.exit()
-    relays = post('/dmkey', {'account': acc, 'dm_pk': dm_pk, 'ts': ts, 'sig': sig, 'pub': pub})
+    out = {'account': acc, 'dm_pk': dm_pk, 'ts': ts, 'sig': sig, 'pub': pub}
+    # Additive: a capability advertisement (which sealed-sender formats this account can read), signed
+    # SEPARATELY from the dm_pk binding. Carry it through only when its own signature verifies, so the
+    # node never relays a caps claim it did not check — a stripped or forged flag simply does not appear.
+    caps = rec.get('caps', ''); caps_sig = rec.get('caps_sig', '')
+    if caps and caps_sig and verify(pub, xc.sig_canon('dmkeycaps', acc, ts, caps), caps_sig):
+        out['caps'] = caps; out['caps_sig'] = caps_sig
+    relays = post('/dmkey', out)
     json.dump({'ok': True, 'relays': relays}, open('/tmp/xc_dm_result.json', 'w'))
 
 elif mode == 'keyget':
     account = rd('/tmp/xc_dm_peer.txt')
-    json.dump({'ok': True, 'account': account, 'dm_pk': peer_dm_pk(account)},
+    info = peer_dm_pk(account) or {}
+    json.dump({'ok': True, 'account': account, 'dm_pk': info.get('dm_pk'), 'caps': info.get('caps', '')},
               open('/tmp/xc_dm_result.json', 'w'))
 
 elif mode == 'send':

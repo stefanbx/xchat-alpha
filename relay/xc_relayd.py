@@ -235,7 +235,17 @@ def channels_directory():
     return _channels_cache['json']
 
 _heads_lock = threading.Lock()                                # guards heads across prune + /push
-_dm_seen = set()                                              # (from, ts) O(1) dedup for the mailbox
+_dm_seen = set()                                              # dedup index for the mailbox (see _dm_key)
+
+
+def _dm_key(m):
+    # Dedup key for a stored DM. A SEALED-SENDER record (v2) hides `from`, so the old (from, ts) key
+    # would collapse every sealed record to (None, ts) — two senders in the same second would lose a
+    # message. A v2 record therefore carries its own random `mid`, and we key on that when present.
+    # Legacy (v1) records keep the (from, ts) key unchanged, so this is additive: old records dedup
+    # exactly as before, new records dedup on an id that does not depend on a visible sender.
+    mid = m.get('mid')
+    return ('mid', mid) if mid else ('ft', m.get('from'), m.get('ts'))
 
 # Reading a mailbox: prove you own it.
 #
@@ -792,7 +802,7 @@ def save():
 load_state()
 blob_load_meta()
 for _m in dms:                                       # rebuild the DM dedup index from the loaded mailbox
-    _dm_seen.add((_m.get('from'), _m.get('ts')))
+    _dm_seen.add(_dm_key(_m))
 for _pid, _recs in reports.items():                  # rebuild per-cid reporter weights -> blob penalty
     for _acc, _rec in (_recs or {}).items():
         _c = (_rec or {}).get('cid'); _rp = float((_rec or {}).get('rep', 0) or 0)
@@ -1407,15 +1417,15 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/dm'):
-            # store an encrypted DM (O(1) dedup by (from, ts)). The relay only holds ciphertext, and
-            # the mailbox is a bounded ring — oldest ciphertext drops once it's past DM_MAX.
+            # store an encrypted DM (O(1) dedup by _dm_key: `mid` for sealed v2, else (from, ts)). The
+            # relay only holds ciphertext, and the mailbox is a bounded ring — oldest drops past DM_MAX.
             try:
-                m = json.loads(raw); key = (m.get('from'), m.get('ts'))
+                m = json.loads(raw); key = _dm_key(m)
                 if key not in _dm_seen:
                     _dm_seen.add(key); dms.append(m)
                     if len(dms) > DM_MAX:                                # bounded: evict oldest
                         for x in dms[:-DM_MAX]:
-                            _dm_seen.discard((x.get('from'), x.get('ts')))
+                            _dm_seen.discard(_dm_key(x))
                         del dms[:-DM_MAX]
                 self._send(200, json.dumps({'ok': True, 'stored': len(dms)}))
             except Exception as e:

@@ -122,6 +122,12 @@ class NanoWallet {
   String profileMsg(int ts, String display, String bio, String avatar, String banner) =>
       sigCanon('profile', [account, ts, display, bio, avatar, banner]);
   String dmKeyMsg(int ts, String dmPub) => sigCanon('dmkey', [account, ts, dmPub]);
+  /// Capability advertisement, signed SEPARATELY from the dm_pk binding so it is additive: an old
+  /// verifier checks dm_pk with the unchanged `dmkey` preimage and ignores this, while a new sender
+  /// verifies this to trust that the recipient can read a sealed-sender record. Signing it (rather than
+  /// leaving a bare flag) is what stops a hostile node from silently stripping the flag to force a
+  /// sender back to the cleartext-`from` format — the exact node we are hiding from.
+  String dmKeyCapsMsg(int ts, String caps) => sigCanon('dmkeycaps', [account, ts, caps]);
   /// Proof that we own a mailbox, for reading it. Bound to a timestamp so a captured signature is a
   /// bearer token for minutes rather than forever.
   String dmInboxMsg(int ts) => sigCanon('dminbox', [account, ts]);
@@ -178,6 +184,48 @@ class NanoWallet {
   String? dmOpen(String peerPkHex, String b64) {
     try {
       return utf8.decode(_boxFor(peerPkHex).decrypt(pnacl.EncryptedMessage.fromList(base64.decode(b64))));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ---- sealed sender (double seal) ----
+  // A relay currently sees `from` on every DM, so anyone pulling a mailbox can read the whole social
+  // graph. Sealed sender hides the sender: the record carries only an EPHEMERAL public key and
+  // ciphertext, and the true identity moves INSIDE the sealed payload.
+  //
+  //   inner = box(text)          under OUR REAL dm key → the recipient, opened with our published
+  //                              dm_pk; opening under that key is the proof of authorship (the MAC).
+  //   outer = box({from, from_pk, inner}) under a THROWAWAY ephemeral key → the recipient. The relay
+  //                              sees the ephemeral key, never ours, so it cannot tie the record to us.
+  //
+  // Both layers seal to the SAME recipient dm_pk with crypto we already have; only the outer key is
+  // per-message and disposable. The recipient opens the outer with (their dm key × epk) — which is
+  // exactly `dmOpen(epk, ct)` — then opens the inner with (their dm key × our REAL dm_pk), which it
+  // must confirm is the sender's ledger-published key before trusting the `from` (done in the Api layer).
+  static const String dmCaps = 's1';                   // what we advertise + what a sealed record declares
+
+  /// Build a sealed-sender envelope for a peer's dm_pk. Returns {epk, ct} for a v2 DM record.
+  Map<String, String> dmSealSealed(String peerPkHex, String text) {
+    final inner = dmSeal(peerPkHex, text);             // authenticated by our real dm key (authorship)
+    final payload = jsonEncode({'f': account, 'k': dmPub, 'i': inner});
+    final eph = pnacl.PrivateKey.generate();           // throwaway: the relay only ever sees eph.public
+    final outer = pnacl.Box(myPrivateKey: eph, theirPublicKey: pnacl.PublicKey(_bytesOfHex(peerPkHex)));
+    return {
+      'epk': _hexOfBytes(eph.publicKey),
+      'ct': base64.encode(outer.encrypt(Uint8List.fromList(utf8.encode(payload)))),
+    };
+  }
+
+  /// Open a sealed-sender envelope with our own dm key. Returns the decoded payload
+  /// {f: from, k: from_pk_claimed, i: inner_ct}, or null if the outer seal is not addressed to us.
+  /// The caller MUST verify `k` against the sender's ledger dm_pk, then open `i` with dmOpen(realPk, i).
+  Map<String, dynamic>? dmOpenSealedOuter(String epkHex, String ct) {
+    final plain = dmOpen(epkHex, ct);                  // outer: our dm key × the ephemeral key
+    if (plain == null) return null;
+    try {
+      final o = jsonDecode(plain);
+      return o is Map<String, dynamic> ? o : null;
     } catch (_) {
       return null;
     }

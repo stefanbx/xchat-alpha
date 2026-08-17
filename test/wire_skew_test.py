@@ -150,17 +150,23 @@ def suite(relay):
               f'[{L}] unknown fields (epk, v) survive intact — additive changes are safe to store',
               json.dumps(got[0]))
 
-    # ---- CONSTRAINT 1: dedup is on (from, ts). Hiding `from` collapses distinct messages. --------
-    # Two DIFFERENT sealed messages, same second, no plaintext sender: both dedup to (None, 3000).
-    relay.post_dm({'to': BOB, 'ts': 3000, 'ct': 'FIRST', 'epk': 'd1' * 32})
-    relay.post_dm({'to': BOB, 'ts': 3000, 'ct': 'SECOND', 'epk': 'd2' * 32})
+    # ---- DEDUP: sealed records carry their own `mid`, so `from` no longer has to be visible. -------
+    # Two DIFFERENT sealed messages in the same second with DISTINCT mids must BOTH survive (the old
+    # (from, ts) key would have collapsed them to (None, 3000) and dropped one). This is the relay half
+    # of sealed sender — it fails against a pre-sealed-sender baseline, which is precisely the signal
+    # that such a relay needs updating before it can carry same-second sealed traffic without loss.
+    relay.post_dm({'to': BOB, 'ts': 3000, 'mid': 'm1' * 8, 'ct': 'FIRST', 'epk': 'd1' * 32})
+    relay.post_dm({'to': BOB, 'ts': 3000, 'mid': 'm2' * 8, 'ct': 'SECOND', 'epk': 'd2' * 32})
     at3000 = [m for m in relay.get_dms(BOB) if m.get('ts') == 3000]
-    # On the CURRENT relay this is 1 (the hazard). A sealed-sender relay must make it 2 by deduping on
-    # a message id instead. Either way the number is the contract, so a change to it is deliberate.
-    check(len(at3000) == 1,
-          f'[{L}] CONSTRAINT: two senderless records in one second dedup to one — sealed sender '
-          f'needs its own message id',
-          f'got {len(at3000)} (current relay: expect 1; a fixed relay: expect 2 and this test updates)')
+    check(len(at3000) == 2,
+          f'[{L}] two sealed records in one second with distinct mids BOTH survive (dedup moved to mid)',
+          f'got {len(at3000)}')
+    # And the mid really IS the dedup key: the same mid twice is still one record (a re-post/gossip echo).
+    relay.post_dm({'to': BOB, 'ts': 3001, 'mid': 'm3' * 8, 'ct': 'ONCE', 'epk': 'd3' * 32})
+    relay.post_dm({'to': BOB, 'ts': 3001, 'mid': 'm3' * 8, 'ct': 'ONCE', 'epk': 'd3' * 32})
+    at3001 = [m for m in relay.get_dms(BOB) if m.get('ts') == 3001]
+    check(len(at3001) == 1, f'[{L}] a repeated mid dedups to one (gossip echoes do not pile up)',
+          f'got {len(at3001)}')
 
     # ---- CONSTRAINT 2: the SENDER reads their own sent mail via `from == acc`. ------------------
     # A record addressed to BOB with a plaintext sender ALICE is visible to BOTH. Remove the sender
