@@ -20,6 +20,15 @@ for _p in (os.path.join(_here, "xc_common.py"),          # staged next to the re
         except Exception:
             xc = None
 
+xc_tunnel = None                                # mesh reverse-tunnel: reach a NAT'd relay, no external service
+_tp = os.path.join(_here, "xc_tunnel.py")
+if os.path.exists(_tp):
+    try:
+        _spec = importlib.util.spec_from_file_location("xc_tunnel", _tp)
+        xc_tunnel = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(xc_tunnel)
+    except Exception:
+        xc_tunnel = None
+
 PORT = int(sys.argv[1]); STORE = sys.argv[2]
 BIND = os.environ.get('BIND_HOST', '127.0.0.1')      # '0.0.0.0' when hosted (Fly.io)
 # public URL other nodes reach this relay at; defaults to loopback for local runs
@@ -878,6 +887,13 @@ try:
 except Exception:
     ID_KEY, ID_ACCT, ID_PUB = '', '', ''
 
+# Mesh reverse-tunnel ENTRY hub. Any relay with a public IP can be an entry node for relays behind NAT
+# — a permissionless capability. Always on when the module + xc are present; it only does anything once
+# a home relay dials in (XC_TUNNEL_ENTRIES) and a public /r/<account>/... request arrives. NEXT STEP:
+# advertise a 't1' cap on /relays + on-chain so home relays DISCOVER entry nodes instead of being handed
+# a list; the prototype takes the list from XC_TUNNEL_ENTRIES and proves the transport + no-SPOF failover.
+HUB = xc_tunnel.EntryHub(xc) if (xc_tunnel is not None and xc is not None) else None
+
 # --- BLIND MAILBOX READ (breaks IP<->account correlation) -----------------------------------------
 # A mailbox read names the account that owns it, so whoever serves the read learns "this IP reads that
 # account's DMs". Sealed sender hid the SENDER from the relay; it did nothing for this, because the
@@ -1168,7 +1184,62 @@ class H(BaseHTTPRequestHandler):
         self.send_header('Content-Length', '0')
         self.end_headers()
 
+    # --- mesh reverse-tunnel (see xc_tunnel.py) ---------------------------------------------------
+    def _read_body(self):
+        try:
+            n = int(self.headers.get('Content-Length', 0) or 0)
+        except ValueError:
+            return b''
+        return self.rfile.read(n) if n > 0 else b''
+
+    def _tunnel_poll(self):
+        q = qs(self.path)
+        try:
+            item = HUB.poll(q.get('account', ''), q.get('pub', ''), q.get('ts', '0'), q.get('sig', ''))
+        except PermissionError:
+            return self._send(403, '{"ok":false,"error":"tunnel: bad signature"}')
+        if item is None:
+            return self._send(204, '')
+        b = item.encode()                                     # item is the framed request JSON string
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def _tunnel_reply(self):
+        try:
+            d = json.loads(self._read_body() or b'{}')
+            ok = HUB.reply(d.get('account', ''), d.get('pub', ''), d.get('ts', '0'), d.get('sig', ''),
+                           d.get('reqid', ''), d.get('status', 200), d.get('headers', {}), d.get('body_b64', ''))
+        except PermissionError:
+            return self._send(403, '{"ok":false,"error":"tunnel: bad signature"}')
+        except Exception as e:
+            return self._send(400, json.dumps({"ok": False, "error": str(e)}))
+        return self._send(200 if ok else 404, json.dumps({"ok": bool(ok)}))
+
+    def _tunnel_public(self, method):
+        # /r/<account>/<subpath...>  — reverse-proxied down the tunnel to the home relay.
+        acct, _, sub = self.path[len('/r/'):].partition('/')
+        if not acct:
+            return self._send(404, '{"ok":false,"error":"tunnel: no account"}')
+        subpath = sub if sub.startswith('/') else '/' + sub
+        body = self._read_body() if method == 'POST' else b''
+        st, hdrs, out = HUB.serve_public(acct, method, subpath, self.headers, body)
+        self.send_response(st)
+        for k, v in (hdrs or {}).items():
+            self.send_header(k, v)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(out)))
+        self.end_headers()
+        if not getattr(self, '_head_only', False):
+            self.wfile.write(out)
+
     def do_GET(self):
+        if HUB is not None and self.path.startswith('/_tunnel/poll'):
+            return self._tunnel_poll()
+        if HUB is not None and self.path.startswith('/r/'):
+            return self._tunnel_public('GET')
         if self.path.startswith('/heads'):
             self._send(200, json.dumps({'relay': PORT, 'heads': live_heads()}))
         elif self.path.startswith('/relays'):
@@ -1309,6 +1380,10 @@ class H(BaseHTTPRequestHandler):
         else:
             self._send(404, '{"error":"not found"}')
     def do_POST(self):
+        if HUB is not None and self.path.startswith('/_tunnel/reply'):
+            return self._tunnel_reply()
+        if HUB is not None and self.path.startswith('/r/'):
+            return self._tunnel_public('POST')
         # Real client IP for the throttle. A forwarded IP is trustworthy ONLY from Fly's edge or our own
         # loopback node proxy (kt_server on the same host); otherwise a remote client spoofs
         # X-Forwarded-For to dodge the throttle AND to bloat the _rate table with fake IPs. So trust the
@@ -1658,4 +1733,18 @@ if BOOTSTRAPS:
 threading.Thread(target=sync_release_blobs, daemon=True).start()   # catch up on any release bytes we're missing
 threading.Thread(target=probe_peers, daemon=True).start()          # forget dead relay urls; re-announce ours
 threading.Thread(target=shard_repair, daemon=True).start()         # pull the share of blobs we're placed on
+
+# Mesh reverse-tunnel CLIENT. If this relay is behind NAT it dials OUT to the entry nodes listed in
+# XC_TUNNEL_ENTRIES (comma-separated base urls) and serves itself through all of them at once — kill any
+# one and the others carry it (no SPOF, no external service). Announce _mesh.public_urls() on-chain.
+_TUNNEL_ENTRIES = [u.strip() for u in os.environ.get('XC_TUNNEL_ENTRIES', '').split(',') if u.strip()]
+if xc_tunnel is not None and _TUNNEL_ENTRIES and ID_KEY and xc is not None:
+    try:
+        _mesh = xc_tunnel.MeshClient(xc, ID_ACCT, ID_KEY, f'http://127.0.0.1:{PORT}', _TUNNEL_ENTRIES,
+                                     log=lambda m: print(f'[tunnel] {m}', file=sys.stderr, flush=True))
+        _mesh.start()
+        print('[tunnel] reachable via: ' + ', '.join(_mesh.public_urls()), file=sys.stderr, flush=True)
+    except Exception as _e:
+        print(f'[tunnel] client failed to start: {_e}', file=sys.stderr, flush=True)
+
 ThreadingHTTPServer((BIND, PORT), H).serve_forever()
