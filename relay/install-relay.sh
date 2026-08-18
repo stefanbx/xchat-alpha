@@ -1221,10 +1221,11 @@ except Exception:
     # the relay stays invisible with only a line in selfannounce.log to say so. Observed on a real
     # operator's chain: twelve check-ins across four restarts, not one URL commit. Same GPU the node
     # uses, same XC_WORK_LOCAL=1 CPU fallback so an announce can never be blocked outright.
-    # mesh mode announces nothing from HERE: there is no single tunnel url — the relay is reachable at
-    # <entry>/r/<account> for each discovered entry, a set known only at runtime, so the relay announces
-    # those urls itself (see MeshClient.public_urls). Announcing the empty ANNOUNCE_URL here would only
-    # publish a dead address.
+    # mesh mode announces nothing from HERE, and nothing announces the tunnel address ANYWHERE: the relay
+    # is reachable at <entry>/r/<token> for each discovered entry, where <token> is an ephemeral,
+    # per-epoch routing id derived from a shared rendezvous secret (see xc_tunnel.py). Publishing that
+    # on-chain would republish a linkable relay↔entry topology and defeat the anonymity the mesh exists
+    # for — so it stays OFF the ledger; the secret is shared out-of-band with the users who may reach it.
     RELDIR="$XC_HOME/node/xc_reldir.py"; [ -f "$RELDIR" ] || RELDIR="$XC_HOME/xc_reldir.py"
     if [ "$MODE" != mesh ] && [ -s "$XC_HOME/operator.seed" ] && [ -f "$RELDIR" ]; then
         ( sleep 25

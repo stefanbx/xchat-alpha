@@ -889,10 +889,10 @@ except Exception:
 
 # Mesh reverse-tunnel ENTRY hub. Any relay with a public IP can be an entry node for relays behind NAT
 # — a permissionless capability. Always on when the module + xc are present; it only does anything once
-# a home relay dials in (XC_TUNNEL_ENTRIES) and a public /r/<account>/... request arrives. NEXT STEP:
-# advertise a 't1' cap on /relays + on-chain so home relays DISCOVER entry nodes instead of being handed
-# a list; the prototype takes the list from XC_TUNNEL_ENTRIES and proves the transport + no-SPOF failover.
-HUB = xc_tunnel.EntryHub(xc) if (xc_tunnel is not None and xc is not None) else None
+# a home relay dials in and a public /r/<token>/... request arrives. Routing is by opaque ephemeral
+# TOKEN, so this entry never learns which ledger account it is carrying (see xc_tunnel.py header). SELF
+# is folded into every signed poll/reply, binding the auth to THIS entry.
+HUB = xc_tunnel.EntryHub(xc, SELF) if (xc_tunnel is not None and xc is not None) else None
 
 def relay_caps():
     # Capabilities this relay advertises on /relays, so peers/home-relays can DISCOVER what it offers.
@@ -1206,7 +1206,7 @@ class H(BaseHTTPRequestHandler):
     def _tunnel_poll(self):
         q = qs(self.path)
         try:
-            item = HUB.poll(q.get('account', ''), q.get('pub', ''), q.get('ts', '0'), q.get('sig', ''))
+            item = HUB.poll(q.get('token', ''), q.get('ts', '0'), q.get('sig', ''))
         except PermissionError:
             return self._send(403, '{"ok":false,"error":"tunnel: bad signature"}')
         if item is None:
@@ -1221,7 +1221,7 @@ class H(BaseHTTPRequestHandler):
     def _tunnel_reply(self):
         try:
             d = json.loads(self._read_body() or b'{}')
-            ok = HUB.reply(d.get('account', ''), d.get('pub', ''), d.get('ts', '0'), d.get('sig', ''),
+            ok = HUB.reply(d.get('token', ''), d.get('ts', '0'), d.get('sig', ''),
                            d.get('reqid', ''), d.get('status', 200), d.get('headers', {}), d.get('body_b64', ''))
         except PermissionError:
             return self._send(403, '{"ok":false,"error":"tunnel: bad signature"}')
@@ -1230,13 +1230,14 @@ class H(BaseHTTPRequestHandler):
         return self._send(200 if ok else 404, json.dumps({"ok": bool(ok)}))
 
     def _tunnel_public(self, method):
-        # /r/<account>/<subpath...>  — reverse-proxied down the tunnel to the home relay.
-        acct, _, sub = self.path[len('/r/'):].partition('/')
-        if not acct:
-            return self._send(404, '{"ok":false,"error":"tunnel: no account"}')
+        # /r/<token>/<subpath...>  — reverse-proxied down the tunnel to the home relay. The token is an
+        # opaque ephemeral routing id (not a ledger account); this entry never resolves it to one.
+        token, _, sub = self.path[len('/r/'):].partition('/')
+        if not token:
+            return self._send(404, '{"ok":false,"error":"tunnel: no token"}')
         subpath = sub if sub.startswith('/') else '/' + sub
         body = self._read_body() if method == 'POST' else b''
-        st, hdrs, out = HUB.serve_public(acct, method, subpath, self.headers, body)
+        st, hdrs, out = HUB.serve_public(token, method, subpath, self.headers, body)
         self.send_response(st)
         for k, v in (hdrs or {}).items():
             self.send_header(k, v)
@@ -1751,11 +1752,17 @@ threading.Thread(target=shard_repair, daemon=True).start()         # pull the sh
 #   XC_TUNNEL_AUTO=1   DISCOVER entries on-chain: scan the ledger relay set + gossiped `known`, probe
 #                      each for the 't1' capability, and dial the ones that advertise it. No hardcoded
 #                      list. XC_TUNNEL_DISCOVER_FROM seeds extra candidate urls into the probe (testing).
-# Either or both may be set. Announce _mesh.public_urls() (one /r/<account> per live entry) on-chain.
+# Either or both may be set. Reachability is by ephemeral per-(entry,epoch) TOKEN derived from a shared
+# RENDEZVOUS SECRET — deliberately NOT announced on-chain (that would republish a linkable relay↔entry
+# topology; see xc_tunnel.py). The operator shares the secret out-of-band with the users who may reach
+# this private relay; they derive the same token to address it. XC_TUNNEL_SECRET sets it explicitly;
+# otherwise it is derived one-way from the relay's ID key (shareable without exposing the ledger key).
 _TUNNEL_ENTRIES = [u.strip() for u in os.environ.get('XC_TUNNEL_ENTRIES', '').split(',') if u.strip()]
 _TUNNEL_SEED    = [u.strip() for u in os.environ.get('XC_TUNNEL_DISCOVER_FROM', '').split(',') if u.strip()]
 _TUNNEL_AUTO    = os.environ.get('XC_TUNNEL_AUTO') == '1' or bool(_TUNNEL_SEED)
 _MESH_CLIENT    = bool(_TUNNEL_ENTRIES) or _TUNNEL_AUTO      # read by relay_caps(): a client can't also be an entry
+_TUNNEL_SECRET  = os.environ.get('XC_TUNNEL_SECRET') or (
+    hashlib.blake2b(b'xchat/mesh-rv/v1|' + bytes.fromhex(ID_KEY), digest_size=32).hexdigest() if ID_KEY else '')
 
 def _discover_entry_candidates():
     # The on-chain / gossip relay set this relay knows about — candidates to PROBE for the entry cap.
@@ -1770,10 +1777,10 @@ def _discover_entry_candidates():
         pass
     return list(cands)
 
-if xc_tunnel is not None and _MESH_CLIENT and ID_KEY and xc is not None:
+if xc_tunnel is not None and _MESH_CLIENT and _TUNNEL_SECRET and xc is not None:
     try:
         _mesh = xc_tunnel.MeshClient(
-            xc, ID_ACCT, ID_KEY, f'http://127.0.0.1:{PORT}',
+            xc, _TUNNEL_SECRET, f'http://127.0.0.1:{PORT}',
             entries=_TUNNEL_ENTRIES,
             discover=(_discover_entry_candidates if _TUNNEL_AUTO else None),
             self_url=SELF,
