@@ -894,6 +894,17 @@ except Exception:
 # a list; the prototype takes the list from XC_TUNNEL_ENTRIES and proves the transport + no-SPOF failover.
 HUB = xc_tunnel.EntryHub(xc) if (xc_tunnel is not None and xc is not None) else None
 
+def relay_caps():
+    # Capabilities this relay advertises on /relays, so peers/home-relays can DISCOVER what it offers.
+    # 't1' = it can serve as a mesh-tunnel ENTRY node. Advertised whenever the hub is up and this relay
+    # is not itself tunnelling out (a NAT'd client can't accept inbound). Reachability self-selects: a
+    # home relay only keeps entries it can actually reach, so a mis-advertised unreachable node is
+    # dropped after a failed probe. `_MESH_CLIENT` is set at startup (bottom of file).
+    caps = []
+    if HUB is not None and not globals().get('_MESH_CLIENT', False):
+        caps.append(xc_tunnel.ENTRY_CAP)
+    return caps
+
 # --- BLIND MAILBOX READ (breaks IP<->account correlation) -----------------------------------------
 # A mailbox read names the account that owns it, so whoever serves the read learns "this IP reads that
 # account's DMs". Sealed sender hid the SENDER from the relay; it did nothing for this, because the
@@ -1247,7 +1258,7 @@ class H(BaseHTTPRequestHandler):
             # 'peers' carries the signed identity records, ignored by anything that doesn't know them.
             self._send(200, json.dumps({'relay': PORT, 'relays': sorted(known),
                                         'account': ID_ACCT, 'peers': signed_peers(),
-                                        'open_announce': OPEN_ANNOUNCE}))
+                                        'caps': relay_caps(), 'open_announce': OPEN_ANNOUNCE}))
         elif self.path.startswith('/notify'):
             h = qs(self.path).get('handle', '')
             self._send(200, json.dumps({'relay': PORT, 'notifs': notifs.get(h, [])}))
@@ -1734,16 +1745,40 @@ threading.Thread(target=sync_release_blobs, daemon=True).start()   # catch up on
 threading.Thread(target=probe_peers, daemon=True).start()          # forget dead relay urls; re-announce ours
 threading.Thread(target=shard_repair, daemon=True).start()         # pull the share of blobs we're placed on
 
-# Mesh reverse-tunnel CLIENT. If this relay is behind NAT it dials OUT to the entry nodes listed in
-# XC_TUNNEL_ENTRIES (comma-separated base urls) and serves itself through all of them at once — kill any
-# one and the others carry it (no SPOF, no external service). Announce _mesh.public_urls() on-chain.
+# Mesh reverse-tunnel CLIENT. A relay behind NAT dials OUT to public entry nodes and serves itself
+# through all of them at once — kill any one and the others carry it (no SPOF, no external service).
+#   XC_TUNNEL_ENTRIES  explicit, trusted entry urls (comma-separated) — always dialed.
+#   XC_TUNNEL_AUTO=1   DISCOVER entries on-chain: scan the ledger relay set + gossiped `known`, probe
+#                      each for the 't1' capability, and dial the ones that advertise it. No hardcoded
+#                      list. XC_TUNNEL_DISCOVER_FROM seeds extra candidate urls into the probe (testing).
+# Either or both may be set. Announce _mesh.public_urls() (one /r/<account> per live entry) on-chain.
 _TUNNEL_ENTRIES = [u.strip() for u in os.environ.get('XC_TUNNEL_ENTRIES', '').split(',') if u.strip()]
-if xc_tunnel is not None and _TUNNEL_ENTRIES and ID_KEY and xc is not None:
+_TUNNEL_SEED    = [u.strip() for u in os.environ.get('XC_TUNNEL_DISCOVER_FROM', '').split(',') if u.strip()]
+_TUNNEL_AUTO    = os.environ.get('XC_TUNNEL_AUTO') == '1' or bool(_TUNNEL_SEED)
+_MESH_CLIENT    = bool(_TUNNEL_ENTRIES) or _TUNNEL_AUTO      # read by relay_caps(): a client can't also be an entry
+
+def _discover_entry_candidates():
+    # The on-chain / gossip relay set this relay knows about — candidates to PROBE for the entry cap.
+    cands = set(_TUNNEL_SEED)
     try:
-        _mesh = xc_tunnel.MeshClient(xc, ID_ACCT, ID_KEY, f'http://127.0.0.1:{PORT}', _TUNNEL_ENTRIES,
-                                     log=lambda m: print(f'[tunnel] {m}', file=sys.stderr, flush=True))
+        cands.update(known)                          # relays learned via bootstrap gossip (rooted on-chain)
+    except Exception:
+        pass
+    try:
+        cands.update(xc.onchain_relays())            # a fresh ledger scan — no directory, no SPOF
+    except Exception:
+        pass
+    return list(cands)
+
+if xc_tunnel is not None and _MESH_CLIENT and ID_KEY and xc is not None:
+    try:
+        _mesh = xc_tunnel.MeshClient(
+            xc, ID_ACCT, ID_KEY, f'http://127.0.0.1:{PORT}',
+            entries=_TUNNEL_ENTRIES,
+            discover=(_discover_entry_candidates if _TUNNEL_AUTO else None),
+            self_url=SELF,
+            log=lambda m: print(f'[tunnel] {m}', file=sys.stderr, flush=True))
         _mesh.start()
-        print('[tunnel] reachable via: ' + ', '.join(_mesh.public_urls()), file=sys.stderr, flush=True)
     except Exception as _e:
         print(f'[tunnel] client failed to start: {_e}', file=sys.stderr, flush=True)
 

@@ -38,6 +38,8 @@ import urllib.request
 # --- tunables (prototype; env-overridable) ---------------------------------------------------------
 POLL_HOLD_S    = int(os.environ.get('XC_TUNNEL_POLL_HOLD_S', '25'))    # entry holds a poll open this long with no work → 204
 PUBLIC_WAIT_S  = int(os.environ.get('XC_TUNNEL_PUBLIC_WAIT_S', '30'))  # public request waits this long for the reply → 504
+REFRESH_S      = int(os.environ.get('XC_TUNNEL_REFRESH_S', '60'))      # how often the home relay re-discovers the entry set
+ENTRY_CAP      = 't1'    # capability an entry node advertises on /relays; home relays discover entries by it
 CLOCK_SKEW_S   = 120     # accepted |now - ts| on a signed poll/reply — bounds replay
 WORKERS        = 4       # parallel poll loops per entry node = max concurrent in-flight requests per node
 DISPATCH_TO_S  = 20      # timeout dispatching a framed request against the home relay's own local port
@@ -148,20 +150,30 @@ class EntryHub:
 # entry node never takes the others down.
 
 class MeshClient:
-    def __init__(self, xc, account, id_key, local_base, entries, workers=WORKERS, log=None):
+    # entries: an explicit, trusted list (XC_TUNNEL_ENTRIES) — always used, never filtered.
+    # discover: a callable -> candidate base urls (the on-chain / gossip relay set). Candidates are
+    #           PROBED for the ENTRY_CAP on /relays and only the ones advertising it (and reachable) are
+    #           dialed. A manager thread re-runs discovery every REFRESH_S and reconciles connections, so
+    #           entry nodes joining or leaving the ledger are picked up / dropped without a restart.
+    def __init__(self, xc, account, id_key, local_base, entries=None, discover=None,
+                 self_url='', workers=WORKERS, log=None):
         self.xc = xc
         self.account = account
         self.id_key = id_key
         self.local_base = local_base.rstrip('/')      # e.g. http://127.0.0.1:7401 — our own relay
-        self.entries = [e.rstrip('/') for e in entries if e]
+        self.static = [e.rstrip('/') for e in (entries or []) if e]
+        self.discover = discover
+        self.self_url = (self_url or '').rstrip('/')
         self.workers = workers
         self._log = log or (lambda *a: None)
         self._stop = threading.Event()
-        self._threads = []
+        self._active = {}                             # entry_url -> per-entry stop Event
+        self._lock = threading.Lock()
 
     def public_urls(self):
-        """The addresses to announce on-chain: one per entry node. Any one up == reachable."""
-        return [f'{e}/r/{self.account}' for e in self.entries]
+        """Addresses to announce on-chain: one per CURRENTLY-connected entry. Any one up == reachable."""
+        with self._lock:
+            return [f'{e}/r/{self.account}' for e in sorted(self._active)]
 
     def _sign(self, kind, *extra):
         ts = str(int(time.time()))
@@ -170,19 +182,63 @@ class MeshClient:
         return ts, lines.get('pub', ''), lines.get('sig', '')
 
     def start(self):
-        for entry in self.entries:
-            for i in range(self.workers):
-                t = threading.Thread(target=self._poll_loop, args=(entry, i), daemon=True)
-                t.start()
-                self._threads.append(t)
-        self._log(f'mesh tunnel: dialing {len(self.entries)} entry node(s), {self.workers} workers each')
+        threading.Thread(target=self._manager, daemon=True).start()
 
     def stop(self):
         self._stop.set()
+        with self._lock:
+            for ev in self._active.values():
+                ev.set()
 
-    def _poll_loop(self, entry, worker):
-        backoff = 1.0
+    # -- discovery: which entry nodes to be reachable through right now --
+    def _has_entry_cap(self, url):
+        u = url.rstrip('/')
+        if u == self.self_url:
+            return False
+        try:
+            with urllib.request.urlopen(u + '/relays', timeout=5) as r:
+                d = json.loads(r.read())
+            return ENTRY_CAP in (d.get('caps') or [])
+        except Exception:
+            return False
+
+    def _resolve_targets(self):
+        target = set(self.static)                     # explicit entries: trusted, always on
+        if self.discover is not None:
+            cands = set()
+            try:
+                cands = {u.rstrip('/') for u in (self.discover() or []) if u}
+            except Exception as e:
+                self._log(f'mesh tunnel: discovery error ({e})')
+            for u in cands - target - {self.self_url}:
+                if self._has_entry_cap(u):            # on-chain relay that ADVERTISES it can be an entry node
+                    target.add(u)
+        return target
+
+    def _manager(self):
+        first = True
         while not self._stop.is_set():
+            target = self._resolve_targets()
+            with self._lock:
+                for u in target:
+                    if u not in self._active:
+                        ev = threading.Event()
+                        self._active[u] = ev
+                        for i in range(self.workers):
+                            threading.Thread(target=self._poll_loop, args=(u, i, ev), daemon=True).start()
+                        self._log(f'mesh tunnel: + entry {u}')
+                for u in list(self._active):
+                    if u not in target:              # left the ledger / stopped advertising → drop it
+                        self._active.pop(u).set()
+                        self._log(f'mesh tunnel: - entry {u}')
+                n = len(self._active)
+            if first:
+                self._log(f'mesh tunnel: reachable via {n} entry node(s)'); first = False
+            self._stop.wait(REFRESH_S)
+
+    def _poll_loop(self, entry, worker, entry_stop):
+        backoff = 1.0
+        while not self._stop.is_set() and not entry_stop.is_set():
             try:
                 ts, pub, sig = self._sign('tunnel_poll')
                 url = f'{entry}/_tunnel/poll?account={self.account}&pub={pub}&ts={ts}&sig={sig}'
@@ -195,7 +251,7 @@ class MeshClient:
                     continue                           # no work this round — re-poll immediately
                 self._handle(entry, json.loads(raw))
             except Exception as e:
-                if self._stop.is_set():
+                if self._stop.is_set() or entry_stop.is_set():
                     break
                 # Entry node down/unreachable: back off, but keep trying — the OTHER entries carry us.
                 self._log(f'mesh tunnel: entry {entry} w{worker} error ({e}); retry in {backoff:.0f}s')

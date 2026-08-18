@@ -85,14 +85,23 @@ def main():
         if not (wait_up(A + '/relays') and wait_up(B + '/relays')):
             sys.exit('an entry relay never came up')
 
-        # The home relay dials OUT to both entries; it is reachable to the "public" ONLY through them.
-        procs['H'] = spawn(ph, 'home', {'XC_TUNNEL_ENTRIES': f'{A},{B}'})
+        # ---- 0: entry nodes ADVERTISE the 't1' capability so they can be discovered ----
+        capsA = json.loads(get(A + '/relays')[1].decode()).get('caps', [])
+        capsB = json.loads(get(B + '/relays')[1].decode()).get('caps', [])
+        check('t1' in capsA and 't1' in capsB,
+              "entry nodes advertise the 't1' (mesh-entry) capability on /relays", f'A={capsA} B={capsB}')
+
+        # The home relay DISCOVERS entries on-chain — here seeded with A,B as ledger candidates, which it
+        # probes for 't1' and dials. No hardcoded entry list (XC_TUNNEL_ENTRIES is NOT set).
+        procs['H'] = spawn(ph, 'home', {'XC_TUNNEL_DISCOVER_FROM': f'{A},{B}'})
         if not wait_up(f'http://127.0.0.1:{ph}/relays'):
             sys.exit('the home relay never came up')
 
         home = json.loads(get(f'http://127.0.0.1:{ph}/relays')[1].decode())
         acct = home['account']
         check(bool(acct), 'home relay has a ledger identity to be reached by', home)
+        check('t1' not in home.get('caps', []),
+              "the home relay (a tunnel CLIENT) does NOT advertise 't1' — it can't accept inbound", home.get('caps'))
         print(f'  home account {acct[:22]}…\n')
 
         # ---- 1 & 2: reachable through EACH entry, and answered by the home relay itself ----
