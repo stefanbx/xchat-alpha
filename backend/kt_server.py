@@ -7,7 +7,7 @@
 # Wallet state is namespaced per instance (XC_NS = port): one node = one identity ("run your own node").
 #
 #   python3 kt_server.py 8790            # serve on :8790 (binds 0.0.0.0 so a phone/relay can reach it)
-import os, sys, json, subprocess, urllib.parse, urllib.request, time, threading, queue, base64, hashlib
+import os, sys, json, subprocess, urllib.parse, urllib.request, urllib.error, time, threading, queue, base64, hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -995,10 +995,33 @@ class H(BaseHTTPRequestHandler):
                                      data=(raw if self.command == 'POST' else None),
                                      headers={'Content-Type': 'application/json',
                                               'X-Forwarded-For': client_ip}, method=self.command)
+        # Mesh reverse-tunnel paths behave nothing like a normal relay call: this node fronts its
+        # loopback relay as a mesh ENTRY, so /_tunnel/poll long-polls for work (~POLL_HOLD_S) and
+        # /r/<token> holds the request open while the home relay answers (~PUBLIC_WAIT_S). A 10s cap
+        # would sever the poll; and the mesh client keys on the REAL status (200 vs 504), which the
+        # normal proxy flattens to 200 — so forward status + body faithfully with a generous timeout.
+        p = urllib.parse.urlparse(self.path).path
+        if p.startswith('/_tunnel/') or p.startswith('/r/'):
+            return self._proxy_tunnel(req)
         try:
             self._send(urllib.request.urlopen(req, timeout=10).read())
         except Exception as e:
             self._send(json.dumps({'error': 'relay: ' + str(e)}))
+
+    def _proxy_tunnel(self, req):
+        try:
+            r = urllib.request.urlopen(req, timeout=65)
+            status, body, ctype = r.getcode(), r.read(), r.headers.get('Content-Type', 'application/json')
+        except urllib.error.HTTPError as he:          # a 4xx/5xx from the relay (e.g. 504 no-answer) is a real answer
+            status, body, ctype = he.code, he.read(), he.headers.get('Content-Type', 'application/json')
+        except Exception as e:
+            status, body, ctype = 502, json.dumps({'ok': False, 'error': 'tunnel proxy: ' + str(e)}).encode(), 'application/json'
+        self.send_response(status)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self._write_body(body)
 
     def _handle(self, body, raw=b''):
         u = urllib.parse.urlparse(self.path)
