@@ -51,6 +51,12 @@
 #                                         tailnet, then use this. Unlike the default quick tunnel the
 #                                         name never changes, so it can be announced on-chain, and it
 #                                         is not subject to the quick-tunnel rate limit.
+#   sh install-relay.sh --mesh-tunnel  NO external service at all AND no single point of failure. The
+#                                         relay discovers public xchat entry nodes on the ledger and is
+#                                         reachable through ALL of them at once (a reverse tunnel to each);
+#                                         kill any one and the others carry it. Needs >=1 public relay on
+#                                         the network advertising the 't1' entry capability. No Cloudflare,
+#                                         no localhost.run, no Tailscale, no ssh — just other xchat nodes.
 #   sh install-relay.sh --domain relay.example.com --tunnel-token TOKEN
 #                                         most reliable of all: your own domain over a NAMED Cloudflare
 #                                         tunnel. Unlimited bandwidth, stable name. Needs a domain.
@@ -158,6 +164,7 @@ DOMAIN=''
 TUNNEL_TOKEN=''
 USE_TAILSCALE=0
 USE_LHR=0
+USE_MESH=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --status)          ACTION=status ;;
@@ -179,6 +186,7 @@ while [ $# -gt 0 ]; do
         --tunnel-token=*)  TUNNEL_TOKEN="${1#*=}" ;;
         --tailscale)       USE_TAILSCALE=1 ;;
         --localhost-run)   USE_LHR=1 ;;   # free SSH reverse tunnel, no account, no Cloudflare
+        --mesh-tunnel)     USE_MESH=1 ;;  # reach the net through discovered xchat entry nodes — no external service, no SPOF
         *) die "unknown option: $1  (try --help)" ;;
     esac
     shift
@@ -553,6 +561,7 @@ esac
 # domain, unlimited bandwidth), Tailscale Funnel (free, no domain, stable *.ts.net name), then quick.
 if   [ -n "$DOMAIN" ] && [ -n "$TUNNEL_TOKEN" ]; then MODE=named
 elif [ -n "$DOMAIN" ];                          then MODE=direct
+elif [ "$USE_MESH" = 1 ];                        then MODE=mesh
 elif [ "$USE_TAILSCALE" = 1 ];                  then MODE=tailscale
 elif [ "$USE_LHR" = 1 ];                         then MODE=lhr
 else                                                 MODE=quick
@@ -844,6 +853,9 @@ export XC_WORK_URL="http://127.0.0.1:$WORKD_PORT"   # lets the relay serve /work
 export XC_WORK_BIN="$XC_HOME/bin/nano_work_cl"
 export RELAY_ACCT="$ACCT"
 export BIND_HOST="${XC_BIND:-127.0.0.1}"
+# mesh mode: no third-party tunnel. The relay discovers public entry nodes on-chain and is reachable
+# through all of them at once (no SPOF, no external service). XC_TUNNEL_AUTO turns that on in the relay.
+[ "\$MODE" = mesh ] && export XC_TUNNEL_AUTO=1
 KEEP_AWAKE="${KEEP_AWAKE:-1}"
 EOF
 cat >> "$XC_HOME/run.sh" <<'EOF'
@@ -1208,8 +1220,12 @@ except Exception:
     # the relay stays invisible with only a line in selfannounce.log to say so. Observed on a real
     # operator's chain: twelve check-ins across four restarts, not one URL commit. Same GPU the node
     # uses, same XC_WORK_LOCAL=1 CPU fallback so an announce can never be blocked outright.
+    # mesh mode announces nothing from HERE: there is no single tunnel url — the relay is reachable at
+    # <entry>/r/<account> for each discovered entry, a set known only at runtime, so the relay announces
+    # those urls itself (see MeshClient.public_urls). Announcing the empty ANNOUNCE_URL here would only
+    # publish a dead address.
     RELDIR="$XC_HOME/node/xc_reldir.py"; [ -f "$RELDIR" ] || RELDIR="$XC_HOME/xc_reldir.py"
-    if [ -s "$XC_HOME/operator.seed" ] && [ -f "$RELDIR" ]; then
+    if [ "$MODE" != mesh ] && [ -s "$XC_HOME/operator.seed" ] && [ -f "$RELDIR" ]; then
         ( sleep 25
           XC_RELAY_OPERATOR_SEED="$(cat "$XC_HOME/operator.seed")" NODE_PUBLIC_URL="$ANNOUNCE_URL" \
           XC_WORK="http://127.0.0.1:$WORKD_PORT" XC_WORK_LOCAL=1 \
@@ -1542,6 +1558,10 @@ if [ -n "$URL" ]; then
     else
         warn "the tunnel is up but hasn't answered yet; give it a minute, then: sh ${SELF} --status"
     fi
+elif [ "$MODE" = mesh ]; then
+    ok "mesh mode: reachable through discovered entry nodes — no tunnel, no external service, no single point of failure"
+    say "  It comes online as entry nodes are found on-chain. Needs >=1 public relay advertising 't1'."
+    say "  Check:  sh ${SELF} --status"
 else
     warn "the relay is installed and starting, but it has no public address yet."
     say "  Check again in a minute:  sh ${SELF} --status"

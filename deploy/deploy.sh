@@ -49,6 +49,7 @@ cp backend/*.html deploy/app/ 2>/dev/null || true   # download/landing page serv
 # showing whatever was last set by hand. That is the failure this automation exists to end.
 cp backend/*.json deploy/app/ 2>/dev/null || true
 cp relay/xc_relayd.py deploy/app/
+cp relay/xc_tunnel.py deploy/app/              # mesh reverse-tunnel entry hub (imported by xc_relayd)
 cp relay/install-relay.sh deploy/app/          # served at <node>/relay.sh — the landing page's one-liner
 cp relay/xc_admin.py deploy/app/               # the relay operator's settings page (loopback only)
 # The Flutter web build, served at <node>/chat. It's a build artifact (not in git), so build it first:
