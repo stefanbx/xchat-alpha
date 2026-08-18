@@ -637,6 +637,7 @@ fi
 
 step "downloading the relay"
 fetch "$SRC/relay/xc_relayd.py"    "$XC_HOME/xc_relayd.py"
+fetch "$SRC/relay/xc_tunnel.py"    "$XC_HOME/xc_tunnel.py"   # mesh reverse-tunnel (entry hub + client); xc_relayd imports it
 fetch "$SRC/backend/xc_common.py"  "$XC_HOME/xc_common.py"
 fetch "$SRC/relay/xc_admin.py"     "$XC_HOME/xc_admin.py"
 fetch "$SRC/backend/xc_workd.py"   "$XC_HOME/xc_workd.py"
