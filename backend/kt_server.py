@@ -626,12 +626,30 @@ def _work_mode():
     _work_mode_cache[0] = now; _work_mode_cache[1] = mode
     return mode
 
-def api_status():
+_status_cache = {'ts': 0.0, 'height': '0', 'work': 'rpc'}
+_status_lock = threading.Lock()
+
+def _status_refresh():
+    # Height + work-mode for the status line, refreshed OFF the request path. block_count is a public-RPC
+    # call; doing it inline made /api/status — which is ALSO the Fly health check — block on a slow/down
+    # RPC, fail the check, and take the whole node offline (a public RPC's latency must never do that).
     try:
-        bc = xc.rpc_cached({'action': 'block_count'}, ttl=10)  # chain height for display; 10s stale is invisible
-        return json.dumps({'online': True, 'height': bc.get('count', '0'), 'work': _work_mode()})
+        bc = xc.rpc_cached({'action': 'block_count'}, ttl=10)
+        with _status_lock:
+            _status_cache['height'] = bc.get('count', _status_cache['height'])
+            _status_cache['work'] = _work_mode()
+            _status_cache['ts'] = time.time()
     except Exception:
-        return '{"online":false}'
+        pass
+
+def api_status():
+    # MUST be instant and never block: the process being able to answer IS the health signal. Serve the
+    # last-known height and kick a background refresh when it goes stale — never wait on the RPC here.
+    with _status_lock:
+        st = dict(_status_cache)
+    if time.time() - st['ts'] > 10:
+        threading.Thread(target=_status_refresh, daemon=True).start()
+    return json.dumps({'online': True, 'height': st['height'], 'work': st['work']})
 
 # ---- PUSH DELIVERY -----------------------------------------------------------------------------
 # A DM used to arrive when the recipient next got round to asking: a 5s poll inside a thread, 12s for
