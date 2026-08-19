@@ -509,6 +509,23 @@ def _evict_locked():                 # called with _blob_lock held; drops least-
         _db.execute('DELETE FROM blob WHERE cid=?', (c,))
         blob_meta.pop(c, None)
 
+def evict_sweep():
+    # Eviction used to run ONLY on a blob PUT, so a relay that stopped receiving writes could sit ABOVE
+    # its cap indefinitely — exactly how a box whose XC_BLOB_CAP_MB was lowered stayed full of stale
+    # content (e.g. 20 old release APKs) until the next upload happened to trigger _evict_locked. Enforce
+    # the cap on a timer too, so the store converges down to the cap regardless of write traffic. Cheap:
+    # _evict_locked returns immediately when already under cap. XC_EVICT_SWEEP_S<=0 disables it.
+    if EVICT_SWEEP_S <= 0:
+        return
+    while True:
+        time.sleep(EVICT_SWEEP_S)
+        try:
+            with _blob_lock:
+                _evict_locked()
+                _db.commit()
+        except Exception:
+            pass
+
 def blob_load_meta():                # startup: rebuild the small RAM index from the SQLite table
     with _blob_lock:
         for cid, size, last, tips in _db.execute('SELECT cid,size,last,tips FROM blob'):
@@ -521,6 +538,7 @@ def blob_load_meta():                # startup: rebuild the small RAM index from
 # It runs under _blob_lock (the single serialiser for this connection) so it can't race a writer,
 # and every failure is swallowed: a checkpoint is best-effort housekeeping, never worth a crash.
 WAL_CHECKPOINT_S = float(os.environ.get('XC_WAL_CHECKPOINT_S', '300'))   # 0/negative disables the routine
+EVICT_SWEEP_S    = int(os.environ.get('XC_EVICT_SWEEP_S', '300'))         # enforce the blob cap on a timer, not only on writes
 
 def _wal_checkpoint():
     while True:
@@ -573,6 +591,13 @@ def reconcile_release_pins():
     # Enforce the newest-N pin window: UNPIN any older release cid so its bytes become evictable under
     # disk pressure (the record stays; the bytes are re-fetchable from IPFS/peers). Never touches a
     # PAID pin (pins_paid) — a user who paid to keep a cid owns that pin regardless of release status.
+    #
+    # RETENTION: unpinning alone left the bytes resident until cap pressure — which on a big-cap relay
+    # never comes, so it hoarded every build it ever synced (20+ old APKs, hundreds of MB). A superseded
+    # self-update binary is dead weight: the app only ever updates to the NEWEST release, and the bytes
+    # stay re-fetchable from IPFS/peers if ever needed. So actively DROP our copy when a release falls out
+    # of the window — unless placement makes us a responsible holder of that cid (then we keep it, and
+    # shard_repair would just pull it back anyway) or a user paid to pin it.
     keep = _release_pin_cids()
     paid = set(pins_paid.values())
     for _pub, lst in list(releases.items()):
@@ -580,8 +605,15 @@ def reconcile_release_pins():
             continue
         for rec in lst:
             c = (rec or {}).get('cid')
-            if c and c not in keep and c not in paid and pinned.get(c):
-                pinned.pop(c, None)          # release pin lifted; falls back to normal cache eviction
+            if not c or c in keep or c in paid:
+                continue
+            if pinned.get(c):
+                pinned.pop(c, None)          # release pin lifted
+            if c in blob_meta and not _responsible(c):
+                with _blob_lock:
+                    if c in blob_meta:       # re-check under lock
+                        _db.execute('DELETE FROM blob WHERE cid=?', (c,)); _db.commit()
+                        blob_meta.pop(c, None)
     return keep
 
 def sync_release_blobs():
@@ -1904,6 +1936,7 @@ threading.Thread(target=sync_release_blobs, daemon=True).start()   # catch up on
 threading.Thread(target=probe_peers, daemon=True).start()          # forget dead relay urls; re-announce ours
 threading.Thread(target=shard_repair, daemon=True).start()         # pull the share of blobs we're placed on
 threading.Thread(target=mesh_discover, daemon=True).start()        # find public mesh nodes through hubs → mesh tier
+threading.Thread(target=evict_sweep, daemon=True).start()          # enforce the blob cap on a timer, not only on writes
 
 # Mesh reverse-tunnel CLIENT. A relay behind NAT dials OUT to public entry nodes and serves itself
 # through all of them at once — kill any one and the others carry it (no SPOF, no external service).
