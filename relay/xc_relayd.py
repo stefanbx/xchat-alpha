@@ -117,6 +117,12 @@ known = {SELF}                       # relays this relay knows about (flat URL s
 # path here — and every already-deployed relay — still reads.
 peers_by_acct = {}                   # relay account -> {'url', 'ts', 'pub', 'sig'} (signed, relayable)
 relay_health = {}                    # url -> {'fail': consecutive probe failures, 'ok': last success ts}
+# A signed record carries a FIXED timestamp and is relayable by any peer, so a dead relay's last
+# announce keeps circulating forever: whichever peer hasn't forgotten it yet re-teaches it to one that
+# just did. Forgetting must therefore leave a mark. `dead_until` is that mark — a url the prober proved
+# unreachable is refused (not re-learned, not served) until the tombstone lapses or a NEWER signed
+# self-announce (a genuine comeback) supersedes it. Without it, pruning is undone the same cycle it runs.
+dead_until = {}                      # url -> ts before which we refuse to (re)learn or serve it
 _probe_cursor = 0                    # rotates the probe window through `known` across cycles
 
 def head_score(author, h):
@@ -177,6 +183,11 @@ SHARD_PULL_MAX  = int(os.environ.get('XC_SHARD_PULL_MAX', '40'))     # blobs fet
 RELAY_PROBE_SEC = int(os.environ.get('XC_RELAY_PROBE_SEC', '300'))   # how often to re-check known relays
 RELAY_FAIL_MAX  = int(os.environ.get('XC_RELAY_FAIL_MAX', '5'))      # consecutive probe failures -> forget it
 ANNOUNCE_SKEW   = int(os.environ.get('XC_ANNOUNCE_SKEW', '3600'))    # reject announces dated this far ahead
+# A live relay re-announces itself with a FRESH timestamp every probe cycle (gossip_out below), so its
+# record never ages out. A dead one stops minting timestamps, so its last record — and the url tombstone
+# from probing it — expires after this window and it drops out of the set for good. Must be a wide
+# multiple of RELAY_PROBE_SEC so a healthy relay is never expired between re-announces (12x by default).
+RELAY_TTL       = int(os.environ.get('XC_RELAY_TTL', '3600'))        # signed record / tombstone lifetime (s)
 # Both of these are per-cycle BUDGETS, not "everything we know". Probing every known relay each cycle
 # is O(N) 4-second timeouts (a full pass over a large set would outrun the interval and pile up), and
 # announcing to all of them is O(N²) chatter across the network. Rotate through instead.
@@ -965,9 +976,12 @@ def announce_self():
     return body
 
 def _forget(u):
-    # Unconditional: only the prober calls this, and only about a url that failed for real.
+    # Only the prober / cap-eviction calls this, and only about a url that failed for real. Leave a
+    # tombstone so a peer that still holds this url's stale record can't hand it straight back to us.
     known.discard(u)
     relay_health.pop(u, None)
+    if u != SELF and u not in BOOTSTRAPS:
+        dead_until[u] = time.time() + RELAY_TTL
     for a, v in list(peers_by_acct.items()):
         if v.get('url') == u:
             peers_by_acct.pop(a, None)
@@ -1011,18 +1025,30 @@ def learn_peer(m):
     # Known peers still get updates (e.g. a signed address change) so we never strand an existing peer.
     if not OPEN_ANNOUNCE and u not in known and u not in BOOTSTRAPS and m.get('account') not in peers_by_acct:
         return False
+    now = time.time()
+    if dead_until.get(u, 0) <= now:
+        dead_until.pop(u, None)                            # tombstone lapsed — a fresh attempt is allowed
     acct, pub, sig = m.get('account', ''), m.get('pub', ''), m.get('sig', '')
     try:
         ts = int(m.get('ts', 0) or 0)
     except Exception:
         ts = 0
     signed = False
-    if acct and pub and sig and xc is not None and ts <= time.time() + ANNOUNCE_SKEW:
+    if acct and pub and sig and xc is not None and now - RELAY_TTL <= ts <= now + ANNOUNCE_SKEW:
         try:
             signed = (xc.pub_to_addr(pub) == acct
                       and xc.verify_msg(pub, _announce_canon(acct, u, ts), sig))
         except Exception:
             signed = False
+    # A live tombstone blocks re-learning — unless a valid self-announce minted AFTER we declared the url
+    # dead proves the relay is genuinely back (the old record still circulating carries an older ts and
+    # cannot clear it). This is the one path that revives a tombstoned url.
+    du = dead_until.get(u, 0)
+    if du:
+        if signed and ts >= du - RELAY_TTL:
+            dead_until.pop(u, None)
+        else:
+            return False
     if not signed:
         return _add_known(u)                               # legacy/anonymous: a bare url, as before
     cur = peers_by_acct.get(acct)
@@ -1038,8 +1064,16 @@ def learn_peer(m):
     return True
 
 def signed_peers():
+    # Never relay a record that has aged past its freshness window — otherwise this relay becomes the
+    # source that keeps a dead peer alive for everyone else.
+    stale = time.time() - RELAY_TTL
     return [{'account': a, 'url': v['url'], 'ts': v['ts'], 'pub': v['pub'], 'sig': v['sig']}
-            for a, v in list(peers_by_acct.items())]
+            for a, v in list(peers_by_acct.items()) if v.get('ts', 0) >= stale]
+
+def _serve_relays():
+    # The flat url list we advertise: everything we know, minus anything currently tombstoned as dead.
+    now = time.time()
+    return sorted(u for u in known if dead_until.get(u, 0) <= now)
 
 def _pull_relays(url):
     d = json.loads(urllib.request.urlopen(url + '/relays', timeout=3).read())
@@ -1080,6 +1114,14 @@ def probe_peers():
     while True:
         time.sleep(RELAY_PROBE_SEC)
         try:
+            now = time.time()
+            for a, v in list(peers_by_acct.items()):       # drop signed records that aged out (dead relays
+                if v.get('ts', 0) < now - RELAY_TTL and \
+                   relay_health.get(v['url'], {}).get('ok', 0) < now - RELAY_TTL:  # and not answering probes
+                    _forget(v['url'])                       # (live ones refresh their ts / pass probes each cycle)
+            for u, du in list(dead_until.items()):          # let lapsed tombstones go so a recovered relay
+                if du <= now:                               # can be re-learned and re-probed from scratch
+                    dead_until.pop(u, None)
             allk = sorted(u for u in known if u != SELF and u not in BOOTSTRAPS)
             if allk:                                       # rotate a fixed-size window through the set
                 _probe_cursor %= len(allk)
@@ -1257,7 +1299,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/relays'):
             # 'relays' stays the flat url list every deployed relay and the node already parse;
             # 'peers' carries the signed identity records, ignored by anything that doesn't know them.
-            self._send(200, json.dumps({'relay': PORT, 'relays': sorted(known),
+            self._send(200, json.dumps({'relay': PORT, 'relays': _serve_relays(),
                                         'account': ID_ACCT, 'peers': signed_peers(),
                                         'caps': relay_caps(), 'open_announce': OPEN_ANNOUNCE}))
         elif self.path.startswith('/notify'):
@@ -1456,7 +1498,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path.startswith('/relay_announce'):
             try:
                 learn_peer(json.loads(raw) or {})
-                self._send(200, json.dumps({'ok': True, 'relays': sorted(known),
+                self._send(200, json.dumps({'ok': True, 'relays': _serve_relays(),
                                             'account': ID_ACCT, 'peers': signed_peers()}))
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
