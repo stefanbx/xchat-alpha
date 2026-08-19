@@ -295,6 +295,7 @@ class Settings {
   bool forYouBoostFollows;  // boost posts from people you follow
   bool autoSweep;           // auto-forward balance above the safety cap to a savings address
   String sweepAddr;         // the external savings address (this app holds no key for it)
+  int feedCacheSize;        // max posts kept on-device; the feed loads from here + fetches only new
   Settings({
     this.defaultTip = 0.01,
     this.relaySplit = 10,
@@ -310,6 +311,7 @@ class Settings {
     this.forYouBoostFollows = true,
     this.autoSweep = false,
     this.sweepAddr = '',
+    this.feedCacheSize = 300,
   });
   int get creatorSplit => 100 - relaySplit - reposterSplit;
 }
@@ -336,6 +338,7 @@ class SettingsStore {
         forYouBoostFollows: m['forYouBoostFollows'] ?? true,
         autoSweep: m['autoSweep'] ?? false,
         sweepAddr: m['sweepAddr'] ?? '',
+        feedCacheSize: (m['feedCacheSize'] as num?)?.toInt() ?? 300,
       );
     } catch (_) {
       return Settings();
@@ -360,6 +363,7 @@ class SettingsStore {
           'forYouBoostFollows': s.forYouBoostFollows,
           'autoSweep': s.autoSweep,
           'sweepAddr': s.sweepAddr,
+          'feedCacheSize': s.feedCacheSize,
         }));
   }
 }
@@ -1204,6 +1208,19 @@ class Post {
         replyTo: j['reply_to'],
         poll: (j['poll']?['options'] as List?)?.map((e) => '$e').toList(),
       );
+  // Round-trips through fromJson (same keys) for the on-device feed cache. Runtime-only fields
+  // (liked/localLikes/pending) are intentionally not persisted — engagement counts refresh on load.
+  Map<String, dynamic> toJson() => {
+        'id': id, 'handle': handle, 'account': account, 'kind': kind, 'text': text,
+        if (title != null) 'title': title,
+        if (media != null) 'media': media,
+        if (thumb != null) 'thumb': thumb,
+        if (dur != null) 'dur': dur,
+        'ts': ts, 'likes': likes, 'reposts': reposts,
+        if (quote != null) 'quote': quote,
+        if (replyTo != null) 'reply_to': replyTo,
+        if (poll != null) 'poll': {'options': poll},
+      };
 }
 
 // a moderation labeler: on-chain identity, reputation (Nano voting weight),
@@ -1267,16 +1284,10 @@ class Api {
     final d = jsonDecode(r.body);
     final c = d['content'] ?? {};
     final posts = (c['posts'] as List?) ?? [];
-    // Cache the last FULL feed that actually has content, so a cold-node blip (a machine just restarted
-    // and its feed cache is still warming) or an offline launch shows the last feed instead of blanking.
     feedHasMore = c['more'] == true;
-    // Only the FIRST page is cached. Caching a later page would replace the cold-start feed with a
-    // slice from the middle of the timeline, so the next launch would open on old posts.
-    if (since == 0 && before == 0 && posts.isNotEmpty) {
-      try {
-        (await SharedPreferences.getInstance()).setString('xchat_feed_cache', r.body);
-      } catch (_) {}
-    }
+    // Persistence of the feed is owned by the feed screen now (loadCachedPosts/saveCachedPosts below):
+    // it keeps a bounded, merged set across launches and fetches only what's new, instead of this
+    // caching a single full-page snapshot that the next launch threw away.
     return FeedData(
         posts.map((p) => Post.fromJson(p)).toList(),
         (d['onchain_blocks'] ?? 0) as int,
@@ -1284,19 +1295,34 @@ class Api {
         (c['relays_total'] ?? 0) as int);
   }
 
-  static Future<FeedData?> cachedFeed() async {
+  // ---- on-device feed cache: a bounded, persisted set of posts -----------------------------------
+  // The feed loads from here INSTANTLY on launch (no blank frame, no full re-download), then fetches
+  // only posts newer than the newest cached one. The set is capped to the user's feedCacheSize and
+  // trimmed oldest-first on save — the same idea as a relay bounding its own store rather than keeping
+  // every post forever.
+  static const _feedCacheKey = 'xchat_feed_posts';
+
+  static Future<List<Post>> loadCachedPosts() async {
     try {
-      final s = (await SharedPreferences.getInstance()).getString('xchat_feed_cache');
-      if (s == null || s.isEmpty) return null;
-      final d = jsonDecode(s);
-      final c = d['content'] ?? {};
-      final posts = (c['posts'] as List?) ?? [];
-      if (posts.isEmpty) return null;
-      return FeedData(posts.map((p) => Post.fromJson(p)).toList(), (d['onchain_blocks'] ?? 0) as int,
-          (c['relays_up'] ?? 0) as int, (c['relays_total'] ?? 0) as int);
+      final s = (await SharedPreferences.getInstance()).getString(_feedCacheKey);
+      if (s == null || s.isEmpty) return [];
+      final list = (jsonDecode(s) as List)
+          .map((e) => Post.fromJson(e as Map<String, dynamic>))
+          .toList();
+      list.sort((a, b) => b.ts.compareTo(a.ts));   // newest first, ready to render
+      return list;
     } catch (_) {
-      return null;
+      return [];
     }
+  }
+
+  static Future<void> saveCachedPosts(List<Post> posts, int cap) async {
+    try {
+      final sorted = [...posts]..sort((a, b) => b.ts.compareTo(a.ts));
+      final capped = (cap > 0 && sorted.length > cap) ? sorted.sublist(0, cap) : sorted;
+      await (await SharedPreferences.getInstance())
+          .setString(_feedCacheKey, jsonEncode(capped.map((p) => p.toJson()).toList()));
+    } catch (_) {}
   }
 
   // settle the batched off-chain tip tally. The tip is SPLIT immutably on-chain: the creator gets
@@ -3155,6 +3181,12 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     return t;
   }
 
+  // Persist the shown timeline to the on-device cache, bounded to the user's feedCacheSize. Fire-and-
+  // forget: a cache write must never block the UI. Called after any change to _posts.
+  void _persistFeed() {
+    Api.saveCachedPosts(_posts, _settings.feedCacheSize);
+  }
+
   // A lightweight, silent poll. It fetches ONLY posts newer than we already have (incremental), holds
   // them in a buffer surfaced by a "new posts" pill instead of injecting them live (so the reader's
   // scroll never jumps), and updates engagement counts in place. The timeline itself is never
@@ -3190,7 +3222,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
           _newPosts.removeWhere((p) => !live.contains(p.id));
         }
       });
-      if (reconcile) _refreshLabels();   // pick up others' community reports for the shield filter
+      if (reconcile) { _refreshLabels(); _persistFeed(); }   // reports for the shield filter; cache the reconciled set
       if (!mounted) return;
       setState(() {
         if (fresh.isNotEmpty) {
@@ -3210,6 +3242,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         ..sort((a, b) => b.ts.compareTo(a.ts));
       _newPosts.clear();
     });
+    _persistFeed();   // the merged-in new posts are now part of the timeline — cache them
     if (_scroll.hasClients) {
       _scroll.animateTo(0, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
     }
@@ -5748,6 +5781,16 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                 onTap: () { Navigator.pop(ctx); _showMutedBlocked(); },
               ),
 
+              section('Feed cache'),
+              const Text('How many posts to keep on this device. The feed opens instantly from here on '
+                  'launch and then fetches only what\'s new — older posts beyond this are dropped, like a '
+                  'relay bounding its own store instead of keeping everything forever.',
+                  style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+              const SizedBox(height: 8),
+              Wrap(spacing: 8, children: [100, 300, 500, 1000, 2000].map((n) =>
+                  chip('$n posts', _settings.feedCacheSize == n,
+                      () { _settings.feedCacheSize = n; _persistFeed(); })).toList()),
+
               section('Connection'),
               const Text('The relay/engine this app talks to. Point it at a hosted node (e.g. a Fly.io '
                   'relay) so a phone and an emulator can share one network.', style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
@@ -6317,30 +6360,44 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       _loading = true;
       _error = null;
     });
-    // Cold start: paint the last cached feed immediately so the first frame isn't blank while we fetch.
+    // Cold start: paint the PERSISTED feed immediately (instant, no network), then below fetch ONLY
+    // posts newer than the newest cached one and MERGE — instead of re-downloading the first page on
+    // every launch and throwing the cache away.
     if (_posts.isEmpty) {
-      final cached = await Api.cachedFeed();
-      if (cached != null && mounted && _posts.isEmpty) {
-        setState(() {
-          _posts = cached.posts;
-          _relaysUp = cached.relaysUp;
-          _relaysTotal = cached.relaysTotal;
-        });
+      final cached = await Api.loadCachedPosts();
+      if (cached.isNotEmpty && mounted && _posts.isEmpty) {
+        setState(() => _posts = cached);
       }
     }
     try {
-      // Slim launch: fetch ONLY what the first paint needs — the feed, identity, and moderation labels
-      // (3 requests, not 5). Notifications + engagement counts aren't needed to render the feed, so they
-      // load just after (see _loadSecondary) — a lighter startup burst and a faster first frame.
-      final results = await Future.wait([Api.feed(limit: _pageSize), Api.me(), Api.labels()]);
+      // Slim launch: fetch ONLY what the first paint needs — the feed, identity, and moderation labels.
+      // With a warm cache the feed fetch is INCREMENTAL (since = newest we already hold), so a relaunch
+      // pulls just the new posts; an empty cache (first run) fetches the first page. Notifications +
+      // engagement counts load just after (see _loadSecondary) — a lighter startup burst.
+      final haveTs = _newestTs();
+      final incremental = _posts.isNotEmpty && haveTs > 0;
+      final results = await Future.wait([
+        incremental ? Api.feed(since: haveTs - 1) : Api.feed(limit: _pageSize),
+        Api.me(),
+        Api.labels(),
+      ]);
       final fd = results[0] as FeedData;
       final me = results[1] as Map<String, dynamic>;
       final labelers = results[2] as List<Labeler>;
       setState(() {
-        // Never blank a good feed with a momentarily-empty one (e.g. a just-restarted node whose feed
-        // cache is still warming). Only replace when the fetch has posts, or we truly had none.
-        if (fd.posts.isNotEmpty || _posts.isEmpty) _posts = fd.posts;
-        _newPosts.clear();                    // a full refresh already includes everything
+        if (incremental) {
+          // MERGE new posts into the persisted timeline (dedupe by id) — never replace what we cached.
+          final seen = _posts.map((p) => p.id).toSet();
+          final fresh = fd.posts.where((p) => !seen.contains(p.id)).toList();
+          if (fresh.isNotEmpty) {
+            _posts = [...fresh, ..._posts]..sort((a, b) => b.ts.compareTo(a.ts));
+          }
+        } else {
+          // First run / empty cache. Never blank a good feed with a momentarily-empty one (e.g. a
+          // just-restarted node whose feed cache is still warming).
+          if (fd.posts.isNotEmpty || _posts.isEmpty) _posts = fd.posts;
+        }
+        _newPosts.clear();
         // (fd.onchainBlocks is always 0 — the feed is off-chain. The header's "Nano txns" count comes
         //  from the user's own on-chain block count instead; see _refreshTxCount.)
         if (fd.posts.isNotEmpty) {
@@ -6353,6 +6410,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         _labelers = labelers;
         _loading = false;
       });
+      _persistFeed();   // keep the on-device cache current, bounded to feedCacheSize
       _syncSupporter(); // reflect current supporter state now that the account is known
       _initProfile();   // pull our own profile (name/avatar) into the cache
       _refreshTxCount(); // header "Nano txns" = your on-chain block count (now the account is known)
