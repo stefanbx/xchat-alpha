@@ -116,6 +116,9 @@ class EntryHub:
         self._q = {}                 # token -> Queue of pending framed items
         self._inflight = {}          # reqid -> {'event','holder','token'}
         self._seen = {}              # token -> last-poll monotonic ts (observability / "who's connected")
+        self._public = {}            # token -> last-poll ts, but ONLY for nodes that asked to be listed
+                                     # publicly (opt-in, `--public`). Discovery reads this; a private node
+                                     # never appears here, so it stays reachable-by-secret only.
         self._lock = threading.Lock()
         self._pruned = 0.0           # last registry sweep (monotonic)
 
@@ -131,6 +134,7 @@ class EntryHub:
         dead = [t for t, seen in self._seen.items() if now - seen > POLL_HOLD_S * 2]
         for t in dead:
             self._seen.pop(t, None)
+            self._public.pop(t, None)                 # a node that stopped polling drops off discovery too
             q = self._q.get(t)
             if q is not None and q.empty():
                 self._q.pop(t, None)
@@ -187,12 +191,19 @@ class EntryHub:
         return st, hdrs, base64.b64decode(body_b64 or '')
 
     # -- called by the entry node's /_tunnel/poll handler (long-poll for work) --
-    def poll(self, token, ts, sig):
-        """Return one framed request as a JSON string, or None on 204/timeout. Raises PermissionError on bad auth."""
+    def poll(self, token, ts, sig, public=False):
+        """Return one framed request as a JSON string, or None on 204/timeout. Raises PermissionError on bad auth.
+        `public` (opt-in per poll) marks this token as discoverable — the node asked to be listed. It rides
+        the already-authenticated poll (only the token key holder can poll), so no separate signature."""
         if not self._auth('tunnel_poll', token, ts, sig):
             raise PermissionError('tunnel: bad poll signature')
         with self._lock:                              # (not held during the blocking get below)
-            self._seen[token] = time.monotonic()
+            now = time.monotonic()
+            self._seen[token] = now
+            if public:
+                self._public[token] = now
+            else:
+                self._public.pop(token, None)         # a node can go private again by dropping the flag
             self._prune()
         try:
             return self._queue_for(token).get(timeout=POLL_HOLD_S)
@@ -217,6 +228,13 @@ class EntryHub:
         now = time.monotonic()
         return sorted(t for t, seen in self._seen.items() if now - seen < POLL_HOLD_S * 2)
 
+    def public_nodes(self):
+        """The routing tokens of currently-connected nodes that opted into public discovery. A client
+        reaches each at <this-hub>/r/<token>/... — no secret, no ledger. Freshness-bounded like _seen so
+        a node that left disappears within ~2 poll holds."""
+        now = time.monotonic()
+        return sorted(t for t, seen in self._public.items() if now - seen < POLL_HOLD_S * 2)
+
 
 # ============================= CLIENT SIDE (runs on the home relay) =================================
 # Dial OUT to each entry node under the CURRENT and NEXT epoch's token, run WORKERS parallel poll loops
@@ -232,7 +250,7 @@ class MeshClient:
     #           PROBED for the ENTRY_CAP on /relays and only the ones advertising it (and reachable) are
     #           dialed.
     def __init__(self, xc, secret, local_base, entries=None, discover=None,
-                 self_url='', workers=WORKERS, log=None):
+                 self_url='', workers=WORKERS, log=None, public=False):
         self.xc = xc
         self.secret = secret
         self.local_base = local_base.rstrip('/')      # e.g. http://127.0.0.1:7401 — our own relay
@@ -240,6 +258,10 @@ class MeshClient:
         self.discover = discover
         self.self_url = (self_url or '').rstrip('/')
         self.workers = workers
+        # public: ask every entry to LIST this node for discovery, so apps reach it with no secret. Off by
+        # default — a node is private-by-secret unless its operator opts in (`--public`). Trades the node's
+        # anonymity (its account↔hub link becomes visible) for zero-config reachability.
+        self.public = bool(public)
         self._log = log or (lambda *a: None)
         self._stop = threading.Event()
         self._active = {}                             # (entry_url, epoch) -> per-loop stop Event
@@ -331,6 +353,8 @@ class MeshClient:
             try:
                 ts, sig = self._sign(token_sk, 'tunnel_poll', entry_id)
                 url = f'{entry}/_tunnel/poll?token={token_pub}&ts={ts}&sig={sig}'
+                if self.public:
+                    url += '&public=1'                # opt into discovery on this entry (see EntryHub.poll)
                 req = urllib.request.Request(url)
                 with urllib.request.urlopen(req, timeout=POLL_HOLD_S + 10) as r:
                     code = r.getcode()

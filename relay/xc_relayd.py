@@ -30,6 +30,14 @@ if os.path.exists(_tp):
         xc_tunnel = None
 
 PORT = int(sys.argv[1]); STORE = sys.argv[2]
+# Relay build version. Kept in lockstep with the app (app/pubspec.yaml `version: X.Y.Z+CODE`), so a
+# relay and the app it serves report the same release. The deploy may override via XC_RELAY_VERSION /
+# XC_RELAY_VCODE (e.g. stamped from pubspec at build time); the literals are the fallback when unset.
+RELAY_VERSION = os.environ.get('XC_RELAY_VERSION', '2.5.3')
+try:
+    RELAY_VCODE = int(os.environ.get('XC_RELAY_VCODE', '22503'))
+except Exception:
+    RELAY_VCODE = 22503
 BIND = os.environ.get('BIND_HOST', '127.0.0.1')      # '0.0.0.0' when hosted (Fly.io)
 # public URL other nodes reach this relay at; defaults to loopback for local runs
 SELF = os.environ.get('RELAY_PUBLIC_URL', f'http://127.0.0.1:{PORT}')
@@ -116,6 +124,11 @@ known = {SELF}                       # relays this relay knows about (flat URL s
 # so a restart REPLACES its entry instead of adding one. `known` stays the flat set every other code
 # path here — and every already-deployed relay — still reads.
 peers_by_acct = {}                   # relay account -> {'url', 'ts', 'pub', 'sig'} (signed, relayable)
+# Public MESH nodes discovered through hubs (see mesh_discover). Keyed by the node's stable account;
+# `urls` is its CURRENT reach set — one <hub>/r/<token> per hub it dials — refreshed each sweep because
+# the token rotates per epoch. Kept SEPARATE from peers_by_acct so the two tiers can be placed against
+# independently (hybrid placement) and so their rotating, unsigned reach urls never pollute gossip.
+mesh_peers = {}                      # account -> {'urls': [reach_url, ...], 'last': monotonic ts}
 relay_health = {}                    # url -> {'fail': consecutive probe failures, 'ok': last success ts}
 # A signed record carries a FIXED timestamp and is relayable by any peer, so a dead relay's last
 # announce keeps circulating forever: whichever peer hasn't forgotten it yet re-teaches it to one that
@@ -177,7 +190,15 @@ RESHARERS_MAX   = int(os.environ.get('XC_RESHARERS_MAX', '1000'))    # resharers
 KNOWN_MAX       = int(os.environ.get('XC_KNOWN_MAX', '10000'))       # distinct relay URLs gossiped
 WORK_URL        = os.environ.get('XC_WORK_URL', '').rstrip('/')      # xc_workd behind /work (empty = off)
 WORK_TIMEOUT    = int(os.environ.get('XC_WORK_TIMEOUT', '30'))       # cap a single work request
-BLOB_REPLICAS   = int(os.environ.get('XC_BLOB_REPLICAS', '3'))       # target copies of a blob network-wide
+BLOB_REPLICAS   = int(os.environ.get('XC_BLOB_REPLICAS', '3'))       # target copies (single-tier / small net)
+# HYBRID PLACEMENT: durable copies on STABLE relays (public, ledger-reachable, hub-independent) + extra
+# copies on MESH nodes (flakier home boxes) for capacity/read-spread. Each blob is placed within each
+# tier independently by rendezvous hash, so losing every hub only sheds the mesh tier — the durable
+# copies on stable relays are reached directly and keep the data alive.
+STABLE_REPLICAS = int(os.environ.get('XC_STABLE_REPLICAS', '2'))     # durable copies on public relays
+MESH_REPLICAS   = int(os.environ.get('XC_MESH_REPLICAS', '2'))       # capacity copies on mesh nodes
+MESH_DISCOVER_S = int(os.environ.get('XC_MESH_DISCOVER_S', '120'))   # how often a relay sweeps hubs for public nodes
+MESH_PEERS_MAX  = int(os.environ.get('XC_MESH_PEERS_MAX', '2000'))    # cap public mesh nodes taken from one hub
 SHARD_REPAIR_S  = int(os.environ.get('XC_SHARD_REPAIR_S', '900'))    # how often to pull our missing share
 SHARD_PULL_MAX  = int(os.environ.get('XC_SHARD_PULL_MAX', '40'))     # blobs fetched per repair cycle
 RELAY_PROBE_SEC = int(os.environ.get('XC_RELAY_PROBE_SEC', '300'))   # how often to re-check known relays
@@ -423,27 +444,30 @@ def blob_touch(cid):                 # a read counts as use; RAM-only (avoids a 
     if m:
         m['last'] = time.time()
 
-def _shard_relays():
-    # Identities eligible to hold a share: us, plus every peer that has proved an identity. URL-only
-    # (legacy) peers can't be placed against, so they simply don't participate in placement.
-    out = [ID_ACCT] if ID_ACCT else []
-    out.extend(peers_by_acct.keys())
-    return out
+def _am_mesh():
+    # This relay's own tier: a mesh node dials out (a tunnel CLIENT, no address of its own); anything
+    # else is a stable, directly-reachable relay. Set at startup (bottom of file).
+    return bool(globals().get('_MESH_CLIENT', False))
 
-def _responsible(cid, accts=None):
-    # RENDEZVOUS ("highest random weight") HASHING. Every relay independently computes the same
-    # ranking of relays for a given cid and keeps it only if it lands in the top BLOB_REPLICAS. No
-    # coordinator, no directory, no agreement protocol — just a hash — which is the only kind of
-    # placement that fits a network where anyone can join and nobody is in charge.
-    #
-    # This exists because the old policy was BOTH wasteful and lossy: the node pushes every blob to
-    # every relay, and eviction ranked by blob_score, which is identical everywhere — so all relays
-    # evicted the SAME victims at the same time. Popular media sat on N relays while unpopular media
-    # dropped to zero copies network-wide. Placement fixes both ends: ~BLOB_REPLICAS copies of
-    # everything instead of N copies of some things and none of the rest.
-    accts = accts if accts is not None else _shard_relays()
-    if not ID_ACCT or len(accts) <= BLOB_REPLICAS:
-        return True                                          # small network: everyone holds everything
+def _placement_sets():
+    # The two placement tiers, each a list of accounts we rank within. We add OUR OWN account to our own
+    # tier so we rank consistently with how every peer ranks us. STABLE = signed gossip peers (public,
+    # ledger-reachable); MESH = public nodes discovered through hubs. A peer with no proved identity
+    # (legacy url-only) can't be placed against and simply doesn't participate.
+    stable = list(peers_by_acct.keys())
+    mesh = list(mesh_peers.keys())
+    if ID_ACCT:
+        (mesh if _am_mesh() else stable).append(ID_ACCT)
+    return stable, mesh
+
+def _in_top_k(cid, accts, k):
+    # RENDEZVOUS ("highest random weight") HASHING within one tier: is OUR account among the top-k for
+    # this cid? Every relay computes the identical ranking from the same hash — no coordinator, no
+    # directory, no agreement protocol. k or fewer members ⇒ everyone in the tier holds everything.
+    if not ID_ACCT or ID_ACCT not in accts:
+        return False
+    if len(accts) <= k:
+        return True
     def weight(a):
         return hashlib.blake2b((cid + '|' + a).encode(), digest_size=8).digest()
     mine = weight(ID_ACCT)
@@ -451,21 +475,31 @@ def _responsible(cid, accts=None):
     for a in accts:
         if a != ID_ACCT and weight(a) > mine:
             ahead += 1
-            if ahead >= BLOB_REPLICAS:
+            if ahead >= k:
                 return False
     return True
+
+def _responsible(cid, sets=None):
+    # HYBRID: a blob gets up to STABLE_REPLICAS holders from the stable tier AND up to MESH_REPLICAS from
+    # the mesh tier, chosen independently by rendezvous hash. We're "responsible" if we land in the top-k
+    # of OUR OWN tier — so stable relays guarantee durable, hub-free copies while mesh nodes add capacity.
+    # This replaced a single-tier policy; without tiers, a blob's copies could all land on flaky mesh
+    # nodes and vanish when they churn. Eviction ranks by blob_score, identical everywhere, so all relays
+    # would otherwise evict the SAME victims at once — placement (both tiers) is what avoids that.
+    stable, mesh = sets if sets is not None else _placement_sets()
+    return _in_top_k(cid, mesh, MESH_REPLICAS) if _am_mesh() else _in_top_k(cid, stable, STABLE_REPLICAS)
 
 def _evict_locked():                 # called with _blob_lock held; drops least-valuable unpinned first
     total = _blob_total()
     if total <= BLOB_CAP:
         return
     now = time.time()
-    accts = _shard_relays()
+    sets = _placement_sets()
     # Evict what we are NOT responsible for before anything we are: an opportunistic copy of a popular
     # post is the cheapest thing in the cache to lose (several other relays hold it by construction),
-    # while our own share may be one of only BLOB_REPLICAS copies in existence. Nothing is deleted
+    # while our own share may be one of only a few copies in existence. Nothing is deleted
     # that the cap wasn't already going to delete — this only chooses better victims.
-    victims = sorted((1 if _responsible(c, accts) else 0, blob_score(m), m['last'], c)
+    victims = sorted((1 if _responsible(c, sets) else 0, blob_score(m), m['last'], c)
                      for c, m in blob_meta.items() if pinned.get(c, 0) <= now)
     victims = [(s, l, c) for _r, s, l, c in victims]
     for _score, _last, c in victims:
@@ -916,6 +950,15 @@ def relay_caps():
         caps.append(xc_tunnel.ENTRY_CAP)
     return caps
 
+def relay_type():
+    # The role this relay plays in the mesh, so peers/nodes/apps can tell the two kinds apart on /relays
+    # without inferring it from `caps`:
+    #   'node' — a relay reachable ONLY through hubs (a mesh-tunnel CLIENT, typically behind NAT).
+    #   'hub'  — a publicly-reachable relay that can front `node` relays as an entry.
+    # Determined by whether this relay dials out as a tunnel client; `_MESH_CLIENT` is set at startup
+    # (bottom of file), so this is read lazily at request time exactly like relay_caps().
+    return 'node' if globals().get('_MESH_CLIENT', False) else 'hub'
+
 # --- BLIND MAILBOX READ (breaks IP<->account correlation) -----------------------------------------
 # A mailbox read names the account that owns it, so whoever serves the read learns "this IP reads that
 # account's DMs". Sealed sender hid the SENDER from the relay; it did nothing for this, because the
@@ -1084,10 +1127,22 @@ def _pull_relays(url):
         if isinstance(u, str):
             learn_peer({'url': u})
 
+def _publicly_listed():
+    # A mesh 'node' (tunnel CLIENT) is PRIVATE by design: it is reachable only through an entry by an
+    # ephemeral per-epoch token that holders of the out-of-band rendezvous secret derive (Layer A —
+    # the topology is deliberately kept off-chain). So a node must NEVER broadcast its url into the
+    # public relay set: its only routable identity would be a loopback SELF, which every hub would learn,
+    # fail to probe, and correctly tombstone ~25 min later — polluting the set and then flapping out.
+    # Suppressing the broadcast is the whole "private-by-secret" contract; reachability stays via the
+    # tunnel. Plain 'hub' relays announce as before.
+    return not globals().get('_MESH_CLIENT', False)
+
 def gossip_out():
     # Announce to the bootstraps plus a sample of peers. A quick-tunnel relay changes hostname on
     # restart, so this is also how the network learns its new address — the sample is enough, because
     # a signed record is relayable and spreads onward from whoever receives it.
+    if not _publicly_listed():
+        return                                             # a mesh node never advertises its url (see above)
     me = announce_self()
     others = [u for u in list(known) if u != SELF and u not in BOOTSTRAPS]
     if len(others) > ANNOUNCE_FANOUT:
@@ -1099,7 +1154,10 @@ def bootstrap():
     time.sleep(0.4)
     for bp in BOOTSTRAPS:
         _add_known(bp)
-        post_json(bp + '/relay_announce', announce_self())  # tell the bootstrap we exist
+        if _publicly_listed():
+            post_json(bp + '/relay_announce', announce_self())  # tell the bootstrap we exist
+        # A mesh node still PULLS the relay set (it needs the bootstraps to discover entry candidates),
+        # it just doesn't push its own url — see _publicly_listed().
         try:
             _pull_relays(bp)
         except Exception:
@@ -1154,6 +1212,46 @@ def _probe_one(u):
     except Exception:
         return False
 
+def mesh_discover():
+    # Discover PUBLIC mesh nodes the same way the app does: sweep the hubs we know (any relay; a non-hub
+    # just 404s /mesh_nodes) for the routing tokens they list, resolve each to its stable account, and
+    # register it in mesh_peers with its CURRENT reach urls (one per hub, refreshed here because the
+    # token rotates per epoch). Once a node is in mesh_peers it joins the MESH placement tier and gets
+    # its share via shard_repair — turning a NAT'd volunteer's box into a real capacity-tier relay.
+    if HUB is None or xc is None or not ID_ACCT:
+        return
+    while True:
+        try:
+            found = {}                                     # account -> set(reach_url)
+            # (hub_base, token) pairs to resolve: the nodes WE front (reached via our own SELF), plus the
+            # nodes every other hub we know fronts (a non-hub simply 404s /mesh_nodes and is skipped).
+            pairs = [(SELF, t) for t in HUB.public_nodes()[:MESH_PEERS_MAX]]
+            for hub in [u for u in _serve_relays() if u != SELF and '/r/' not in u]:
+                base = hub.rstrip('/')
+                try:
+                    d = json.loads(urllib.request.urlopen(base + '/mesh_nodes', timeout=6).read())
+                except Exception:
+                    continue                               # not a hub / unreachable — skip
+                pairs.extend((base, t) for t in (d.get('nodes') or [])[:MESH_PEERS_MAX])
+            for base, tok in pairs:
+                reach = f'{base.rstrip("/")}/r/{tok}'
+                try:
+                    r = json.loads(urllib.request.urlopen(reach + '/relays', timeout=8).read())
+                except Exception:
+                    continue
+                acct = r.get('account')
+                if acct and acct != ID_ACCT:
+                    found.setdefault(acct, set()).add(reach)
+            now = time.monotonic()
+            for acct, urls in found.items():
+                mesh_peers[acct] = {'urls': sorted(urls), 'last': now}
+            for acct in [a for a, v in list(mesh_peers.items())
+                         if now - v.get('last', 0) > MESH_DISCOVER_S * 3]:
+                mesh_peers.pop(acct, None)                  # a node that stopped appearing drops out of placement
+        except Exception:
+            pass
+        time.sleep(MESH_DISCOVER_S)
+
 def shard_repair():
     # Placement only sheds copies; on its own it would let replication decay every time a relay left,
     # filled up, or joined late — and a blob nobody is responsible for is a blob that disappears. This
@@ -1162,10 +1260,17 @@ def shard_repair():
     while True:
         time.sleep(SHARD_REPAIR_S)
         try:
-            accts = _shard_relays()
-            if len(accts) <= BLOB_REPLICAS:
-                continue                                   # everyone holds everything; nothing to repair
+            sets = _placement_sets()
+            stable, mesh = sets
+            my_tier = mesh if _am_mesh() else stable
+            k = MESH_REPLICAS if _am_mesh() else STABLE_REPLICAS
+            if len(my_tier) <= k:
+                continue                                   # our tier all holds everything; nothing to repair
+            # Pull from stable peers AND from other mesh nodes (reached through their hubs). A mesh node
+            # repairs its share from whoever has it, tier-agnostic — placement decides what WE keep.
             peers = [u for u in list(known) if u != SELF and '127.0.0.1' not in u and 'localhost' not in u]
+            for v in list(mesh_peers.values()):
+                peers.extend(v.get('urls', []))
             random.shuffle(peers)
             pulled = 0
             for peer in peers:
@@ -1185,7 +1290,7 @@ def shard_repair():
                     for cid in cids:
                         if pulled >= SHARD_PULL_MAX:
                             break
-                        if cid in blob_meta or not _responsible(cid, accts):
+                        if cid in blob_meta or not _responsible(cid, sets):
                             continue
                         try:
                             b = json.loads(urllib.request.urlopen(
@@ -1248,7 +1353,8 @@ class H(BaseHTTPRequestHandler):
     def _tunnel_poll(self):
         q = qs(self.path)
         try:
-            item = HUB.poll(q.get('token', ''), q.get('ts', '0'), q.get('sig', ''))
+            item = HUB.poll(q.get('token', ''), q.get('ts', '0'), q.get('sig', ''),
+                            public=q.get('public', '') in ('1', 'true'))
         except PermissionError:
             return self._send(403, '{"ok":false,"error":"tunnel: bad signature"}')
         if item is None:
@@ -1294,6 +1400,11 @@ class H(BaseHTTPRequestHandler):
             return self._tunnel_poll()
         if HUB is not None and self.path.startswith('/r/'):
             return self._tunnel_public('GET')
+        if HUB is not None and self.path.startswith('/mesh_nodes'):
+            # Discovery: the routing tokens of nodes that opted into public listing on THIS hub. A client
+            # reaches each at <this-hub>/r/<token>/... — no secret, no ledger. Only public-mode nodes
+            # appear (private-by-secret nodes never do). Empty list when this relay fronts none.
+            return self._send(200, json.dumps({'nodes': HUB.public_nodes(), 'hub': SELF}))
         if self.path.startswith('/heads'):
             self._send(200, json.dumps({'relay': PORT, 'heads': live_heads()}))
         elif self.path.startswith('/relays'):
@@ -1301,7 +1412,9 @@ class H(BaseHTTPRequestHandler):
             # 'peers' carries the signed identity records, ignored by anything that doesn't know them.
             self._send(200, json.dumps({'relay': PORT, 'relays': _serve_relays(),
                                         'account': ID_ACCT, 'peers': signed_peers(),
-                                        'caps': relay_caps(), 'open_announce': OPEN_ANNOUNCE}))
+                                        'caps': relay_caps(), 'open_announce': OPEN_ANNOUNCE,
+                                        'ver': RELAY_VERSION, 'vcode': RELAY_VCODE,
+                                        'type': relay_type()}))
         elif self.path.startswith('/notify'):
             h = qs(self.path).get('handle', '')
             self._send(200, json.dumps({'relay': PORT, 'notifs': notifs.get(h, [])}))
@@ -1329,12 +1442,15 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps({'cid': cid, 'b64': blob_get(cid)}))   # serve cached content from disk
         elif self.path.startswith('/cache'):                           # cache health: size vs cap, pins
             now = time.time()
-            accts = _shard_relays()
-            mine = sum(1 for c in list(blob_meta) if _responsible(c, accts))
+            sets = _placement_sets()
+            stable, mesh = sets
+            mine = sum(1 for c in list(blob_meta) if _responsible(c, sets))
             self._send(200, json.dumps({'relay': PORT, 'blobs': len(blob_meta), 'bytes': _blob_total(),
                                         'cap': BLOB_CAP, 'pinned': sum(1 for e in pinned.values() if e > now),
                                         'shard': mine, 'opportunistic': len(blob_meta) - mine,
-                                        'replicas': BLOB_REPLICAS, 'placement_relays': len(accts)}))
+                                        'tier': ('mesh' if _am_mesh() else 'stable'),
+                                        'stable_replicas': STABLE_REPLICAS, 'mesh_replicas': MESH_REPLICAS,
+                                        'stable_relays': len(stable), 'mesh_relays': len(mesh)}))
         elif self.path.startswith('/haveblob'):
             cid = qs(self.path).get('cid', '')
             self._send(200, json.dumps({'cid': cid, 'have': blob_has(cid),
@@ -1787,6 +1903,7 @@ if BOOTSTRAPS:
 threading.Thread(target=sync_release_blobs, daemon=True).start()   # catch up on any release bytes we're missing
 threading.Thread(target=probe_peers, daemon=True).start()          # forget dead relay urls; re-announce ours
 threading.Thread(target=shard_repair, daemon=True).start()         # pull the share of blobs we're placed on
+threading.Thread(target=mesh_discover, daemon=True).start()        # find public mesh nodes through hubs → mesh tier
 
 # Mesh reverse-tunnel CLIENT. A relay behind NAT dials OUT to public entry nodes and serves itself
 # through all of them at once — kill any one and the others carry it (no SPOF, no external service).
@@ -1819,13 +1936,17 @@ def _discover_entry_candidates():
         pass
     return list(cands)
 
+# A node opts into public discovery with XC_MESH_PUBLIC=1 (install-relay.sh --public). It then asks every
+# entry to LIST it (see MeshClient.public), so apps reach it with no secret. Off = private-by-secret.
+_MESH_PUBLIC = os.environ.get('XC_MESH_PUBLIC') == '1'
+
 if xc_tunnel is not None and _MESH_CLIENT and _TUNNEL_SECRET and xc is not None:
     try:
         _mesh = xc_tunnel.MeshClient(
             xc, _TUNNEL_SECRET, f'http://127.0.0.1:{PORT}',
             entries=_TUNNEL_ENTRIES,
             discover=(_discover_entry_candidates if _TUNNEL_AUTO else None),
-            self_url=SELF,
+            self_url=SELF, public=_MESH_PUBLIC,
             log=lambda m: print(f'[tunnel] {m}', file=sys.stderr, flush=True))
         _mesh.start()
     except Exception as _e:

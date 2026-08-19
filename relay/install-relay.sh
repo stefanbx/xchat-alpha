@@ -57,6 +57,23 @@
 #                                         kill any one and the others carry it. Needs >=1 public relay on
 #                                         the network advertising the 't1' entry capability. No Cloudflare,
 #                                         no localhost.run, no Tailscale, no ssh — just other xchat nodes.
+#   sh install-relay.sh --mesh-tunnel --public   same, but ask the hubs to LIST this node so every app
+#                                         discovers it automatically (no secret, no ledger entry). Reached
+#                                         as <hub>/r/<token>, so its own IP is never exposed. Omit --public
+#                                         to stay private-by-secret (reachable only by someone you share the
+#                                         rendezvous secret with). --public trades that anonymity for reach.
+#   sh install-relay.sh --hub                 a VPS with a PUBLIC IP: bind straight to the internet, no
+#   sh install-relay.sh --hub relay.example.com   tunnel, no proxy, no external service at all. The node
+#                                         already listens on 0.0.0.0, so on a public-IP box it is reachable
+#                                         as-is — this mode just skips the tunnel and announces the direct
+#                                         address (http://<ip-or-host>:PORT). Give the address if you have
+#                                         a hostname/elastic IP; omit it and the installer reads this box's
+#                                         own IP from the routing table (no external lookup). Open the port
+#                                         in the VPS firewall / security group. This is the stable, zero-
+#                                         dependency way to run a public HUB (an entry node, cap 't1') that
+#                                         fronts NAT'd relays. It serves HTTP: the app auto-lists only
+#                                         https relays, so point an app at it manually or announce it for
+#                                         mesh-entry discovery. No SPOF beyond the box itself.
 #   sh install-relay.sh --domain relay.example.com --tunnel-token TOKEN
 #                                         most reliable of all: your own domain over a NAMED Cloudflare
 #                                         tunnel. Unlimited bandwidth, stable name. Needs a domain.
@@ -138,6 +155,22 @@ fetch() {  # fetch <url> <dest>
     else die "need curl or wget"; fi
 }
 
+# This box's own address, read LOCALLY (no external "what's my IP" service — that would be exactly the
+# outside dependency a hub exists to avoid). `ip route get` only consults the routing table; it sends no
+# packet. On a cloud VPS the default-route source IP is the public IP; behind NAT it's a private one, so
+# --hub prints what it found and asks the operator to confirm / pass the real address.
+detect_public_ip() {
+    _ip=''
+    if command -v ip >/dev/null 2>&1; then
+        _ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.][0-9.]*\).*/\1/p' | head -1)
+    fi
+    [ -z "$_ip" ] && command -v hostname >/dev/null 2>&1 && _ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -z "$_ip" ] && [ "$OS" = Darwin ]; then
+        _ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+    fi
+    printf '%s' "$_ip"
+}
+
 # ---------------------------------------------------------------- stop / status / uninstall
 
 stop_service() {
@@ -165,6 +198,9 @@ TUNNEL_TOKEN=''
 USE_TAILSCALE=0
 USE_LHR=0
 USE_MESH=0
+USE_HUB=0
+PUBLIC=0
+HUB_HOST=''
 while [ $# -gt 0 ]; do
     case "$1" in
         --status)          ACTION=status ;;
@@ -187,6 +223,12 @@ while [ $# -gt 0 ]; do
         --tailscale)       USE_TAILSCALE=1 ;;
         --localhost-run)   USE_LHR=1 ;;   # free SSH reverse tunnel, no account, no Cloudflare
         --mesh-tunnel)     USE_MESH=1 ;;  # reach the net through discovered xchat entry nodes — no external service, no SPOF
+        --public)          PUBLIC=1 ;;    # (mesh only) ask the hubs to LIST this node so apps discover it with no secret;
+                           # trades this node's anonymity for zero-config reachability. Off = private-by-secret.
+        --hub)             USE_HUB=1        # public-IP VPS: bind direct, no tunnel/proxy/external service
+                           # optional address follows (--hub relay.example.com); a flag or nothing means auto-detect
+                           case "${2:-}" in ''|-*) : ;; *) HUB_HOST="$2"; shift ;; esac ;;
+        --hub=*)           USE_HUB=1; HUB_HOST="${1#*=}" ;;
         *) die "unknown option: $1  (try --help)" ;;
     esac
     shift
@@ -561,13 +603,38 @@ esac
 # domain, unlimited bandwidth), Tailscale Funnel (free, no domain, stable *.ts.net name), then quick.
 if   [ -n "$DOMAIN" ] && [ -n "$TUNNEL_TOKEN" ]; then MODE=named
 elif [ -n "$DOMAIN" ];                          then MODE=direct
+elif [ "$USE_HUB" = 1 ];                          then MODE=hub
 elif [ "$USE_MESH" = 1 ];                        then MODE=mesh
 elif [ "$USE_TAILSCALE" = 1 ];                  then MODE=tailscale
 elif [ "$USE_LHR" = 1 ];                         then MODE=lhr
 else                                                 MODE=quick
 fi
+# --public only means something for a mesh node (a NAT'd relay reachable ONLY through hubs). Any other
+# mode is already directly reachable/announced, so listing has nothing to do — warn rather than mislead.
+[ "$PUBLIC" = 1 ] && [ "$MODE" != mesh ] && warn "--public is ignored without --mesh-tunnel (only a mesh node opts into hub listing)"
 PUBLIC_URL=''
 [ -n "$DOMAIN" ] && PUBLIC_URL="https://$DOMAIN"
+
+# HUB: a public-IP VPS binds straight to the internet — no tunnel, no proxy, no external service. The
+# public face is the NODE (kt_server already listens on 0.0.0.0); a --no-node hub exposes the relay
+# port instead. Build the direct http URL now so it is baked into run.sh and announced as-is.
+HUB_AUTODETECTED=0
+if [ "$MODE" = hub ]; then
+    _hubport="$NODE_PORT"; [ "$WITH_NODE" = 1 ] || _hubport="$PORT"
+    HUB_HOST=$(printf '%s' "$HUB_HOST" | sed 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*$##')
+    if [ -z "$HUB_HOST" ]; then
+        HUB_HOST=$(detect_public_ip)
+        [ -n "$HUB_HOST" ] || die "--hub couldn't read this machine's address — pass it: --hub <public-ip-or-host>"
+        HUB_AUTODETECTED=1
+    fi
+    case "$HUB_HOST" in
+        *[!a-zA-Z0-9.:-]*) die "--hub address should be a bare host or host:port, e.g. relay.example.com or 203.0.113.4 (got: $HUB_HOST)" ;;
+    esac
+    case "$HUB_HOST" in
+        *:*) PUBLIC_URL="http://$HUB_HOST" ;;              # operator supplied host:port — respect it
+        *)   PUBLIC_URL="http://$HUB_HOST:$_hubport" ;;
+    esac
+fi
 
 # ---------------------------------------------------------------- preflight
 
@@ -698,6 +765,8 @@ fi
 CF="$XC_HOME/bin/cloudflared"
 if [ "$MODE" = direct ]; then
     ok "using https://$DOMAIN — you route it to 127.0.0.1:$PORT yourself, no tunnel installed"
+elif [ "$MODE" = hub ]; then
+    ok "hub mode: serving directly at $PUBLIC_URL — no tunnel, no proxy, no external service"
 else
     [ "$MODE" = named ] && step "downloading cloudflared (for your named tunnel)" \
                         || step "downloading cloudflared (the free public tunnel)"
@@ -844,6 +913,7 @@ PY="$RELAY_PY"
 CF="$CF"
 BOOTSTRAP="$BOOTSTRAP"
 MODE=$MODE
+PUBLIC=$PUBLIC
 PUBLIC_URL="$PUBLIC_URL"
 TUNNEL_TOKEN="$TUNNEL_TOKEN"
 ADMIN_PORT=$ADMIN_PORT
@@ -854,9 +924,17 @@ export XC_WORK_URL="http://127.0.0.1:$WORKD_PORT"   # lets the relay serve /work
 export XC_WORK_BIN="$XC_HOME/bin/nano_work_cl"
 export RELAY_ACCT="$ACCT"
 export BIND_HOST="${XC_BIND:-127.0.0.1}"
+# hub mode on a public-IP VPS: the RELAY itself must face the internet ONLY when there is no node in
+# front of it (kt_server already binds 0.0.0.0 and proxies to the loopback relay, so a --with-node hub
+# keeps the relay on loopback — one public port, not two). A --no-node hub is relay-only, so it binds
+# the relay publicly. XC_BIND still overrides either way.
+[ "\$MODE" = hub ] && [ "\$WITH_NODE" != 1 ] && export BIND_HOST="\${XC_BIND:-0.0.0.0}"
 # mesh mode: no third-party tunnel. The relay discovers public entry nodes on-chain and is reachable
 # through all of them at once (no SPOF, no external service). XC_TUNNEL_AUTO turns that on in the relay.
 [ "\$MODE" = mesh ] && export XC_TUNNEL_AUTO=1
+# --public (mesh only): opt into hub listing so apps discover this node with no secret. The node asks
+# every entry to publish its routing token; the hub still never learns the account (opaque token only).
+[ "\$MODE" = mesh ] && [ "\$PUBLIC" = 1 ] && export XC_MESH_PUBLIC=1
 KEEP_AWAKE="${KEEP_AWAKE:-1}"
 EOF
 cat >> "$XC_HOME/run.sh" <<'EOF'
@@ -1258,7 +1336,7 @@ except Exception:
         # Funnel runs inside the tailscaled daemon, so CF_PID is empty there and gating on it would
         # have left exactly the blind spot this check exists to close: a funnel that stops routing
         # while the relay keeps happily reporting itself up.
-        if [ -n "$URL" ] && [ "$MODE" != direct ]; then
+        if [ -n "$URL" ] && [ "$MODE" != direct ] && [ "$MODE" != hub ]; then
             HB=$((HB + 5))
             if [ "$HB" -ge 60 ]; then
                 HB=0
@@ -1533,7 +1611,11 @@ ok "registered ($STARTED)"
 
 # ---------------------------------------------------------------- wait for it to be live
 
-[ "$MODE" = quick ] && step "opening your public tunnel" || step "starting your relay on https://$DOMAIN"
+case "$MODE" in
+    quick) step "opening your public tunnel" ;;
+    hub)   step "starting your hub on $PUBLIC_URL" ;;
+    *)     step "starting your relay on ${PUBLIC_URL:-https://$DOMAIN}" ;;
+esac
 URL=''; i=0
 while [ $i -lt 60 ]; do
     [ -f "$XC_HOME/public-url.txt" ] && URL=$(cat "$XC_HOME/public-url.txt") && [ -n "$URL" ] && break
@@ -1555,6 +1637,11 @@ if [ -n "$URL" ]; then
     say "  ${c_b}$URL${c_0}"
     if [ -n "$HEADS" ]; then
         ok "reachable from the internet — it answered a request on that address"
+    elif [ "$MODE" = hub ]; then
+        _hubport=$(printf '%s' "$URL" | sed -n 's#.*:\([0-9][0-9]*\)$#\1#p')
+        warn "answered locally but not yet confirmed reachable — if a client can't reach $URL,"
+        warn "  open port ${_hubport:-$NODE_PORT}/tcp in the VPS firewall AND the cloud security group,"
+        [ "$HUB_AUTODETECTED" = 1 ] && warn "  and confirm $HUB_HOST is this box's PUBLIC address (it was auto-detected)."
     elif [ "$MODE" = direct ]; then
         warn "nothing answered on $URL yet — check that it routes to 127.0.0.1:$PORT on this machine"
     else
@@ -1612,7 +1699,16 @@ PYEOF
                  && say "${c_dim}  $ID${c_0}" && say ''
 fi
 
-if [ "$MODE" = quick ]; then
+if [ "$MODE" = hub ]; then
+    say "${c_dim}This is a HUB: it serves directly at the address above — no tunnel, no proxy, no external${c_0}"
+    say "${c_dim}service, no single point of failure but the box itself. Make sure the port is reachable:${c_0}"
+    say "${c_dim}  • open it in the VPS firewall (e.g. ufw allow ${NODE_PORT}/tcp) AND the provider's security group${c_0}"
+    say "${c_dim}  • the address is permanent, so it can go ON-CHAIN — then relays behind NAT discover this${c_0}"
+    say "${c_dim}    hub as an entry ('t1') with no bootstrap. One command sets up the signing key:${c_0}"
+    say "${c_dim}      sh $SELF --setup-operator${c_0}"
+    say "${c_dim}  • it serves HTTP; the app auto-lists only https relays, so point an app at it by hand${c_0}"
+    say "${c_dim}    (Settings → node URL) — on-chain discovery above is what makes it useful as an entry.${c_0}"
+elif [ "$MODE" = quick ]; then
     say "${c_dim}The address changes each restart. That's fine — your relay's identity doesn't, so peers${c_0}"
     say "${c_dim}follow it to the new address. Want a permanent one? Re-run with --domain your.host and,${c_0}"
     say "${c_dim}if it's a Cloudflare tunnel, --tunnel-token <token from the Cloudflare dashboard>.${c_0}"

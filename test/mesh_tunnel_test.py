@@ -104,10 +104,18 @@ def main():
             sys.exit('an entry relay never came up')
 
         # ---- entry nodes ADVERTISE the 't1' capability so they can be discovered ----
-        capsA = json.loads(get(A + '/relays')[1].decode()).get('caps', [])
-        capsB = json.loads(get(B + '/relays')[1].decode()).get('caps', [])
+        relA = json.loads(get(A + '/relays')[1].decode())
+        relB = json.loads(get(B + '/relays')[1].decode())
+        capsA, capsB = relA.get('caps', []), relB.get('caps', [])
         check('t1' in capsA and 't1' in capsB,
               "entry nodes advertise the 't1' (mesh-entry) capability on /relays", f'A={capsA} B={capsB}')
+
+        # ---- version + type: an entry advertises type 'hub' and a build version on /relays ----
+        check(relA.get('type') == 'hub' and relB.get('type') == 'hub',
+              "entry relays advertise type 'hub' on /relays", f"A={relA.get('type')} B={relB.get('type')}")
+        check(bool(relA.get('ver')) and isinstance(relA.get('vcode'), int),
+              "entry relays advertise a build version (ver + integer vcode)",
+              f"ver={relA.get('ver')} vcode={relA.get('vcode')}")
 
         # The home relay DISCOVERS entries on-chain — here seeded with A,B as ledger candidates, which it
         # probes for 't1' and dials. It is given a shared rendezvous SECRET; reachability is by token
@@ -121,6 +129,8 @@ def main():
         check(bool(acct), 'home relay has a ledger identity (used end-to-end, never as the route)', home)
         check('t1' not in home.get('caps', []),
               "the home relay (a tunnel CLIENT) does NOT advertise 't1' — it can't accept inbound", home.get('caps'))
+        check(home.get('type') == 'node',
+              "the home relay advertises type 'node' (reachable only through hubs)", home.get('type'))
         print(f'  home account {acct[:22]}…\n')
 
         # ---- 1 & 2: reachable through EACH entry BY TOKEN, and answered by the home relay itself ----

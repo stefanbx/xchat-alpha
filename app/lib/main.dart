@@ -29,6 +29,7 @@ import 'package:crypto/crypto.dart' show sha256;
 import 'package:url_launcher/url_launcher.dart';
 import 'body.dart';
 import 'wallet.dart';
+import 'mesh.dart';
 import 'ledger_discovery.dart';
 
 // The engine/relay endpoint. Default: the Android emulator reaches the host loopback at
@@ -184,6 +185,7 @@ const Color kDim = Color(0xFF71767B);
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await _loadEndpoints();                              // persisted last-good endpoint + failover list
+  await MeshReach.load();                              // rendezvous secret + hubs for reaching a NAT'd node
   runApp(const XChatApp());
 }
 
@@ -1583,14 +1585,28 @@ class Api {
   // the discovered PUBLIC relay origins (https), from the on-chain relay directory — NOT deduped by pin
   // account (pinTargets is), so a peer relay that actually holds a big blob is reachable directly.
   static Future<List<String>> relayUrls() async {
+    final out = <String>[];
+    final relays = <String>[];
     try {
       final r = await http.get(Uri.parse('$kBase/api/relaydir')).timeout(const Duration(seconds: 25));
       final d = jsonDecode(r.body);
       final list = (d['relays'] as List?) ?? (d['active'] as List?) ?? const [];
-      return list.map((e) => '$e').where((u) => u.startsWith('https')).toList();
-    } catch (_) {
-      return [];
+      relays.addAll(list.map((e) => '$e').where((u) => u.startsWith('https')));
+      out.addAll(relays);
+    } catch (_) {}
+    // A hub-fronted NAT'd node is off-ledger, so it never appears in /api/relaydir. Add its reach urls
+    // two ways: (1) a private node we hold the rendezvous secret for; (2) PUBLIC nodes — auto-discovered
+    // by asking every hub we know (the relays above + kBase) "who's attached?" (no secret, no config).
+    // Both are plain <hub>/r/<token> urls — the node's own IP is never exposed anywhere.
+    out.addAll(MeshReach.reachBases());
+    final hubs = [...relays, kBase];
+    if (MeshReach.discovered.isEmpty) {
+      await MeshReach.autoDiscoverFrom(hubs);        // first read: populate before we return
+    } else {
+      MeshReach.autoDiscoverFrom(hubs);              // warm cache: refresh in the background
     }
+    out.addAll(MeshReach.discovered);
+    return out;
   }
 
   // (Api.setWallet removed — the seed never leaves the device; there is no /api/wallet anymore.)
@@ -5835,6 +5851,15 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       backgroundColor: kBg,
       builder: (_) => StatefulBuilder(builder: (ctx, setSheet) {
         Future<Map<String, dynamic>?> f = Api.relaydir();
+        // Auto-discover public mesh nodes from the hubs this directory lists — no config, no secret.
+        Future<List<Map<String, dynamic>>> meshF = f.then((d) async {
+          final urls = ((d?['health'] as List?) ?? const [])
+              .map((h) => '${h['url']}')
+              .where((u) => u.startsWith('https'))
+              .toList();
+          await MeshReach.autoDiscoverFrom(urls);
+          return MeshReach.discoveredInfo;
+        });
         return FutureBuilder<Map<String, dynamic>?>(
           future: f,
           builder: (_, snap) {
@@ -5922,6 +5947,45 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                       ]),
                     );
                   }),
+                // Public mesh nodes — relays with no public address, discovered THROUGH the hubs above.
+                FutureBuilder<List<Map<String, dynamic>>>(
+                  future: meshF,
+                  builder: (_, ms) {
+                    final nodes = ms.data ?? const [];
+                    if (nodes.isEmpty) return const SizedBox.shrink();
+                    String hubHost(String via) =>
+                        via.replaceFirst(RegExp(r'^https?://'), '').split('/r/').first;
+                    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: nodes.map((n) {
+                      final acct = '${n['account']}';
+                      final shortA = acct.length > 22 ? '${acct.substring(0, 14)}…${acct.substring(acct.length - 6)}' : acct;
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 10),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: const Color(0xFF8b5cf6))),
+                        child: Row(children: [
+                          const Icon(Icons.hub_outlined, color: Color(0xFF8b5cf6), size: 18),
+                          const SizedBox(width: 12),
+                          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Row(children: [
+                              Flexible(child: Text(shortA, overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 12, fontWeight: FontWeight.w700))),
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                                decoration: BoxDecoration(color: kBg, borderRadius: BorderRadius.circular(5), border: Border.all(color: kLine)),
+                                child: const Text('mesh · public', style: TextStyle(color: Color(0xFF8b5cf6), fontSize: 9, fontWeight: FontWeight.w700)),
+                              ),
+                            ]),
+                            const SizedBox(height: 3),
+                            Text('no address of its own · via ${hubHost('${n['via']}')}',
+                                style: const TextStyle(color: kDim, fontSize: 11)),
+                          ])),
+                        ]),
+                      );
+                    }).toList());
+                  },
+                ),
                 const SizedBox(height: 4),
                 Text('$up serving you now · $onLedger self-announced on the XNO ledger · ${rvs.length} keyless rendezvous. '
                     'Strength = latency, reliability = recent uptime.',
@@ -5943,12 +6007,19 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   // edit the relay/engine endpoint (persisted; applied live)
   void _showEndpoint() {
     final ctl = TextEditingController(text: kBase);
+    final secCtl = TextEditingController(text: MeshReach.secret);
+    final hubCtl = TextEditingController(
+        text: MeshReach.hubs.isEmpty ? kDefaultBase : MeshReach.hubs.join(', '));
+    String meshStatus = '';
+    Color meshStatusColor = kDim;
+    bool meshBusy = false;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: kBg,
-      builder: (_) => Padding(
+      builder: (_) => StatefulBuilder(builder: (ctx, setSheet) => Padding(
         padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+        child: SingleChildScrollView(
         child: Container(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
           decoration: const BoxDecoration(border: Border(top: BorderSide(color: kLine))),
@@ -5994,9 +6065,98 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                 child: const Text('Save & connect', style: TextStyle(fontWeight: FontWeight.w800)),
               ),
             ]),
+            const SizedBox(height: 20),
+            const Divider(color: kLine, height: 1),
+            const SizedBox(height: 18),
+            Row(children: const [
+              Icon(Icons.hub_outlined, color: kAccent, size: 20), SizedBox(width: 8),
+              Text('Mesh node', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+            ]),
+            const SizedBox(height: 6),
+            const Text('Reach a relay that has no public address of its own — it dials into a public hub. '
+                'Leave the secret empty to auto-discover PUBLIC nodes the hub lists (no code). Enter a '
+                'secret to reach a PRIVATE node shared with you. The hub only ever sees an opaque token.',
+                style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+            const SizedBox(height: 12),
+            const Text('Rendezvous secret', style: TextStyle(color: kDim, fontSize: 11, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+            TextField(
+              controller: secCtl,
+              style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 13),
+              decoration: _fieldDeco('shared secret'),
+            ),
+            const SizedBox(height: 10),
+            const Text('Hub(s), comma-separated', style: TextStyle(color: kDim, fontSize: 11, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+            TextField(
+              controller: hubCtl,
+              style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 13),
+              keyboardType: TextInputType.url,
+              decoration: _fieldDeco('https://hub.fly.dev'),
+            ),
+            if (meshStatus.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(meshStatus, style: TextStyle(color: meshStatusColor, fontSize: 12.5, height: 1.4, fontFamily: 'monospace')),
+            ],
+            const SizedBox(height: 14),
+            Row(children: [
+              TextButton(
+                onPressed: () async {
+                  secCtl.clear();
+                  await MeshReach.save('', []);
+                  setSheet(() { meshStatus = 'mesh reach cleared'; meshStatusColor = kDim; });
+                },
+                child: const Text('Clear', style: TextStyle(color: kDim)),
+              ),
+              const Spacer(),
+              FilledButton.tonalIcon(
+                onPressed: meshBusy ? null : () async {
+                  final hubs = hubCtl.text.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+                  final secret = secCtl.text.trim();
+                  await MeshReach.save(secret, hubs);
+                  if (hubs.isEmpty) {
+                    setSheet(() { meshStatus = 'enter at least one hub'; meshStatusColor = const Color(0xFFE0A83E); });
+                    return;
+                  }
+                  String shortAcct(String a) => a.length > 20 ? '${a.substring(0, 12)}…${a.substring(a.length - 6)}' : a;
+                  if (secret.isEmpty) {
+                    // PUBLIC discovery — no secret. Ask the hubs which nodes are attached.
+                    setSheet(() { meshBusy = true; meshStatus = 'discovering public nodes on the hub…'; meshStatusColor = kDim; });
+                    await MeshReach.discoverVia(hubs);
+                    final found = await MeshReach.probeDiscovered();
+                    if (found.isEmpty) {
+                      setSheet(() { meshBusy = false; meshStatus = '✗ this hub lists no public nodes right now'; meshStatusColor = const Color(0xFFEF6C9B); });
+                      return;
+                    }
+                    final lines = found.map((f) => '✓ ${shortAcct('${f['account']}')}  type=${f['type']} ver=${f['ver'] ?? '?'}').join('\n');
+                    setSheet(() {
+                      meshBusy = false;
+                      meshStatus = 'discovered ${found.length} public node(s) — no code:\n$lines\n  added to your relay set';
+                      meshStatusColor = const Color(0xFF4DD0A7);
+                    });
+                    return;
+                  }
+                  // PRIVATE — derive the token from the secret.
+                  setSheet(() { meshBusy = true; meshStatus = 'reaching node through hub…'; meshStatusColor = kDim; });
+                  final info = await MeshReach.probe();
+                  if (info == null) {
+                    setSheet(() { meshBusy = false; meshStatus = '✗ no node answered through the hub (is it dialed in?)'; meshStatusColor = const Color(0xFFEF6C9B); });
+                    return;
+                  }
+                  setSheet(() {
+                    meshBusy = false;
+                    meshStatus = '✓ reached node ${shortAcct('${info['account']}')}\n  type=${info['type']} ver=${info['ver'] ?? '?'}\n  the hub is routing to it now';
+                    meshStatusColor = const Color(0xFF4DD0A7);
+                  });
+                },
+                icon: const Icon(Icons.wifi_tethering, size: 18),
+                label: Text(meshBusy ? 'working…' : 'Save & reach'),
+              ),
+            ]),
           ]),
         ),
-      ),
+        ),
+      )),
     );
   }
 
