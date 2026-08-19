@@ -80,7 +80,19 @@ export RELAY_PUBLIC_URL="$NODE_PUBLIC_URL"     # the embedded relay's reachable 
 # takes no payments", which is the only safe default for money.
 export XCHAT_BOOTSTRAP="$PEER_RELAY"           # xc_common._bootstrap() always includes the peer relay
 echo "http://127.0.0.1:7401" > /tmp/xchat_bootstrap.txt   # node still talks to its co-located relay on loopback
-python3 /app/xc_relayd.py 7401 "$STORE_DIR/relay.json" "$PEER_RELAY" >/tmp/relay.log 2>&1 &
+# SUPERVISE the embedded relay. It used to be a one-shot background process, so a crash — or an OOM-kill
+# under memory pressure — left it dead while kt_server (the health-checked front on :8790) stayed up.
+# Fly saw a healthy machine and never restarted it, so every proxied relay path (/relays, /blob, the mesh
+# tunnel) 502'd until someone noticed and restarted the machine by hand. Respawn it with backoff instead,
+# like launchd KeepAlive, and log each exit so the failure is visible in /tmp/relay.log.
+(
+  while true; do
+    python3 /app/xc_relayd.py 7401 "$STORE_DIR/relay.json" "$PEER_RELAY" >>/tmp/relay.log 2>&1
+    code=$?
+    echo "$(date -u +%FT%TZ) relay exited ($code) — respawning in 3s" >> /tmp/relay.log
+    sleep 3
+  done
+) &
 sleep 1
 # Self-announce this node's /api URL on the XNO ledger (idempotent) so the app can rediscover it from
 # an unstoppable source if this host's DNS is ever lost. Needs a one-time-funded operator key in
