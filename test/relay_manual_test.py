@@ -44,6 +44,9 @@ check('"$ADMIN_URL/manual"' in INSTALL, 'xchat manual opens the relay-served URL
 check('file://$XC_HOME/manual.html' in INSTALL, 'xchat manual falls back to the on-disk file when the server is down')
 check('xchat manual' in INSTALL, 'the help listing mentions xchat manual')
 check(INSTALL.count('ӾChat Relay Manual') >= 2, 'a desktop shortcut is created on both macOS and Linux')
+check(INSTALL.count('make_app "ӾChat Relay Manual" "file://$XC_HOME/manual.html"') == 1
+      and INSTALL.count('make_desktop "ӾChat Relay Manual" "file://$XC_HOME/manual.html"') == 1,
+      'the shortcuts open the file directly (file://), so they work even when the server is stopped')
 check('xchat-relay-manual.desktop' in INSTALL and 'ӾChat Relay Manual.app' in INSTALL,
       'uninstall removes the manual shortcuts too')
 

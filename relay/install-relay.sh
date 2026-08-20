@@ -1617,7 +1617,7 @@ PLIST
     mkdir -p "$HOME/Applications"
     make_app "ӾChat" "$APP_URL" "$HOME/Applications"
     make_app "ӾChat Relay Settings" "$ADMIN_URL" "$HOME/Applications"
-    make_app "ӾChat Relay Manual" "$ADMIN_URL/manual" "$HOME/Applications"
+    make_app "ӾChat Relay Manual" "file://$XC_HOME/manual.html" "$HOME/Applications"
     ok "shortcuts added to your Applications folder (search Spotlight for 'ӾChat')"
 else
     APPS="$HOME/.local/share/applications"
@@ -1637,7 +1637,7 @@ DESK
     }
     make_desktop "ӾChat" "$APP_URL" "xchat"
     make_desktop "ӾChat Relay Settings" "$ADMIN_URL" "xchat-relay-settings"
-    make_desktop "ӾChat Relay Manual" "$ADMIN_URL/manual" "xchat-relay-manual"
+    make_desktop "ӾChat Relay Manual" "file://$XC_HOME/manual.html" "xchat-relay-manual"
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS" 2>/dev/null || true
     ok "shortcuts added to your applications menu"
 fi
