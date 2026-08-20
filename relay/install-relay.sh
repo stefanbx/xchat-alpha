@@ -8,8 +8,10 @@
 #   2. downloads the relay (two pure-Python files) from the repo
 #   3. makes a venv and installs nanopy — without it the relay can't verify signed profiles,
 #      reports or pin payments, and it can't hold an account to be paid on
-#   4. downloads cloudflared and opens a free quick tunnel, so a laptop behind NAT still gets a
-#      real https:// URL other nodes can reach — no router config, no account, no port forward
+#   4. picks how it goes public with ZERO config (any mode flag below overrides): a box with a PUBLIC
+#      IP becomes a HUB that binds straight to the internet; a box behind NAT becomes a public, self-
+#      healing MESH NODE, reachable through other xchat hubs with no external service. Prefer a stable
+#      address? --domain / --tailscale / --setup-worker. Want the old Cloudflare quick tunnel? --quick.
 #   5. registers it to start at login (launchd on macOS, systemd --user on Linux) and starts it
 #
 # The relay itself binds to 127.0.0.1 only; the tunnel is the sole way in. It stores signed bytes
@@ -40,6 +42,11 @@
 #                                         exist on-chain. The seed is written to ~/.xchat-relay/
 #                                         operator.seed, mode 600 — back it up.
 #
+# HOW IT GOES PUBLIC (pick one; with no flag it AUTO-PROMOTES — public IP → hub, behind NAT → public node):
+#   sh install-relay.sh --quick           the old default: a free Cloudflare quick tunnel. Needs nothing,
+#                                         but the hostname changes every restart (can't be announced) and
+#                                         the endpoint rate-limits. Prefer --tailscale or --domain for a
+#                                         NAT-friendly address that is also stable.
 #   sh install-relay.sh --localhost-run   free SSH reverse tunnel, NO account and NO Cloudflare. The
 #                                         relay dials out to localhost.run over SSH (works behind NAT
 #                                         and a changing home IP) and gets a short *.lhr.life name —
@@ -48,7 +55,7 @@
 #                                         for a name that never changes. Needs `ssh` (openssh-client).
 #   sh install-relay.sh --tailscale   free PERMANENT address via Tailscale Funnel, no domain needed.
 #                                         Install tailscale, run `tailscale up`, enable Funnel for the
-#                                         tailnet, then use this. Unlike the default quick tunnel the
+#                                         tailnet, then use this. Unlike a quick tunnel the
 #                                         name never changes, so it can be announced on-chain, and it
 #                                         is not subject to the quick-tunnel rate limit.
 #   sh install-relay.sh --mesh-tunnel  NO external service at all AND no single point of failure. The
@@ -171,6 +178,23 @@ detect_public_ip() {
     printf '%s' "$_ip"
 }
 
+# Is this IPv4 a PUBLIC, internet-routable address? Used only to pick the zero-flag default: a box whose
+# default-route source IP is public becomes a HUB (it can accept inbound); anything else — an RFC1918 or
+# CGNAT address, loopback/link-local, or nothing at all — is behind NAT and becomes a mesh NODE. This is
+# a heuristic for a DEFAULT, never a security check: a public source IP can still be firewalled (an
+# unreachable hub is simply dropped by peers that fail to probe it), and a box behind a cloud NAT with a
+# separate elastic IP looks private here — pass --hub <that-ip> to override. Returns 0 (true) for public.
+is_public_ip() {
+    case "$1" in
+        ''|10.*|127.*|169.254.*|192.168.*|0.*)                    return 1 ;;   # unset / RFC1918 / loopback / link-local
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*)                    return 1 ;;   # 172.16.0.0/12
+        100.6[4-9].*|100.7[0-9].*|100.8[0-9].*|100.9[0-9].*)      return 1 ;;   # 100.64.0.0/10 CGNAT (lower half)
+        100.1[01][0-9].*|100.12[0-7].*)                           return 1 ;;   # 100.64.0.0/10 CGNAT (upper half)
+        *.*.*.*)                                                  return 0 ;;   # a dotted quad that dodged every private range
+        *)                                                        return 1 ;;   # not an IPv4 literal (e.g. only IPv6 found)
+    esac
+}
+
 # ---------------------------------------------------------------- stop / status / uninstall
 
 stop_service() {
@@ -199,6 +223,7 @@ USE_TAILSCALE=0
 USE_LHR=0
 USE_MESH=0
 USE_HUB=0
+USE_QUICK=0
 PUBLIC=0
 HUB_HOST=''
 while [ $# -gt 0 ]; do
@@ -222,6 +247,7 @@ while [ $# -gt 0 ]; do
         --tunnel-token=*)  TUNNEL_TOKEN="${1#*=}" ;;
         --tailscale)       USE_TAILSCALE=1 ;;
         --localhost-run)   USE_LHR=1 ;;   # free SSH reverse tunnel, no account, no Cloudflare
+        --quick)           USE_QUICK=1 ;; # force the Cloudflare quick tunnel (was the old zero-flag default)
         --mesh-tunnel)     USE_MESH=1 ;;  # reach the net through discovered xchat entry nodes — no external service, no SPOF
         --public)          PUBLIC=1 ;;    # (mesh only) ask the hubs to LIST this node so apps discover it with no secret;
                            # trades this node's anonymity for zero-config reachability. Off = private-by-secret.
@@ -596,18 +622,39 @@ DOMAIN=$(printf '%s' "$DOMAIN" | sed 's#^[a-zA-Z]*://##; s#/*$##')
 case "$DOMAIN" in
     *[!a-zA-Z0-9.-]*) die "--domain should be a bare hostname, e.g. relay.example.com (got: $DOMAIN)" ;;
 esac
-# A quick tunnel is the DEFAULT because it needs nothing from the operator, but it is also the least
-# reliable thing here: the hostname churns on every restart (so it can never be announced on-chain)
-# and the endpoint that mints it rate-limits — error 1015 / HTTP 429 — which on a real operator's
-# relay turned a passing blip into hours of downtime. Prefer, in order: a named tunnel (your own
-# domain, unlimited bandwidth), Tailscale Funnel (free, no domain, stable *.ts.net name), then quick.
+# An EXPLICIT mode flag always wins. With none given, we DON'T fall to a quick tunnel any more: a quick
+# tunnel churns its hostname every restart (so it can never be announced) and rate-limits into hours of
+# downtime (error 1015 / HTTP 429). Instead the zero-flag default AUTO-PROMOTES by what the box can do —
+# a public IP becomes a hub (an entry others tunnel through), anything behind NAT becomes a public,
+# self-healing mesh node. `--quick` still asks for the old Cloudflare tunnel on purpose.
+AUTO_PROMOTED=''            # set to hub|node only when the auto-promote default below actually decided
 if   [ -n "$DOMAIN" ] && [ -n "$TUNNEL_TOKEN" ]; then MODE=named
 elif [ -n "$DOMAIN" ];                          then MODE=direct
 elif [ "$USE_HUB" = 1 ];                          then MODE=hub
 elif [ "$USE_MESH" = 1 ];                        then MODE=mesh
 elif [ "$USE_TAILSCALE" = 1 ];                  then MODE=tailscale
 elif [ "$USE_LHR" = 1 ];                         then MODE=lhr
-else                                                 MODE=quick
+elif [ "$USE_QUICK" = 1 ];                        then MODE=quick
+elif [ "$PUBLIC" = 1 ];                          then MODE=mesh   # --public alone means "a public mesh node"
+else
+    # No explicit mode. FIRST inherit whatever a prior install chose, so re-running (that's how you
+    # --update) never silently re-homes a running relay — the same reason WITH_NODE is inherited above.
+    # run.sh bakes `MODE=` and `PUBLIC=` verbatim, so read them straight back.
+    MODE=''
+    if [ -f "$XC_HOME/run.sh" ]; then
+        MODE=$(sed -n 's/^MODE=\([a-z][a-z]*\)$/\1/p' "$XC_HOME/run.sh" | head -1)
+        _pubprev=$(sed -n 's/^PUBLIC=\([01]\)$/\1/p' "$XC_HOME/run.sh" | head -1)
+        [ -n "$_pubprev" ] && PUBLIC="$_pubprev"
+    fi
+    if [ -z "$MODE" ]; then
+        # A GENUINELY FRESH install: auto-promote. A public source IP → hub; NAT/CGNAT/none → public node.
+        # detect_public_ip reads only the routing table (no external lookup); is_public_ip classifies it.
+        if is_public_ip "$(detect_public_ip)"; then
+            MODE=hub;  AUTO_PROMOTED=hub    # the hub block below auto-detects and validates the address
+        else
+            MODE=mesh; PUBLIC=1; AUTO_PROMOTED=node   # discoverable by apps; --mesh-tunnel opts back to private
+        fi
+    fi
 fi
 # --public only means something for a mesh node (a NAT'd relay reachable ONLY through hubs). Any other
 # mode is already directly reachable/announced, so listing has nothing to do — warn rather than mislead.
@@ -641,6 +688,22 @@ fi
 say ''
 say "${c_b}ӾChat relay${c_0} ${c_dim}— installing to $XC_HOME${c_0}"
 say ''
+
+# Say out loud what the zero-flag default picked and how to override it — the choice changes the address
+# and the privacy posture, so it must never be silent.
+if [ "$AUTO_PROMOTED" = hub ]; then
+    say "${c_b}Auto-detected a public IP ($HUB_HOST) → installing as a HUB.${c_0}"
+    say "${c_dim}It serves directly and can front NAT'd relays as an entry. Override: --mesh-tunnel (be a${c_0}"
+    say "${c_dim}private node instead) · --quick (Cloudflare tunnel) · --hub <addr> (a different address).${c_0}"
+    say ''
+elif [ "$AUTO_PROMOTED" = node ]; then
+    say "${c_b}No public IP detected → installing as a public MESH NODE.${c_0}"
+    say "${c_dim}Reachable through discovered entry hubs, self-healing, no external service. Apps find it${c_0}"
+    say "${c_dim}with no secret — which reveals to each hub that it carries this node. Override: --mesh-tunnel${c_0}"
+    say "${c_dim}(private, reachable only by a shared secret) · --quick (Cloudflare tunnel) · --hub <addr>.${c_0}"
+    say "${c_dim}Note: a node needs at least one public hub advertising 't1' to be reachable at all.${c_0}"
+    say ''
+fi
 
 case "$OS" in
     Darwin|Linux) ;;
@@ -767,6 +830,8 @@ if [ "$MODE" = direct ]; then
     ok "using https://$DOMAIN — you route it to 127.0.0.1:$PORT yourself, no tunnel installed"
 elif [ "$MODE" = hub ]; then
     ok "hub mode: serving directly at $PUBLIC_URL — no tunnel, no proxy, no external service"
+elif [ "$MODE" = mesh ]; then
+    ok "mesh mode: reached through discovered entry hubs — no Cloudflare, no external service to install"
 else
     [ "$MODE" = named ] && step "downloading cloudflared (for your named tunnel)" \
                         || step "downloading cloudflared (the free public tunnel)"
