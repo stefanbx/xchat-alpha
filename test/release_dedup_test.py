@@ -47,7 +47,11 @@ check(next(r for r in out if r['cid'] == 'A')['ts'] == 200, 'the NEWEST record w
 check(dedup(recs) and out[-1]['cid'] == 'C', 'newest-by-ts sits last, so lst[-N:] is the newest-N window')
 
 print('\n--- robust to junk; distinct binaries are never merged ---')
-check(dedup([{'ts': 1}, {'x': 1}, 'junk', None]) == [], 'records with no cid / non-dicts are dropped')
+check([r for r in dedup(['junk', None, 42]) ] == [], 'non-dict entries are dropped')
+# A cid-less record is a valid metadata-only release (accept_release allows cid=''); it must be KEPT,
+# not silently dropped — dropping it broke harden_test's "valid release accepted / stored==1".
+kept = dedup([{'version': '1', 'cid': '', 'ts': 5}, {'version': '2', 'ts': 9}])
+check(len(kept) == 2, 'records with no/empty cid are PRESERVED (not deduped away)', f'got {kept}')
 distinct = [{'cid': f'v{i}', 'ts': i} for i in range(5)]
 check(len(dedup(distinct)) == 5, 'five distinct CIDs stay five records')
 check(dedup([]) == [], 'empty list stays empty')

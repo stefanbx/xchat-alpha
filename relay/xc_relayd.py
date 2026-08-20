@@ -641,14 +641,19 @@ def _dedup_releases(lst):
     # so the same CID piled up several slots, wasting the 24-cap and skewing the newest-N pin window. A CID
     # is a content hash: the same CID IS the same binary (and thus the same version), so collapse by CID,
     # keeping the newest record per CID, ordered by ts so the newest-N window (lst[-N:]) is by release time.
-    best = {}
+    best = {}                                   # non-empty cid -> newest record for that binary
+    nocid = []                                  # records with no cid (metadata-only): nothing to collapse on
     for r in lst:
-        if not isinstance(r, dict) or not r.get('cid'):
+        if not isinstance(r, dict):
             continue
-        cur = best.get(r['cid'])
+        c = r.get('cid')
+        if not c:                               # keep every cid-less record — dropping them would lose a
+            nocid.append(r)                     # valid metadata-only release (accept_release still allows it)
+            continue
+        cur = best.get(c)
         if cur is None or (r.get('ts', 0) or 0) >= (cur.get('ts', 0) or 0):
-            best[r['cid']] = r
-    return sorted(best.values(), key=lambda r: r.get('ts', 0) or 0)
+            best[c] = r
+    return sorted(list(best.values()) + nocid, key=lambda r: r.get('ts', 0) or 0)
 
 def accept_release(m):
     # Ingest a signed release record — VERIFYING it, unlike other relay writes. Releases are app
