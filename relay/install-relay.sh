@@ -304,7 +304,24 @@ case "$ACTION" in
                 say "                systemctl --user enable xchat-relay"
             fi
         fi
-        if [ -f "$XC_HOME/public-url.txt" ]; then
+        # A MESH node has no public URL of its own and is not announced on the ledger — it is fronted by
+        # entry hubs and (with --public) listed on them. The URL / worker / ledger checks below are for the
+        # tunnel modes; for mesh, report what actually matters: is an entry carrying us, and are we
+        # discoverable. Auto-promote makes mesh the default, so this is the common path now.
+        _mode_st=$(sed -n 's/^MODE=\([a-z][a-z]*\)$/\1/p' "$XC_HOME/run.sh" 2>/dev/null | head -1)
+        if [ "$_mode_st" = mesh ]; then
+            _ent=$(grep -a 'reachable via' "$XC_HOME/relay.log" 2>/dev/null | tail -1 | sed -n 's/.*reachable via \([0-9][0-9]*\) entry.*/\1/p')
+            if [ -n "$_ent" ] && [ "$_ent" -gt 0 ] 2>/dev/null; then
+                ok "mesh: reachable through $_ent entry hub(s) — a mesh node needs no public URL of its own"
+            else
+                warn "mesh: not yet fronted by an entry hub (needs >=1 public relay advertising 't1') — retries on its own"
+            fi
+            if [ "$(sed -n 's/^PUBLIC=\([01]\)$/\1/p' "$XC_HOME/run.sh" 2>/dev/null | head -1)" = 1 ]; then
+                ok "discoverable: apps find this node through the hubs, no secret needed"
+            else
+                say "  private-by-secret: reachable only by someone you share the rendezvous secret with"
+            fi
+        elif [ -f "$XC_HOME/public-url.txt" ]; then
             PUB=$(cat "$XC_HOME/public-url.txt")
             # "running" is not "reachable". A slept laptop leaves cloudflared alive and retrying, and
             # this used to print the URL as though it worked — for 10 hours, in one measured case. Ask
@@ -322,6 +339,7 @@ case "$ACTION" in
         # that used to be invisible: a failed self-announce only ever wrote a line to selfannounce.log,
         # so a node could serve happily for hours while being unreachable to anyone who didn't already
         # know its URL. Report it plainly, and say exactly what to run.
+        if [ "$_mode_st" != mesh ]; then       # the stable-address / ledger-announce report is URL-mode only
         say ""
         if [ -f "$XC_HOME/worker.conf" ]; then
             WORKER_URL=''; . "$XC_HOME/worker.conf"
@@ -359,6 +377,7 @@ case "$ACTION" in
         if [ -s "$XC_HOME/selfannounce.log" ]; then
             say "last announce: $(tail -n 1 "$XC_HOME/selfannounce.log")"
         fi
+        fi                                     # end: URL-mode-only reachability report
         have=$(installed_fp); want=$(remote_fp)
         if [ -n "$want" ] && [ -n "$have" ] && [ "$have" != "$want" ]; then
             say ""
