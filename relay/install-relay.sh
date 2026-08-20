@@ -1549,15 +1549,35 @@ chmod +x "$XC_HOME/bin/xchat"
 BINDIR="$HOME/.local/bin"
 mkdir -p "$BINDIR"
 ln -sf "$XC_HOME/bin/xchat" "$BINDIR/xchat"
+add_path_line() {   # append the marked PATH export to $1 unless it is already there
+    grep -q 'added by xchat-relay' "$1" 2>/dev/null && return 0
+    printf '\nexport PATH="$HOME/.local/bin:$PATH"   # added by xchat-relay\n' >> "$1"
+}
 case ":$PATH:" in
     *":$BINDIR:"*) ok "'xchat' command installed" ;;
     *)
+        # Add ~/.local/bin to PATH for the operator's interactive shell. Edit every rc that already
+        # exists — but if NONE do, `xchat` would be installed yet unfindable (the old gap). So when
+        # nothing was touched, CREATE the file this shell reads: ~/.zshrc for zsh (macOS default),
+        # ~/.bashrc for bash, ~/.profile for any other POSIX shell.
+        _wrote=0
         for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
             [ -f "$rc" ] || continue
-            grep -q 'added by xchat-relay' "$rc" 2>/dev/null && continue
-            printf '\nexport PATH="$HOME/.local/bin:$PATH"   # added by xchat-relay\n' >> "$rc"
+            add_path_line "$rc"; _wrote=1
         done
-        ok "'xchat' command installed (open a NEW terminal window to use it)"
+        if [ "$_wrote" = 0 ]; then
+            case "${SHELL:-}" in
+                */zsh)  _rc="$HOME/.zshrc" ;;
+                */bash) _rc="$HOME/.bashrc" ;;
+                *)      _rc="$HOME/.profile" ;;
+            esac
+            add_path_line "$_rc"
+            ok "'xchat' command installed — added ~/.local/bin to PATH in $_rc"
+        else
+            ok "'xchat' command installed (open a NEW terminal window to use it)"
+        fi
+        # Works in THIS shell too, without waiting for a new terminal:
+        say "  to use it right now:  export PATH=\"\$HOME/.local/bin:\$PATH\""
         ;;
 esac
 
