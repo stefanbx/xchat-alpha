@@ -635,6 +635,21 @@ def _release_verify(m, pub, sig):
         return False
     return xc.verify_either(pub, sig, xc.release_canon(m), xc.release_canon_legacy(m))
 
+def _dedup_releases(lst):
+    # ONE record per release binary. A publisher re-announcing the same APK (a retry, or a re-sign) appends
+    # a record with a FRESH sig, and the sig-dedup in accept_release only catches byte-identical re-sends —
+    # so the same CID piled up several slots, wasting the 24-cap and skewing the newest-N pin window. A CID
+    # is a content hash: the same CID IS the same binary (and thus the same version), so collapse by CID,
+    # keeping the newest record per CID, ordered by ts so the newest-N window (lst[-N:]) is by release time.
+    best = {}
+    for r in lst:
+        if not isinstance(r, dict) or not r.get('cid'):
+            continue
+        cur = best.get(r['cid'])
+        if cur is None or (r.get('ts', 0) or 0) >= (cur.get('ts', 0) or 0):
+            best[r['cid']] = r
+    return sorted(best.values(), key=lambda r: r.get('ts', 0) or 0)
+
 def accept_release(m):
     # Ingest a signed release record — VERIFYING it, unlike other relay writes. Releases are app
     # updates, so a forged flood here isn't inert junk: the old code stored any record and capped the
@@ -663,7 +678,7 @@ def accept_release(m):
     if any(x.get('sig') == sig for x in lst):
         return False
     lst.append(m)
-    releases[pub_acc] = lst[-24:]
+    releases[pub_acc] = _dedup_releases(lst)[-24:]     # collapse re-announces of the same CID (see helper)
     _cap_dict(releases, RELEASE_PUBS_MAX)
     keep = reconcile_release_pins()                    # this release just became newest -> older one may drop out
     if m.get('cid') and m['cid'] in keep:              # only pin+pull bytes if it's inside the keep window
@@ -843,8 +858,8 @@ def _prune_loaded():
             _cap_dict(recs, REPORT_PER_POST)
     _cap_dict(releases, RELEASE_PUBS_MAX)
     for pub, lst in list(releases.items()):
-        if isinstance(lst, list) and len(lst) > 24:
-            releases[pub] = lst[-24:]
+        if isinstance(lst, list):
+            releases[pub] = _dedup_releases(lst)[-24:]   # drop duplicate-CID records left by older code, then cap
     if len(dms) > DM_MAX:
         del dms[:-DM_MAX]
 
