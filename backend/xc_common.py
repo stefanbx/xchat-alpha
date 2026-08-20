@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Shared helpers for the ӾChat per-user-thread backend (dev Nano network + IPFS).
-import json, subprocess, urllib.request, urllib.parse, urllib.error, base64, hashlib, os, time, ipaddress, shutil, socket
+import json, subprocess, urllib.request, urllib.parse, urllib.error, base64, hashlib, os, time, ipaddress, shutil, socket, threading
 import http.client
 from concurrent.futures import ThreadPoolExecutor
 # Nano RPC endpoint(s). XC_NANO_RPC may be ONE url or a comma-separated list; defaults to the local
@@ -395,6 +395,14 @@ REP_HALFLIFE = float(os.environ.get('XC_REP_HALFLIFE', str(30 * 86400)))   # rep
 REP_TTL      = float(os.environ.get('XC_REP_TTL', '300'))       # cache an account's reputation this long
 REP_TELEPORT = float(os.environ.get('XC_REP_TELEPORT', '0.5'))  # EigenTrust anchor back to on-chain pre-trust
 REP_ITERS    = int(os.environ.get('XC_REP_ITERS', '25'))        # trust-propagation iterations to convergence
+# The aggregated-feed cache. Written by xc_feed.py, read by kt_server (served to clients) and xc_labels.
+# Its PATH is env-driven so a deployment can point it at PERSISTENT storage: on /tmp it is wiped on every
+# redeploy/reboot, which forced a cold 3-8s re-aggregation (the whole relay fan-out + reputation RPCs +
+# content fetch) as the FIRST request after each deploy blocked on rebuilding it from nothing. Pointed at
+# a persistent volume, the last aggregation survives the restart, so that first request serves it
+# instantly and refreshes in the background — the same warm path every later request already takes.
+FEED_CACHE = os.environ.get('XC_FEED_CACHE', '/tmp/xc_feed_agg.json')
+
 _rep_cache = {}
 # DISK-BACKED rep cache. Each account_rep miss is a ~0.66s mainnet RPC, and the feed re-aggregates every
 # few seconds in a FRESH helper process — so an in-memory-only cache re-fetched every reporter's rep on
@@ -1127,15 +1135,25 @@ def _bootstrap():
     if os.environ.get('XC_ISOLATE') == '1':
         s = [u.rstrip('/') for u in os.environ.get('XCHAT_BOOTSTRAP', '').split(',') if u.strip()]
         return s or ['http://127.0.0.1:1']      # unroutable: isolated and misconfigured beats leaking
-    # UNION of every source, ledger first — a node keeps its own co-located relay AND adds the ones
-    # it discovers on-chain, instead of a discovery replacing (and starving) the local set.
-    s = list(onchain_relays()) + list(known_relays())
+    # PROCESS STARTUP MUST NOT BLOCK ON THE LEDGER. This runs at IMPORT (`BOOTSTRAP = _bootstrap()`),
+    # and a COLD on-chain scan fires many public-RPC calls (20s timeout each); when those RPCs are slow
+    # or down the scan runs for minutes. Doing it synchronously here once blocked the node's front from
+    # binding past Fly's health-check grace and took the whole node offline — a single slow public RPC
+    # must never do that. So bootstrap from FAST, no-network sources only (the persisted known-relay
+    # cache, the local hint file, the env) and refresh the ledger set in the BACKGROUND. On-demand
+    # callers of onchain_relays() (feed aggregation, /api/relaydir) still get the full set, cached, on
+    # first use — the union is rebuilt there, just not on the import critical path.
+    s = list(known_relays())
     try:
         s += [l.strip() for l in open('/tmp/xchat_bootstrap.txt') if l.strip()]
     except Exception:
         pass
     s += [u for u in os.environ.get('XCHAT_BOOTSTRAP', '').split(',') if u]
     s = [u.rstrip('/') for u in dict.fromkeys(s) if u]
+    def _warm_onchain():
+        try: onchain_relays()          # populate _ONCHAIN_CACHE + the known-relay list off the hot path
+        except Exception: pass
+    threading.Thread(target=_warm_onchain, daemon=True).start()
     return s or ['http://127.0.0.1:7401', 'http://127.0.0.1:7402', 'http://127.0.0.1:7403']
 BOOTSTRAP = _bootstrap()
 HEAD_TTL = int(os.environ.get('XC_HEAD_TTL', '2592000'))  # 30-day backstop; the relay keeps a head until

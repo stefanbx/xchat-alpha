@@ -127,8 +127,13 @@ ALICE = 'nano_1alice'
 BOB = 'nano_1bob'
 
 
-def suite(relay):
-    """The interop + forward-compat + constraint checks, run against ONE relay version."""
+def suite(relay, mid_required):
+    """The interop + forward-compat + constraint checks, run against ONE relay version.
+
+    mid_required: True for the working-tree relay, which MUST dedup on `mid`. For the deployed baseline
+    it is False — an old relay legitimately lacks the fix and drops one of two same-second sealed
+    messages; that is a KNOWN, additive gap (it still stores the fields, so a mixed network carries the
+    format), and the harness characterises it rather than failing on expected old behaviour."""
     L = relay.label
 
     # ---- a current record round-trips unchanged ------------------------------------------------
@@ -150,17 +155,35 @@ def suite(relay):
               f'[{L}] unknown fields (epk, v) survive intact — additive changes are safe to store',
               json.dumps(got[0]))
 
-    # ---- CONSTRAINT 1: dedup is on (from, ts). Hiding `from` collapses distinct messages. --------
-    # Two DIFFERENT sealed messages, same second, no plaintext sender: both dedup to (None, 3000).
-    relay.post_dm({'to': BOB, 'ts': 3000, 'ct': 'FIRST', 'epk': 'd1' * 32})
-    relay.post_dm({'to': BOB, 'ts': 3000, 'ct': 'SECOND', 'epk': 'd2' * 32})
-    at3000 = [m for m in relay.get_dms(BOB) if m.get('ts') == 3000]
-    # On the CURRENT relay this is 1 (the hazard). A sealed-sender relay must make it 2 by deduping on
-    # a message id instead. Either way the number is the contract, so a change to it is deliberate.
-    check(len(at3000) == 1,
-          f'[{L}] CONSTRAINT: two senderless records in one second dedup to one — sealed sender '
-          f'needs its own message id',
-          f'got {len(at3000)} (current relay: expect 1; a fixed relay: expect 2 and this test updates)')
+    # ---- DEDUP: sealed records carry their own `mid`, so `from` no longer has to be visible. -------
+    # Two DIFFERENT sealed messages in the same second with DISTINCT mids must BOTH survive (the old
+    # (from, ts) key would have collapsed them to (None, 3000) and dropped one). This is the relay half
+    # of sealed sender — it fails against a pre-sealed-sender baseline, which is precisely the signal
+    # that such a relay needs updating before it can carry same-second sealed traffic without loss.
+    relay.post_dm({'to': BOB, 'ts': 3000, 'mid': 'm1' * 8, 'ct': 'FIRST', 'epk': 'd1' * 32})
+    relay.post_dm({'to': BOB, 'ts': 3000, 'mid': 'm2' * 8, 'ct': 'SECOND', 'epk': 'd2' * 32})
+    at3000 = len([m for m in relay.get_dms(BOB) if m.get('ts') == 3000])
+    if mid_required:
+        check(at3000 == 2,
+              f'[{L}] two sealed records in one second with distinct mids BOTH survive (dedup moved to mid)',
+              f'got {at3000}')
+        # And the mid really IS the dedup key: the same mid twice is one record (a re-post/gossip echo).
+        relay.post_dm({'to': BOB, 'ts': 3001, 'mid': 'm3' * 8, 'ct': 'ONCE', 'epk': 'd3' * 32})
+        relay.post_dm({'to': BOB, 'ts': 3001, 'mid': 'm3' * 8, 'ct': 'ONCE', 'epk': 'd3' * 32})
+        at3001 = len([m for m in relay.get_dms(BOB) if m.get('ts') == 3001])
+        check(at3001 == 1, f'[{L}] a repeated mid dedups to one (gossip echoes do not pile up)',
+              f'got {at3001}')
+    elif at3000 == 2:
+        check(True, f'[{L}] this baseline ALREADY dedups on mid (both same-second records survive)')
+    else:
+        # The deployed relay still keys on (from, ts): with `from` hidden both collapse to (None, ts)
+        # and one is lost. Expected and additive — the record + its fields are stored (see forward-compat
+        # above), so the network carries sealed sender; a same-second collision just needs the relay
+        # updated. This line is the harness naming that gap, not a failure of the working-tree code.
+        check(at3000 == 1,
+              f'[{L}] KNOWN GAP: a pre-sealed-sender relay drops one of two same-second sealed messages '
+              f'(needs updating to dedup on mid); it still stores the format, so the network carries it',
+              f'got {at3000}')
 
     # ---- CONSTRAINT 2: the SENDER reads their own sent mail via `from == acc`. ------------------
     # A record addressed to BOB with a plaintext sender ALICE is visible to BOTH. Remove the sender
@@ -202,10 +225,12 @@ def main():
         new = Relay('NEW', REPO)
         check(True, 'both relay versions booted')
 
+        # The working tree MUST have the mid-dedup fix; the deployed baseline may or may not (an old
+        # release does not, and the harness names that gap instead of failing on it).
         print('\n--- OLD (the relay already deployed in the field) ---')
-        suite(old)
+        suite(old, mid_required=(base_sha == head_sha))
         print('\n--- NEW (the working tree, where sealed sender will live) ---')
-        suite(new)
+        suite(new, mid_required=True)
 
         # Cross-version: the deployed OLD relay must serve a record posted in the future shape so a
         # NEW client fetching from an OLD relay is not left blind.

@@ -50,6 +50,7 @@ def diff_for(subtype):
 WORK_DISCOVER = os.environ.get('XC_WORK_DISCOVER', '1') != '0'
 _WORK_PEERS_CACHE = os.environ.get('XC_WORK_PEERS_CACHE', '/tmp/xc_work_peers.json')
 _WORK_PEERS_TTL = float(os.environ.get('XC_WORK_PEERS_TTL', '600'))
+_MESH_WORK_MAX = int(os.environ.get('XC_MESH_WORK_MAX', '40'))   # cap mesh reach bases taken from one hub
 
 
 def _work_relays():
@@ -76,6 +77,29 @@ def _work_relays():
     return _refresh_work_relays()          # nothing cached at all: this one call has to wait
 
 
+def _mesh_work_candidates(hubs):
+    # Public MESH nodes (e.g. a GPU laptop behind NAT) are reachable ONLY through a hub, by an ephemeral
+    # token the hub lists on /mesh_nodes. Being private-by-secret, they never enter the /relays gossip set
+    # that discover_relays() walks — so without this they could never join the work race, however fast
+    # their GPU, which is exactly the "hub-fronted reach" capacity going unused. Sweep each known hub's
+    # /mesh_nodes for the reach bases (<hub>/r/<token>); a non-hub simply 404s and is skipped. Each base is
+    # then probed for the 'work' cap like any other relay, and every answer it returns is validated
+    # locally (_work_ok), so nothing here has to trust a mesh node.
+    out = []
+    for hub in hubs:
+        base = hub.rstrip('/')
+        if '/r/' in base:                              # already a reach url, not a hub — don't sweep it
+            continue
+        try:
+            d = json.loads(urllib.request.urlopen(base + '/mesh_nodes', timeout=4).read())
+        except Exception:
+            continue                                   # not a hub / unreachable — skip
+        for tok in (d.get('nodes') or [])[:_MESH_WORK_MAX]:
+            if isinstance(tok, str) and tok:
+                out.append('%s/r/%s' % (base, tok))
+    return out
+
+
 def _refresh_work_relays():
     found = []
     try:
@@ -86,6 +110,9 @@ def _refresh_work_relays():
             except Exception:
                 return None
         relays = [r for r in xc.discover_relays() if r.startswith('http')]
+        # Add hub-fronted mesh nodes: they advertise the work cap too but never appear in /relays (above).
+        relays += _mesh_work_candidates(relays)
+        relays = list(dict.fromkeys(r.rstrip('/') for r in relays))   # dedupe, keep first-seen order
         if relays:
             with ThreadPoolExecutor(max_workers=min(8, len(relays))) as ex:
                 found = [r for r in ex.map(_probe, relays) if r]

@@ -7,7 +7,7 @@
 # Wallet state is namespaced per instance (XC_NS = port): one node = one identity ("run your own node").
 #
 #   python3 kt_server.py 8790            # serve on :8790 (binds 0.0.0.0 so a phone/relay can reach it)
-import os, sys, json, subprocess, urllib.parse, urllib.request, time, threading, queue, base64, hashlib
+import os, sys, json, subprocess, urllib.parse, urllib.request, urllib.error, time, threading, queue, base64, hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -191,27 +191,45 @@ FEED_TTL = float(os.environ.get('XC_FEED_TTL', '12'))
 _feed_ts = [0.0]
 _feed_lock = threading.Lock()
 
+def _refresh_feed_bg():
+    # Rebuild the aggregation OFF the request path. spawn() is a blocking subprocess.run — run inline it
+    # made the one request that won the refresh eat the whole aggregation (a full relay fan-out + rep
+    # RPCs + content fetch). Warm that is ~1s, but right after a redeploy the persisted cache is stale
+    # AND the in-memory freshness clock is 0, so that first request hit exactly this refresh and wore
+    # the cold 3-8s itself. On a thread, every request serves the cache instantly; the refresh lands a
+    # beat later for the next poll. Holds _feed_lock for the whole run (handed over by the caller) so at
+    # most one aggregation runs at a time; releases it here no matter how spawn exits.
+    try:
+        spawn('xc_feed.py')
+    finally:
+        _feed_lock.release()
+
 def api_feed(query=None):
     now = time.time()
-    if not os.path.exists('/tmp/xc_feed_agg.json'):
-        # COLD START (fresh node, or a redeploy cleared /tmp): BLOCK on the first aggregation so the very
-        # first feed is never empty. Only one caller aggregates per TTL window; others wait on the lock,
-        # then read the fresh file. If it fails, they fall through to empty fast (no thundering herd).
+    if not os.path.exists(xc.FEED_CACHE):
+        # COLD START — no cache anywhere. With FEED_CACHE on a PERSISTENT volume this is now a genuine
+        # first-ever boot (not every redeploy), so blocking the very first request to rebuild it — rather
+        # than serving an empty feed — is a once-in-a-node-lifetime cost, not a per-deploy one. Only one
+        # caller aggregates per TTL window; others wait on the lock, then read the fresh file. If it
+        # fails, they fall through to empty fast (no thundering herd).
         with _feed_lock:
-            if not os.path.exists('/tmp/xc_feed_agg.json') and time.time() - _feed_ts[0] > FEED_TTL:
+            if not os.path.exists(xc.FEED_CACHE) and time.time() - _feed_ts[0] > FEED_TTL:
                 _feed_ts[0] = time.time()
                 spawn('xc_feed.py')
     elif now - _feed_ts[0] > FEED_TTL and _feed_lock.acquire(blocking=False):
+        # A cache EXISTS but is stale: serve it right now, refresh on a background thread. _feed_ts is
+        # advanced BEFORE the thread starts so a burst of requests in the same window all fall through
+        # to the instant serve rather than each queuing another refresh.
+        _feed_ts[0] = now
         try:
-            _feed_ts[0] = now                                # warm refresh: serve the stale cache meanwhile
-            spawn('xc_feed.py')
-        finally:
-            _feed_lock.release()
+            threading.Thread(target=_refresh_feed_bg, daemon=True).start()
+        except Exception:
+            _feed_lock.release()                             # never leak the lock if the thread won't start
     # The aggregation file is a CACHE that must persist for FEED_TTL, so read it WITHOUT consuming it —
     # unlike a one-shot helper result. (read() deletes what it reads; using it here defeated the cache
     # and re-aggregated on every request, which is what made the feed blink slow-or-empty.)
     try:
-        content = open('/tmp/xc_feed_agg.json').read() or '{}'
+        content = open(xc.FEED_CACHE).read() or '{}'
     except Exception:
         content = '{}'
     blocks = read('/tmp/xc_onchain_count.txt', '0') or '0'
@@ -358,6 +376,94 @@ def api_pin_targets():
         except Exception:
             pass
     return json.dumps({'relays': out})
+
+def _blind_relay_ok(relay):
+    """Only forward to a relay this node actually knows — never an arbitrary client-supplied URL, which
+    would make the node an open proxy (SSRF). Matched on the normalized URL the node itself discovered."""
+    if not relay:
+        return None
+    want = relay.rstrip('/')
+    for r in xc.discover_relays():
+        if r.rstrip('/') == want:
+            return want
+    return None
+
+def api_relay_readkey(relay):
+    # Proxy a relay's SIGNED read-key advertisement, so the client can fetch it without revealing its IP
+    # to that relay — the node stays the only IP-hop. The client verifies the signature against the
+    # relay's ledger account, so this node cannot substitute a key: a swapped one just fails that check
+    # and the client falls back to an ordinary read.
+    url = _blind_relay_ok(relay)
+    if not url:
+        return json.dumps({'error': 'unknown relay'})
+    try:
+        return urllib.request.urlopen(url + '/relaykey', timeout=4).read().decode()
+    except Exception as e:
+        return json.dumps({'error': 'relaykey fetch failed: %s' % e})
+
+def api_dm_blind_read(body):
+    # BLIND MAILBOX READ forwarder — the fix for IP<->account correlation. The body {relay, epk, ct}
+    # carries a read request sealed to the relay's key; this node forwards it and pipes the sealed reply
+    # straight back. The node sees the client IP and which relay, but NOT the account (inside `ct`) and
+    # NOT the reply (also sealed): no single operator holds (client IP, account). Deliberately OUTSIDE
+    # ipc_lock('dm') — it is one forward, and holding the DM lock across a network round-trip is exactly
+    # the starvation _dm_watch documents.
+    relay = body.get('relay', '') if isinstance(body, dict) else ''
+    url = _blind_relay_ok(relay)
+    if not url:
+        return json.dumps({'error': 'unknown relay'})
+    try:
+        payload = json.dumps({'epk': body.get('epk', ''), 'ct': body.get('ct', '')}).encode()
+        out = urllib.request.urlopen(urllib.request.Request(
+            url + '/dm_sealed_read', payload, {'Content-Type': 'application/json'}), timeout=8).read()
+        return out.decode()
+    except Exception as e:
+        return json.dumps({'error': 'blind read failed: %s' % e})
+
+def api_dm_inbox(query):
+    # IN-PROCESS mailbox read — the SAME relay fan-out xc_dm.py did, but without the per-poll subprocess
+    # spawn (~130ms of interpreter start-up + imports) and without ipc_lock('dm'). The DM poll is the
+    # hottest read in the app (every ~5s per open thread, plus the badge refresh), so that fixed spawn
+    # tax dominated it — the incremental `since=` shrinks the payload but the spawn cost it anyway. Here
+    # it is a direct fan-out (a few ms), exactly like api_dm_blind_read. Behaviour is unchanged: the
+    # prove-ownership auth (ts/sig/pub) is passed straight through to the relays, and results are deduped
+    # and `since`-filtered the way xc_dm.py did. No shared /tmp files, so no lock is needed.
+    q = lambda k: (query.get(k, [''])[0])
+    acc = q('account')
+    try:
+        since = int(q('since') or 0)
+    except ValueError:
+        since = 0
+    qs = ''
+    if q('sig') and q('pub') and q('ts'):
+        try:
+            qs = '&ts=%d&sig=%s&pub=%s' % (int(q('ts')),
+                                           urllib.parse.quote(q('sig')), urllib.parse.quote(q('pub')))
+        except Exception:
+            qs = ''
+    import concurrent.futures as _cf
+    relays = xc.discover_relays()
+
+    def _one(r):
+        try:
+            return json.loads(urllib.request.urlopen(
+                r + '/dm?account=' + acc + qs, timeout=4).read()).get('dms', [])
+        except Exception:
+            return []
+
+    seen, dms = set(), []
+    if relays:
+        with _cf.ThreadPoolExecutor(max_workers=max(1, len(relays))) as ex:
+            for got in ex.map(_one, relays):
+                for m in got:
+                    k = (m.get('from'), m.get('ts'))
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    if since and int(m.get('ts') or 0) < since:
+                        continue
+                    dms.append(m)
+    return json.dumps({'ok': True, 'account': acc, 'since': since, 'dms': dms})
 
 def api_head(acct):
     # the account's current signed head (seq + cid) across relays — the app re-signs it with a fresh
@@ -520,12 +626,30 @@ def _work_mode():
     _work_mode_cache[0] = now; _work_mode_cache[1] = mode
     return mode
 
-def api_status():
+_status_cache = {'ts': 0.0, 'height': '0', 'work': 'rpc'}
+_status_lock = threading.Lock()
+
+def _status_refresh():
+    # Height + work-mode for the status line, refreshed OFF the request path. block_count is a public-RPC
+    # call; doing it inline made /api/status — which is ALSO the Fly health check — block on a slow/down
+    # RPC, fail the check, and take the whole node offline (a public RPC's latency must never do that).
     try:
-        bc = xc.rpc_cached({'action': 'block_count'}, ttl=10)  # chain height for display; 10s stale is invisible
-        return json.dumps({'online': True, 'height': bc.get('count', '0'), 'work': _work_mode()})
+        bc = xc.rpc_cached({'action': 'block_count'}, ttl=10)
+        with _status_lock:
+            _status_cache['height'] = bc.get('count', _status_cache['height'])
+            _status_cache['work'] = _work_mode()
+            _status_cache['ts'] = time.time()
     except Exception:
-        return '{"online":false}'
+        pass
+
+def api_status():
+    # MUST be instant and never block: the process being able to answer IS the health signal. Serve the
+    # last-known height and kick a background refresh when it goes stale — never wait on the RPC here.
+    with _status_lock:
+        st = dict(_status_cache)
+    if time.time() - st['ts'] > 10:
+        threading.Thread(target=_status_refresh, daemon=True).start()
+    return json.dumps({'online': True, 'height': st['height'], 'work': st['work']})
 
 # ---- PUSH DELIVERY -----------------------------------------------------------------------------
 # A DM used to arrive when the recipient next got round to asking: a 5s poll inside a thread, 12s for
@@ -782,16 +906,12 @@ def route(path, query, body):
         except Exception:
             pass                      # never let the notify path fail a send that already succeeded
         return out
-    if path.startswith('/api/dm_inbox'):
-        with ipc_lock('dm'):
-            put('/tmp/xc_dm_acct.txt', q('account'))
-            put('/tmp/xc_dm_since.txt', q('since') or '0')   # incremental: only ciphertext at/after
-            # Proof the caller owns this mailbox, passed straight through to the relays. Reading a
-            # mailbox exposes who an account talks to, so it should cost a signature; the node has
-            # no seed and cannot forge one.
-            put('/tmp/xc_dm_auth.json', json.dumps({'ts': q('ts'), 'sig': q('sig'), 'pub': q('pub')})
-                if q('sig') else '')
-            spawn('xc_dm.py','inbox');       return read('/tmp/xc_dm_result.json','{}')
+    # Blind mailbox read: fetch a relay's signed read key, then read through it so no single operator
+    # sees (client IP, account). Both match BEFORE /api/dm_inbox (distinct prefixes, but keep them near
+    # the read path they replace). Neither takes ipc_lock('dm') — see api_dm_blind_read.
+    if path.startswith('/api/relay_readkey'): return api_relay_readkey(q('relay'))
+    if path.startswith('/api/dm_blind_read'): return api_dm_blind_read(body)
+    if path.startswith('/api/dm_inbox'): return api_dm_inbox(query)
 
     if path.startswith('/api/blob_put'):
         with ipc_lock('blob'):
@@ -893,10 +1013,33 @@ class H(BaseHTTPRequestHandler):
                                      data=(raw if self.command == 'POST' else None),
                                      headers={'Content-Type': 'application/json',
                                               'X-Forwarded-For': client_ip}, method=self.command)
+        # Mesh reverse-tunnel paths behave nothing like a normal relay call: this node fronts its
+        # loopback relay as a mesh ENTRY, so /_tunnel/poll long-polls for work (~POLL_HOLD_S) and
+        # /r/<token> holds the request open while the home relay answers (~PUBLIC_WAIT_S). A 10s cap
+        # would sever the poll; and the mesh client keys on the REAL status (200 vs 504), which the
+        # normal proxy flattens to 200 — so forward status + body faithfully with a generous timeout.
+        p = urllib.parse.urlparse(self.path).path
+        if p.startswith('/_tunnel/') or p.startswith('/r/'):
+            return self._proxy_tunnel(req)
         try:
             self._send(urllib.request.urlopen(req, timeout=10).read())
         except Exception as e:
             self._send(json.dumps({'error': 'relay: ' + str(e)}))
+
+    def _proxy_tunnel(self, req):
+        try:
+            r = urllib.request.urlopen(req, timeout=65)
+            status, body, ctype = r.getcode(), r.read(), r.headers.get('Content-Type', 'application/json')
+        except urllib.error.HTTPError as he:          # a 4xx/5xx from the relay (e.g. 504 no-answer) is a real answer
+            status, body, ctype = he.code, he.read(), he.headers.get('Content-Type', 'application/json')
+        except Exception as e:
+            status, body, ctype = 502, json.dumps({'ok': False, 'error': 'tunnel proxy: ' + str(e)}).encode(), 'application/json'
+        self.send_response(status)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self._write_body(body)
 
     def _handle(self, body, raw=b''):
         u = urllib.parse.urlparse(self.path)

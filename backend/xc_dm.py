@@ -30,28 +30,69 @@ def verify(pub, msg, sig):
 
 
 def post(path, obj):
-    ok = 0
-    for r in RELAYS:
+    # Fan out to every relay IN PARALLEL. Serially, one dead relay blocks the whole write behind its
+    # 4s timeout — and with a relay in the set down (a sleeping laptop, a churned tunnel), that is why
+    # sending a DM would spin for 15-30s while the recipient's own relay timed out. This is the send
+    # side of the same fix already applied to the inbox read: the fan-out now costs the SLOWEST single
+    # relay (~4s worst case), not the sum, so one down relay can no longer stall a send for everyone.
+    import concurrent.futures as _cf
+    body = json.dumps(obj).encode()
+
+    def _one(r):
         try:
-            urllib.request.urlopen(urllib.request.Request(r + path, json.dumps(obj).encode(),
-                                   {'Content-Type': 'application/json'}), timeout=4).read()
-            ok += 1
+            urllib.request.urlopen(urllib.request.Request(
+                r + path, body, {'Content-Type': 'application/json'}), timeout=4).read()
+            return 1
         except Exception:
-            pass
-    return ok
+            return 0
+
+    if not RELAYS:
+        return 0
+    with _cf.ThreadPoolExecutor(max_workers=len(RELAYS)) as ex:
+        return sum(ex.map(_one, RELAYS))
 
 
 def peer_dm_pk(account):                                   # fetch + verify a peer's signed DM public key
-    for r in RELAYS:
+    # Returns {'dm_pk': ..., 'caps': ...} — caps is the peer's signed sealed-sender capability (empty if
+    # absent or its signature does not check). Query relays IN PARALLEL and take the first VERIFIED key.
+    # Serially, a dead relay ahead of a live one cost its full 4s timeout before the key was even
+    # fetched — and this runs BEFORE every send, so it stacked with the send fan-out to make "message a
+    # peer" spin. The verification is per-record (signature bound to the account), so accepting whichever
+    # verified answer returns first is safe: a relay cannot forge a key, only fail to have one. The caps
+    # signature is checked with the SAME account key, so a relay cannot forge a capability either.
+    def _one(r):
         try:
-            rec = json.loads(urllib.request.urlopen(r + '/dmkey?account=' + account, timeout=4).read()).get('record')
+            rec = json.loads(urllib.request.urlopen(
+                r + '/dmkey?account=' + account, timeout=4).read()).get('record')
             if not rec:
-                continue
+                return None
             msg = xc.sig_canon('dmkey', rec['account'], rec['ts'], rec['dm_pk'])
-            if rec['account'] == account and xc.pub_to_addr(rec['pub']) == account and verify(rec['pub'], msg, rec['sig']):
-                return rec['dm_pk']
+            if rec['account'] == account and xc.pub_to_addr(rec['pub']) == account \
+               and verify(rec['pub'], msg, rec['sig']):
+                caps = rec.get('caps', ''); caps_sig = rec.get('caps_sig', '')
+                if not (caps and caps_sig
+                        and verify(rec['pub'], xc.sig_canon('dmkeycaps', rec['account'], rec['ts'], caps), caps_sig)):
+                    caps = ''
+                return {'dm_pk': rec['dm_pk'], 'caps': caps}
         except Exception:
             pass
+        return None
+
+    if not RELAYS:
+        return None
+    # Take the first VERIFIED key in COMPLETION order, not submission order. ThreadPoolExecutor.map
+    # yields in submission order, so a slow/dead FIRST relay's full 4s timeout was paid before a faster
+    # relay's ready answer could be read — on the path that runs before every send. Daemon workers feed
+    # a queue as they finish, so the fastest verified answer returns at once and the stragglers die with
+    # this short-lived process instead of blocking its exit.
+    import threading, queue as _q
+    out = _q.Queue()
+    for _r in RELAYS:
+        threading.Thread(target=lambda r=_r: out.put(_one(r)), daemon=True).start()
+    for _ in RELAYS:
+        got = out.get()
+        if got:
+            return got
     return None
 
 
@@ -62,12 +103,20 @@ if mode == 'register':
     sig = rec.get('sig', ''); pub = rec.get('pub', '')
     if not (xc.pub_to_addr(pub) == acc and verify(pub, xc.sig_canon('dmkey', acc, ts, dm_pk), sig)):
         json.dump({'ok': False, 'error': 'bad signature'}, open('/tmp/xc_dm_result.json', 'w')); sys.exit()
-    relays = post('/dmkey', {'account': acc, 'dm_pk': dm_pk, 'ts': ts, 'sig': sig, 'pub': pub})
+    out = {'account': acc, 'dm_pk': dm_pk, 'ts': ts, 'sig': sig, 'pub': pub}
+    # Additive: a capability advertisement (which sealed-sender formats this account can read), signed
+    # SEPARATELY from the dm_pk binding. Carry it through only when its own signature verifies, so the
+    # node never relays a caps claim it did not check — a stripped or forged flag simply does not appear.
+    caps = rec.get('caps', ''); caps_sig = rec.get('caps_sig', '')
+    if caps and caps_sig and verify(pub, xc.sig_canon('dmkeycaps', acc, ts, caps), caps_sig):
+        out['caps'] = caps; out['caps_sig'] = caps_sig
+    relays = post('/dmkey', out)
     json.dump({'ok': True, 'relays': relays}, open('/tmp/xc_dm_result.json', 'w'))
 
 elif mode == 'keyget':
     account = rd('/tmp/xc_dm_peer.txt')
-    json.dump({'ok': True, 'account': account, 'dm_pk': peer_dm_pk(account)},
+    info = peer_dm_pk(account) or {}
+    json.dump({'ok': True, 'account': account, 'dm_pk': info.get('dm_pk'), 'caps': info.get('caps', '')},
               open('/tmp/xc_dm_result.json', 'w'))
 
 elif mode == 'send':

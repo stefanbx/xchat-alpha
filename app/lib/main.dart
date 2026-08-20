@@ -29,6 +29,7 @@ import 'package:crypto/crypto.dart' show sha256;
 import 'package:url_launcher/url_launcher.dart';
 import 'body.dart';
 import 'wallet.dart';
+import 'mesh.dart';
 import 'ledger_discovery.dart';
 
 // The engine/relay endpoint. Default: the Android emulator reaches the host loopback at
@@ -184,6 +185,7 @@ const Color kDim = Color(0xFF71767B);
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await _loadEndpoints();                              // persisted last-good endpoint + failover list
+  await MeshReach.load();                              // rendezvous secret + hubs for reaching a NAT'd node
   runApp(const XChatApp());
 }
 
@@ -266,6 +268,13 @@ String genSeed() {
   return List.generate(32, (_) => r.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
 }
 
+/// n random bytes as hex. Used for a sealed DM's message id, which must be unpredictable (it is the
+/// relay's dedup key now that `from` is hidden) and unlinkable to the sender.
+String randHex(int nBytes) {
+  final r = math.Random.secure();
+  return List.generate(nBytes, (_) => r.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+}
+
 // who you follow (local; small enough to also publish to relays for portability later)
 class FollowStore {
   static const _k = 'xchat_follows';
@@ -282,11 +291,13 @@ class Settings {
   int reposterSplit; // % of a tip that rewards whoever reposted it
   bool notifyLike, notifyComment, notifyTip, notifyDm;
   bool readReceipts;   // tell the other side when you have read their messages
+  bool showPresence;   // publish "online now" via the FAST head heartbeat — OPT-IN; off keeps you private
   bool autoReceive;   // claim incoming XNO without being asked — what every Nano wallet does
   int forYouFreshness;      // For You ranking: 0 = popular, 1 = balanced, 2 = latest
   bool forYouBoostFollows;  // boost posts from people you follow
   bool autoSweep;           // auto-forward balance above the safety cap to a savings address
   String sweepAddr;         // the external savings address (this app holds no key for it)
+  int feedCacheSize;        // max posts kept on-device; the feed loads from here + fetches only new
   Settings({
     this.defaultTip = 0.01,
     this.relaySplit = 10,
@@ -297,10 +308,12 @@ class Settings {
     this.notifyDm = true,
     this.autoReceive = true,
     this.readReceipts = true,
+    this.showPresence = false,
     this.forYouFreshness = 1,
     this.forYouBoostFollows = true,
     this.autoSweep = false,
     this.sweepAddr = '',
+    this.feedCacheSize = 300,
   });
   int get creatorSplit => 100 - relaySplit - reposterSplit;
 }
@@ -322,10 +335,12 @@ class SettingsStore {
         notifyDm: m['notifyDm'] ?? true,
         autoReceive: m['autoReceive'] ?? true,
         readReceipts: m['readReceipts'] ?? true,
+        showPresence: m['showPresence'] ?? false,
         forYouFreshness: (m['forYouFreshness'] as num?)?.toInt() ?? 1,
         forYouBoostFollows: m['forYouBoostFollows'] ?? true,
         autoSweep: m['autoSweep'] ?? false,
         sweepAddr: m['sweepAddr'] ?? '',
+        feedCacheSize: (m['feedCacheSize'] as num?)?.toInt() ?? 300,
       );
     } catch (_) {
       return Settings();
@@ -345,10 +360,12 @@ class SettingsStore {
           'notifyDm': s.notifyDm,
           'autoReceive': s.autoReceive,
           'readReceipts': s.readReceipts,
+          'showPresence': s.showPresence,
           'forYouFreshness': s.forYouFreshness,
           'forYouBoostFollows': s.forYouBoostFollows,
           'autoSweep': s.autoSweep,
           'sweepAddr': s.sweepAddr,
+          'feedCacheSize': s.feedCacheSize,
         }));
   }
 }
@@ -1012,6 +1029,18 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         const SizedBox(height: 8),
         const Text("Next you'll confirm a few characters from your backup — the app can't recover this seed for you.",
             style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+        const SizedBox(height: 14),
+        // Set the anonymity model at creation, before any funds arrive: the account is public on the
+        // ledger, and how it is funded is what does or doesn't tie it to a real name. The receive sheet
+        // repeats this at each funding; here it lands first. See docs/ANONYMITY.md.
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: const [
+          Icon(Icons.public, size: 15, color: Color(0xFF4DD0A7)),
+          SizedBox(width: 8),
+          Expanded(
+            child: Text('This account is also public on the Nano ledger. Fund it in a way that isn\'t tied to your name to stay pseudonymous.',
+                style: TextStyle(color: kDim, fontSize: 12, height: 1.45)),
+          ),
+        ]),
         const Spacer(),
         _bigBtn('Continue', _saved ? kAccent : kLine, _saved ? Colors.black : kDim,
             _saved ? () => _startVerify() : null),
@@ -1181,6 +1210,19 @@ class Post {
         replyTo: j['reply_to'],
         poll: (j['poll']?['options'] as List?)?.map((e) => '$e').toList(),
       );
+  // Round-trips through fromJson (same keys) for the on-device feed cache. Runtime-only fields
+  // (liked/localLikes/pending) are intentionally not persisted — engagement counts refresh on load.
+  Map<String, dynamic> toJson() => {
+        'id': id, 'handle': handle, 'account': account, 'kind': kind, 'text': text,
+        if (title != null) 'title': title,
+        if (media != null) 'media': media,
+        if (thumb != null) 'thumb': thumb,
+        if (dur != null) 'dur': dur,
+        'ts': ts, 'likes': likes, 'reposts': reposts,
+        if (quote != null) 'quote': quote,
+        if (replyTo != null) 'reply_to': replyTo,
+        if (poll != null) 'poll': {'options': poll},
+      };
 }
 
 // a moderation labeler: on-chain identity, reputation (Nano voting weight),
@@ -1244,16 +1286,10 @@ class Api {
     final d = jsonDecode(r.body);
     final c = d['content'] ?? {};
     final posts = (c['posts'] as List?) ?? [];
-    // Cache the last FULL feed that actually has content, so a cold-node blip (a machine just restarted
-    // and its feed cache is still warming) or an offline launch shows the last feed instead of blanking.
     feedHasMore = c['more'] == true;
-    // Only the FIRST page is cached. Caching a later page would replace the cold-start feed with a
-    // slice from the middle of the timeline, so the next launch would open on old posts.
-    if (since == 0 && before == 0 && posts.isNotEmpty) {
-      try {
-        (await SharedPreferences.getInstance()).setString('xchat_feed_cache', r.body);
-      } catch (_) {}
-    }
+    // Persistence of the feed is owned by the feed screen now (loadCachedPosts/saveCachedPosts below):
+    // it keeps a bounded, merged set across launches and fetches only what's new, instead of this
+    // caching a single full-page snapshot that the next launch threw away.
     return FeedData(
         posts.map((p) => Post.fromJson(p)).toList(),
         (d['onchain_blocks'] ?? 0) as int,
@@ -1261,19 +1297,34 @@ class Api {
         (c['relays_total'] ?? 0) as int);
   }
 
-  static Future<FeedData?> cachedFeed() async {
+  // ---- on-device feed cache: a bounded, persisted set of posts -----------------------------------
+  // The feed loads from here INSTANTLY on launch (no blank frame, no full re-download), then fetches
+  // only posts newer than the newest cached one. The set is capped to the user's feedCacheSize and
+  // trimmed oldest-first on save — the same idea as a relay bounding its own store rather than keeping
+  // every post forever.
+  static const _feedCacheKey = 'xchat_feed_posts';
+
+  static Future<List<Post>> loadCachedPosts() async {
     try {
-      final s = (await SharedPreferences.getInstance()).getString('xchat_feed_cache');
-      if (s == null || s.isEmpty) return null;
-      final d = jsonDecode(s);
-      final c = d['content'] ?? {};
-      final posts = (c['posts'] as List?) ?? [];
-      if (posts.isEmpty) return null;
-      return FeedData(posts.map((p) => Post.fromJson(p)).toList(), (d['onchain_blocks'] ?? 0) as int,
-          (c['relays_up'] ?? 0) as int, (c['relays_total'] ?? 0) as int);
+      final s = (await SharedPreferences.getInstance()).getString(_feedCacheKey);
+      if (s == null || s.isEmpty) return [];
+      final list = (jsonDecode(s) as List)
+          .map((e) => Post.fromJson(e as Map<String, dynamic>))
+          .toList();
+      list.sort((a, b) => b.ts.compareTo(a.ts));   // newest first, ready to render
+      return list;
     } catch (_) {
-      return null;
+      return [];
     }
+  }
+
+  static Future<void> saveCachedPosts(List<Post> posts, int cap) async {
+    try {
+      final sorted = [...posts]..sort((a, b) => b.ts.compareTo(a.ts));
+      final capped = (cap > 0 && sorted.length > cap) ? sorted.sublist(0, cap) : sorted;
+      await (await SharedPreferences.getInstance())
+          .setString(_feedCacheKey, jsonEncode(capped.map((p) => p.toJson()).toList()));
+    } catch (_) {}
   }
 
   // settle the batched off-chain tip tally. The tip is SPLIT immutably on-chain: the creator gets
@@ -1534,14 +1585,28 @@ class Api {
   // the discovered PUBLIC relay origins (https), from the on-chain relay directory — NOT deduped by pin
   // account (pinTargets is), so a peer relay that actually holds a big blob is reachable directly.
   static Future<List<String>> relayUrls() async {
+    final out = <String>[];
+    final relays = <String>[];
     try {
       final r = await http.get(Uri.parse('$kBase/api/relaydir')).timeout(const Duration(seconds: 25));
       final d = jsonDecode(r.body);
       final list = (d['relays'] as List?) ?? (d['active'] as List?) ?? const [];
-      return list.map((e) => '$e').where((u) => u.startsWith('https')).toList();
-    } catch (_) {
-      return [];
+      relays.addAll(list.map((e) => '$e').where((u) => u.startsWith('https')));
+      out.addAll(relays);
+    } catch (_) {}
+    // A hub-fronted NAT'd node is off-ledger, so it never appears in /api/relaydir. Add its reach urls
+    // two ways: (1) a private node we hold the rendezvous secret for; (2) PUBLIC nodes — auto-discovered
+    // by asking every hub we know (the relays above + kBase) "who's attached?" (no secret, no config).
+    // Both are plain <hub>/r/<token> urls — the node's own IP is never exposed anywhere.
+    out.addAll(MeshReach.reachBases());
+    final hubs = [...relays, kBase];
+    if (MeshReach.discovered.isEmpty) {
+      await MeshReach.autoDiscoverFrom(hubs);        // first read: populate before we return
+    } else {
+      MeshReach.autoDiscoverFrom(hubs);              // warm cache: refresh in the background
     }
+    out.addAll(MeshReach.discovered);
+    return out;
   }
 
   // (Api.setWallet removed — the seed never leaves the device; there is no /api/wallet anymore.)
@@ -2034,22 +2099,33 @@ class Api {
     if (w == null) return;
     final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final s = w.signMsg(w.dmKeyMsg(ts, w.dmPub));
+    // Advertise that this client can READ sealed-sender records, signed separately so an old verifier
+    // ignores it and a new sender can trust it (a bare flag could be stripped to force a downgrade).
+    final cs = w.signMsg(w.dmKeyCapsMsg(ts, NanoWallet.dmCaps));
     try {
       await http.post(Uri.parse('$kBase/api/dm_key_set'),
           headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'account': w.account, 'dm_pk': w.dmPub, 'ts': ts, 'sig': s['sig'], 'pub': s['pub']}));
+          body: jsonEncode({'account': w.account, 'dm_pk': w.dmPub, 'ts': ts, 'sig': s['sig'], 'pub': s['pub'],
+                            'caps': NanoWallet.dmCaps, 'caps_sig': cs['sig']}));
     } catch (_) {}
   }
 
-  // fetch + verify a peer's DM public key (signed by their Nano key)
-  static Future<String?> dmKeyGet(String account) async {
+  // fetch + verify a peer's DM public key + capabilities (the node validates BOTH signatures — the
+  // dm_pk binding and the separate caps signature — so `caps` here is a claim the peer really made).
+  static Future<Map<String, String>?> dmKeyInfo(String account) async {
     try {
       final r = await http.get(Uri.parse('$kBase/api/dm_key_get?account=$account'));
-      return jsonDecode(r.body)['dm_pk'] as String?;
+      final j = jsonDecode(r.body);
+      final pk = j['dm_pk'] as String?;
+      if (pk == null) return null;
+      return {'dm_pk': pk, 'caps': '${j['caps'] ?? ''}'};
     } catch (_) {
       return null;
     }
   }
+
+  // Just the DM public key, for the paths where capabilities are irrelevant (authorship checks, etc.).
+  static Future<String?> dmKeyGet(String account) async => (await dmKeyInfo(account))?['dm_pk'];
 
   // encrypted DMs: seal ON-DEVICE (NaCl crypto_box), relay only the ciphertext — the node never
   // sees plaintext or any secret.
@@ -2148,15 +2224,53 @@ class Api {
   static Future<Map<String, dynamic>?> dmSend(String to, String text) async {
     final w = gWallet;
     if (w == null) return null;
-    final peer = await dmKeyGet(to);
-    if (peer == null) return {'ok': false, 'error': 'recipient has not enabled DMs yet'};
-    final ct = w.dmSeal(peer, text);
+    final info = await dmKeyInfo(to);
+    if (info == null) return {'ok': false, 'error': 'recipient has not enabled DMs yet'};
+    final peer = info['dm_pk']!;
     final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    // Send sealed ONLY to a recipient who has advertised (with a signature) that it can read the format.
+    // Otherwise fall back to v1, so an old install never receives a record it cannot open — the format
+    // is safe by construction, not by flag day.
+    final sealed = (info['caps'] ?? '').contains(NanoWallet.dmCaps);
+    final Map<String, dynamic> record;
+    Map<String, dynamic>? selfRecord;   // sealed-sender only: a copy addressed to us, for device sync
+    final String storeKey;
+    if (sealed) {
+      // SEALED SENDER: the relay never learns WE sent this. `to` stays visible (the recipient must be
+      // addressable to pull their own mailbox); `from`/`from_pk`/`to_pk` are gone. `mid` is a random id
+      // so two sealed records in the same second still dedup now that the relay cannot key on `from`.
+      final env = w.dmSealSealed(peer, text);
+      record = {'v': 2, 'to': to, 'ts': ts, 'mid': randHex(16), 'epk': env['epk'], 'ct': env['ct']};
+      // SELF-COPY: also send a sealed record addressed to OURSELF so this sent message survives a seed
+      // restore or reaches a second device — a normal v2 record hides `from` and is addressed to the
+      // peer, so our own mailbox read never returns it. Store the local copy under the SELF-COPY's ct so
+      // the later poll that fetches it dedups (via DmStore.get) instead of showing the message twice.
+      final self = w.dmSealSealedSelf(to, peer, text);
+      selfRecord = {'v': 2, 'to': w.account, 'ts': ts, 'mid': randHex(16), 'epk': self['epk'], 'ct': self['ct']};
+      storeKey = '${self['ct']}';
+    } else {
+      final ct = w.dmSeal(peer, text);
+      record = {'to': to, 'from': w.account, 'from_pk': w.dmPub, 'to_pk': peer, 'ct': ct, 'ts': ts};
+      storeKey = ct;
+    }
     try {
       final r = await http.post(Uri.parse('$kBase/api/dm_send'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'to': to, 'from': w.account, 'from_pk': w.dmPub, 'to_pk': peer, 'ct': ct, 'ts': ts}));
-      return {'ok': jsonDecode(r.body)['ok'] == true, 'ts': ts};
+          headers: {'Content-Type': 'application/json'}, body: jsonEncode(record));
+      final ok = jsonDecode(r.body)['ok'] == true;
+      if (ok && sealed) {
+        // Fire the self-copy to the network (best-effort — the local store below still holds it on this
+        // device if the mirror send fails; only cross-device sync depends on it landing).
+        try {
+          await http.post(Uri.parse('$kBase/api/dm_send'),
+              headers: {'Content-Type': 'application/json'}, body: jsonEncode(selfRecord));
+        } catch (_) {}
+        // Persist our own copy now (immediacy), keyed by the self-copy's ct so the poll that later
+        // fetches that same record from our mailbox recognises it and does not duplicate the bubble.
+        await DmStore.load(w);
+        DmStore.put(storeKey, text, ts, from: w.account, outgoing: true, peer: to, peerPk: peer);
+        await DmStore.flush(w);
+      }
+      return {'ok': ok, 'ts': ts};
     } catch (_) {
       return {'ok': false, 'error': 'send failed'};
     }
@@ -2191,27 +2305,56 @@ class Api {
       final newest = DmStore.newestTs;
       final full = (_dmPoll++ % 10 == 0) || newest == 0;
       final since = full ? 0 : (newest - 600).clamp(0, newest);
-      // Prove we own this mailbox. Reading one exposes who an account talks to, when and how often
-      // — the bodies are sealed but `from`/`to`/`ts` are not — and until now any stranger could ask
-      // a relay for anyone's. The node cannot forge this: it holds no seed.
-      final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-      final auth = w.signMsg(w.dmInboxMsg(ats));
-      final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'
-          '${since > 0 ? '&since=$since' : ''}'
-          '&ts=$ats&sig=${Uri.encodeQueryComponent(auth['sig']!)}'
-          '&pub=${Uri.encodeQueryComponent(auth['pub']!)}'))
-          .timeout(const Duration(seconds: 12));
-      final dms = ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
+      // Fetch the new ciphertext. Prefer a BLIND read (sealed to a ledger-anchored relay, forwarded by
+      // the node without seeing which mailbox) so the node cannot tie our IP to our account; fall back
+      // to the ordinary signed read whenever a blind one is unavailable — a privacy upgrade must never
+      // cost a delivered message. Either way the decrypt loop below is identical. The full sweep reads
+      // EVERY eligible relay (completeness); incremental polls read one (speed).
+      final dms = await _dmFetchRaw(w, since, full);
+      // A sealed (v2) record hides its sender, so authorship is proven by opening the INNER seal under
+      // the sender's LEDGER-published dm_pk. Resolve each `from` to that key at most once per sweep.
+      final Map<String, String?> pkCache = {};
       for (final m in dms) {
-        final outgoing = m['from'] == w.account;
-        final peerAcc = '${outgoing ? m['to'] : m['from']}';
-        final peerPk = '${outgoing ? m['to_pk'] : m['from_pk']}';
         // Already-read messages come from the store; only genuinely NEW ciphertext is decrypted.
         // Keyed by ciphertext, which is safe HERE (unlike inside dmOpen) because this loop has
         // already established the message is addressed to us — a ciphertext that is not ours never
         // reaches put(), so it can never be served from get().
         final ct = '${m['ct']}';
-        if (DmStore.get(ct) != null) continue;            // already held — nothing to decrypt
+        if (ct.isEmpty || DmStore.get(ct) != null) continue;   // already held — nothing to decrypt
+        if (m['v'] == 2 || m['v'] == '2') {
+          // SEALED SENDER. The relay only ever saw an ephemeral key; the true identity is inside the
+          // outer seal. Open the outer with our dm key × the ephemeral key.
+          final outer = w.dmOpenSealedOuter('${m['epk']}', ct);
+          if (outer == null) continue;                    // outer seal is not addressed to us
+          final from = '${outer['f']}', claimedPk = '${outer['k']}', inner = '${outer['i']}';
+          if (from.isEmpty || claimedPk.isEmpty || inner.isEmpty) continue;
+          // Authorship check. A forger can put any `from` with their OWN key; the claim is only real if
+          // that key IS the sender's ledger-published dm_pk (which the node validates by signature).
+          // Resolve it and require an exact match, THEN open the inner under it — opening is the MAC
+          // proof that whoever wrote this held that key. Either test failing = a forged sender, dropped.
+          if (!pkCache.containsKey(from)) pkCache[from] = await dmKeyGet(from);
+          final realPk = pkCache[from];
+          if (realPk == null || realPk != claimedPk) continue;
+          final plain = w.dmOpen(realPk, inner);
+          if (plain == null) continue;
+          // SELF-COPY: a message WE sent, mirrored to our own mailbox so it syncs to a restored/second
+          // device. It carries the real recipient in `p`/`pk`; store it as OUTGOING to that peer rather
+          // than as an incoming self-DM. (Only we can have produced its inner, so `from == account` here
+          // is authenticated by the MAC, not just claimed.)
+          final selfPeer = outer['p'];
+          if (selfPeer is String && selfPeer.isNotEmpty && from == w.account) {
+            DmStore.put(ct, plain, (m['ts'] ?? 0) as int,
+                from: w.account, outgoing: true, peer: selfPeer, peerPk: '${outer['pk']}');
+          } else {
+            DmStore.put(ct, plain, (m['ts'] ?? 0) as int,
+                from: from, outgoing: false, peer: from, peerPk: realPk);
+          }
+          continue;
+        }
+        // LEGACY (v1): sender/recipient identity and keys are on the record in the clear.
+        final outgoing = m['from'] == w.account;
+        final peerAcc = '${outgoing ? m['to'] : m['from']}';
+        final peerPk = '${outgoing ? m['to_pk'] : m['from_pk']}';
         final plain = w.dmOpen(peerPk, ct);               // decrypts locally; null if not ours
         if (plain == null) continue;
         DmStore.put(ct, plain, (m['ts'] ?? 0) as int,
@@ -2222,6 +2365,174 @@ class Api {
       // A slow or failed poll adds nothing new; it must not REMOVE what the store already holds. Do
       // not return here — fall through and rebuild from the store as it stands.
     }
+    return _convosFromStore();
+  }
+
+  // ---- blind mailbox read (breaks IP<->account correlation) ----
+  // The ordinary read GETs /api/dm_inbox?account=... from our node, so the node sees our IP beside the
+  // account whose mailbox we read — enough to re-attach a sender to a sealed message by correlation.
+  // A blind read seals the request (account + ownership proof) to a relay's key and hands the node an
+  // opaque blob to forward: the node sees the IP but not the account, the relay sees the account but
+  // only the node's IP. See docs/ANONYMITY.md §4 and wallet.dart's sealMailboxRead.
+  static List<Map<String, dynamic>>? _blindRelays;  // eligible relays, each verified against the LEDGER
+  static int _blindRelayAt = 0;                      // epoch secs of the last (re)resolution attempt
+  static bool _blindDisabled = false;                // nothing eligible last try — back off, don't rescan
+  static String _blindRelayBase = '';                // the node (kBase) this set was resolved against
+
+  /// Raw DM ciphertext records — via a BLIND read when relay keys are available, else the ordinary
+  /// signed read straight to our node. `full` (the periodic full sweep) reads EVERY eligible relay and
+  /// merges, so a message that landed only on some relays is still caught; incremental polls read one
+  /// relay for speed. Both paths deliver the same shape; the caller's decrypt loop does not care which.
+  static Future<List<Map<String, dynamic>>> _dmFetchRaw(NanoWallet w, int since, bool full) async {
+    final blind = await _blindDmFetch(w, since, full);
+    if (blind != null) return blind;
+    // Fallback: ordinary signed read. The node cannot forge this proof — it holds no seed — but it does
+    // see (our IP, our account) together, which the blind path above is what avoids.
+    final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final auth = w.signMsg(w.dmInboxMsg(ats));
+    final r = await http.get(Uri.parse('$kBase/api/dm_inbox?account=${w.account}'
+        '${since > 0 ? '&since=$since' : ''}'
+        '&ts=$ats&sig=${Uri.encodeQueryComponent(auth['sig']!)}'
+        '&pub=${Uri.encodeQueryComponent(auth['pub']!)}'))
+        .timeout(const Duration(seconds: 12));
+    return ((jsonDecode(r.body)['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
+  }
+
+  /// Blind-read the mailbox. `all` reads EVERY eligible relay in parallel and merges — the completeness
+  /// backstop that closes the single-relay gap: a message that landed only on some relays (the one we
+  /// usually read was down when it was sent) is still caught. Otherwise it reads just the first relay.
+  /// Returns null ONLY when NO relay could serve it, so the caller falls back to the ordinary read; an
+  /// empty-but-successful read returns [] (an empty mailbox is a valid answer, not a failure).
+  static Future<List<Map<String, dynamic>>?> _blindDmFetch(NanoWallet w, int since, bool all) async {
+    try {
+      final relays = await _blindReadRelays();
+      if (relays.isEmpty) return null;
+      final targets = all ? relays : relays.take(1).toList();
+      final results = await Future.wait(targets.map((r) => _blindReadOne(w, since, r)));
+      if (results.every((r) => r == null)) return null;    // every target failed → fall back
+      final seen = <String>{};
+      final merged = <Map<String, dynamic>>[];
+      for (final list in results) {
+        if (list == null) continue;
+        for (final m in list) {
+          // Dedup across relays the way the node does: by `mid` for sealed v2, else (from, ts).
+          final k = m['mid'] != null ? 'mid:${m['mid']}' : 'ft:${m['from']}:${m['ts']}';
+          if (seen.add(k)) merged.add(m);
+        }
+      }
+      return merged;
+    } catch (_) {
+      return null;                                        // never let the privacy path drop a message
+    }
+  }
+
+  /// One blind read against one relay. Returns its records, or null if that relay could not serve it.
+  static Future<List<Map<String, dynamic>>?> _blindReadOne(
+      NanoWallet w, int since, Map<String, dynamic> relay) async {
+    try {
+      final ats = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final auth = w.signMsg(w.dmInboxMsg(ats));
+      final read = w.sealMailboxRead(relay['read_pk'] as String, {
+        'account': w.account, 'ts': ats, 'sig': auth['sig'], 'pub': auth['pub'], 'since': since,
+      });
+      final r = await http.post(Uri.parse('$kBase/api/dm_blind_read'),
+              headers: const {'content-type': 'application/json'},
+              body: jsonEncode({'relay': relay['url'], 'epk': read.epk, 'ct': read.ct}))
+          .timeout(const Duration(seconds: 12));
+      final resp = jsonDecode(r.body);
+      final ct = resp is Map ? resp['ct'] : null;
+      if (ct is! String || ct.isEmpty) return null;
+      final reply = read.openReply(ct);
+      if (reply == null || reply['error'] != null) return null;
+      return ((reply['dms'] as List?) ?? []).cast<Map<String, dynamic>>();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Resolve and cache the relays to seal blind reads to: the ones the LEDGER (not our node) says exist,
+  /// whose host differs from our node's, and whose read key is signed by their ledger account. Cached an
+  /// hour — a ledger scan is not worth doing on every 5s poll. Capped so the full-sweep fan-out is small.
+  static Future<List<Map<String, dynamic>>> _blindReadRelays() async {
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    // The cache is scoped to the current node: a REPOINT invalidates it, because a relay chosen for the
+    // old node may be co-located with the new operator (privacy loss) or unknown to it (reads fall
+    // back). While the node is unchanged, keep an eligible set for an hour; but back off only ~3 min
+    // after a FAILED/empty resolution — a transient ledger-discovery blip (a rate-limited public RPC)
+    // must not silently disable the private read for a whole hour, though we still must not rescan the
+    // ledger on every 5s poll.
+    if (_blindRelayBase == kBase) {
+      if (_blindRelays != null && now - _blindRelayAt < 3600) return _blindRelays!;
+      if (_blindDisabled && now - _blindRelayAt < 180) return const [];
+    }
+    final w = gWallet;
+    if (w == null) return const [];
+    final out = <Map<String, dynamic>>[];
+
+    Future<void> tryAdd(String url, String acct) async {
+      if (out.any((e) => e['url'] == url)) return;
+      try {
+        final r = await http
+            .get(Uri.parse('$kBase/api/relay_readkey?relay=${Uri.encodeQueryComponent(url)}'))
+            .timeout(const Duration(seconds: 6));
+        final rec = jsonDecode(r.body);
+        if (rec is! Map<String, dynamic>) return;
+        final readPk = w.relayReadPk(rec, acct);            // verifies the sig binds read_pk to acct
+        if (readPk != null) out.add({'url': url, 'account': acct, 'read_pk': readPk});
+      } catch (_) {/* skip this relay */}
+    }
+
+    // DEBUG-ONLY hook, for a local relay NOT announced on the ledger (a test rig). It anchors read_pk to
+    // the account the /relaykey record SELF-REPORTS instead of one read off the ledger, so it TRUSTS THE
+    // NODE and gives up the MITM protection the ledger anchor provides — NEVER set in a shipped build.
+    // Inert unless compiled with --dart-define=XCHAT_DEBUG_BLIND_RELAY=<node-side relay url>.
+    const debugRelay = String.fromEnvironment('XCHAT_DEBUG_BLIND_RELAY');
+    if (debugRelay.isNotEmpty) {
+      try {
+        final r = await http
+            .get(Uri.parse('$kBase/api/relay_readkey?relay=${Uri.encodeQueryComponent(debugRelay)}'))
+            .timeout(const Duration(seconds: 6));
+        final rec = jsonDecode(r.body);
+        if (rec is Map<String, dynamic>) {
+          final acct = '${rec['account']}';                 // self-reported (debug: NOT ledger-anchored)
+          final readPk = w.relayReadPk(rec, acct);
+          if (readPk != null) out.add({'url': debugRelay, 'account': acct, 'read_pk': readPk});
+        }
+      } catch (_) {/* fall through to real discovery */}
+    }
+    try {
+      final nodeHost = Uri.parse(kBase).host;
+      for (final rl in await LedgerDiscovery.discoverRelays()) {
+        if (out.length >= 5) break;                         // cap the full-sweep fan-out
+        final url = rl['url'] ?? '', acct = rl['account'] ?? '';
+        if (url.isEmpty || acct.isEmpty) continue;
+        if (Uri.parse(url).host == nodeHost) continue;      // must not be our own node's operator
+        await tryAdd(url, acct);
+      }
+    } catch (_) {/* discovery failed — fall back for now */}
+
+    if (out.isNotEmpty) {
+      _blindRelays = out;
+      _blindRelayAt = now;
+      _blindRelayBase = kBase;
+      _blindDisabled = false;
+      return out;
+    }
+    _blindDisabled = true;
+    _blindRelayAt = now;                                    // nothing eligible; back off ~3 min, then retry
+    _blindRelayBase = kBase;
+    return const [];
+  }
+
+  /// The conversation list straight from the on-device store, no network. Loads the store (fast,
+  /// local) and returns what it holds, so the inbox can paint IMMEDIATELY instead of spinning for the
+  /// seconds a cold /api/dm_inbox takes. dmInbox() then refreshes it in the background. A returning
+  /// user has their whole history on disk already — making them wait on the network to see it was the
+  /// 15s spinner this removes.
+  static Future<List<Map<String, dynamic>>> dmInboxCached() async {
+    final w = gWallet;
+    if (w == null) return [];
+    await DmStore.load(w);
     return _convosFromStore();
   }
 
@@ -2770,6 +3081,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   StreamSubscription? _batSub, _connSub;
   Timer? _republishTimer, _gossipTimer, _feedTimer, _updateTimer, _presenceTimer;
   int _relayed = 0; // signed heads this phone has propagated (backfilled) this session
+  int _republishTick = 0; // gates the head republish: every tick = presence beacon, else keepalive only
   bool get _supporterActive => _supporterOn && _charging && _wifi;
 
   @override
@@ -2806,7 +3118,16 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       final p = _scroll.position;
       if (p.pixels > p.maxScrollExtent - 1200) _loadMore();
     });
-    _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) => Api.republish());
+    // Head republish. A fresh head within the node's ~150s presence window is what makes /api/presence
+    // report us "online", so the 45s cadence is really a presence BEACON — separate from keeping the
+    // head alive (its expiry is far longer). Presence is OPT-IN: with it on we republish every 45s (a
+    // live green dot); with it off — the default — we republish only ~every 20 min, enough to keep the
+    // head propagating to newly-joined relays without broadcasting a continuous "this person is awake"
+    // signal to anyone who polls /api/presence. Reads _settings live, so toggling takes effect next tick.
+    _republishTimer = Timer.periodic(const Duration(seconds: 45), (_) {
+      _republishTick++;
+      if (_settings.showPresence || _republishTick % 27 == 0) Api.republish();   // 27*45s ≈ 20 min
+    });
     // quietly poll the feed so posts from OTHER devices appear on their own (no manual refresh)
     _feedTimer = Timer.periodic(const Duration(seconds: 12), (_) => _refreshFeedQuiet());
     // who's online — refresh the green dots a bit faster than the 45s head heartbeat so they feel live
@@ -2876,6 +3197,12 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     return t;
   }
 
+  // Persist the shown timeline to the on-device cache, bounded to the user's feedCacheSize. Fire-and-
+  // forget: a cache write must never block the UI. Called after any change to _posts.
+  void _persistFeed() {
+    Api.saveCachedPosts(_posts, _settings.feedCacheSize);
+  }
+
   // A lightweight, silent poll. It fetches ONLY posts newer than we already have (incremental), holds
   // them in a buffer surfaced by a "new posts" pill instead of injecting them live (so the reader's
   // scroll never jumps), and updates engagement counts in place. The timeline itself is never
@@ -2911,7 +3238,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
           _newPosts.removeWhere((p) => !live.contains(p.id));
         }
       });
-      if (reconcile) _refreshLabels();   // pick up others' community reports for the shield filter
+      if (reconcile) { _refreshLabels(); _persistFeed(); }   // reports for the shield filter; cache the reconciled set
       if (!mounted) return;
       setState(() {
         if (fresh.isNotEmpty) {
@@ -2931,6 +3258,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         ..sort((a, b) => b.ts.compareTo(a.ts));
       _newPosts.clear();
     });
+    _persistFeed();   // the merged-in new posts are now part of the timeline — cache them
     if (_scroll.hasClients) {
       _scroll.animateTo(0, duration: const Duration(milliseconds: 300), curve: Curves.easeOut);
     }
@@ -5456,6 +5784,10 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                   _settings.readReceipts, (v) => _settings.readReceipts = v),
 
               section('Privacy'),
+              toggle('Show when I\'m online',
+                  'a live green dot while your app is open. Off (the default) keeps your activity private — nobody can poll for whether you\'re awake.',
+                  _settings.showPresence, (v) => _settings.showPresence = v),
+              const SizedBox(height: 6),
               ListTile(
                 contentPadding: EdgeInsets.zero,
                 leading: const Icon(Icons.block, color: kText, size: 20),
@@ -5464,6 +5796,16 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                 trailing: const Icon(Icons.chevron_right, color: kDim),
                 onTap: () { Navigator.pop(ctx); _showMutedBlocked(); },
               ),
+
+              section('Feed cache'),
+              const Text('How many posts to keep on this device. The feed opens instantly from here on '
+                  'launch and then fetches only what\'s new — older posts beyond this are dropped, like a '
+                  'relay bounding its own store instead of keeping everything forever.',
+                  style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+              const SizedBox(height: 8),
+              Wrap(spacing: 8, children: [100, 300, 500, 1000, 2000].map((n) =>
+                  chip('$n posts', _settings.feedCacheSize == n,
+                      () { _settings.feedCacheSize = n; _persistFeed(); })).toList()),
 
               section('Connection'),
               const Text('The relay/engine this app talks to. Point it at a hosted node (e.g. a Fly.io '
@@ -5509,6 +5851,15 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       backgroundColor: kBg,
       builder: (_) => StatefulBuilder(builder: (ctx, setSheet) {
         Future<Map<String, dynamic>?> f = Api.relaydir();
+        // Auto-discover public mesh nodes from the hubs this directory lists — no config, no secret.
+        Future<List<Map<String, dynamic>>> meshF = f.then((d) async {
+          final urls = ((d?['health'] as List?) ?? const [])
+              .map((h) => '${h['url']}')
+              .where((u) => u.startsWith('https'))
+              .toList();
+          await MeshReach.autoDiscoverFrom(urls);
+          return MeshReach.discoveredInfo;
+        });
         return FutureBuilder<Map<String, dynamic>?>(
           future: f,
           builder: (_, snap) {
@@ -5596,6 +5947,45 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                       ]),
                     );
                   }),
+                // Public mesh nodes — relays with no public address, discovered THROUGH the hubs above.
+                FutureBuilder<List<Map<String, dynamic>>>(
+                  future: meshF,
+                  builder: (_, ms) {
+                    final nodes = ms.data ?? const [];
+                    if (nodes.isEmpty) return const SizedBox.shrink();
+                    String hubHost(String via) =>
+                        via.replaceFirst(RegExp(r'^https?://'), '').split('/r/').first;
+                    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: nodes.map((n) {
+                      final acct = '${n['account']}';
+                      final shortA = acct.length > 22 ? '${acct.substring(0, 14)}…${acct.substring(acct.length - 6)}' : acct;
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 10),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: const Color(0xFF8b5cf6))),
+                        child: Row(children: [
+                          const Icon(Icons.hub_outlined, color: Color(0xFF8b5cf6), size: 18),
+                          const SizedBox(width: 12),
+                          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Row(children: [
+                              Flexible(child: Text(shortA, overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 12, fontWeight: FontWeight.w700))),
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                                decoration: BoxDecoration(color: kBg, borderRadius: BorderRadius.circular(5), border: Border.all(color: kLine)),
+                                child: const Text('mesh · public', style: TextStyle(color: Color(0xFF8b5cf6), fontSize: 9, fontWeight: FontWeight.w700)),
+                              ),
+                            ]),
+                            const SizedBox(height: 3),
+                            Text('no address of its own · via ${hubHost('${n['via']}')}',
+                                style: const TextStyle(color: kDim, fontSize: 11)),
+                          ])),
+                        ]),
+                      );
+                    }).toList());
+                  },
+                ),
                 const SizedBox(height: 4),
                 Text('$up serving you now · $onLedger self-announced on the XNO ledger · ${rvs.length} keyless rendezvous. '
                     'Strength = latency, reliability = recent uptime.',
@@ -5617,12 +6007,19 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   // edit the relay/engine endpoint (persisted; applied live)
   void _showEndpoint() {
     final ctl = TextEditingController(text: kBase);
+    final secCtl = TextEditingController(text: MeshReach.secret);
+    final hubCtl = TextEditingController(
+        text: MeshReach.hubs.isEmpty ? kDefaultBase : MeshReach.hubs.join(', '));
+    String meshStatus = '';
+    Color meshStatusColor = kDim;
+    bool meshBusy = false;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: kBg,
-      builder: (_) => Padding(
+      builder: (_) => StatefulBuilder(builder: (ctx, setSheet) => Padding(
         padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+        child: SingleChildScrollView(
         child: Container(
           padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
           decoration: const BoxDecoration(border: Border(top: BorderSide(color: kLine))),
@@ -5668,9 +6065,98 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                 child: const Text('Save & connect', style: TextStyle(fontWeight: FontWeight.w800)),
               ),
             ]),
+            const SizedBox(height: 20),
+            const Divider(color: kLine, height: 1),
+            const SizedBox(height: 18),
+            Row(children: const [
+              Icon(Icons.hub_outlined, color: kAccent, size: 20), SizedBox(width: 8),
+              Text('Mesh node', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+            ]),
+            const SizedBox(height: 6),
+            const Text('Reach a relay that has no public address of its own — it dials into a public hub. '
+                'Leave the secret empty to auto-discover PUBLIC nodes the hub lists (no code). Enter a '
+                'secret to reach a PRIVATE node shared with you. The hub only ever sees an opaque token.',
+                style: TextStyle(color: kDim, fontSize: 12, height: 1.4)),
+            const SizedBox(height: 12),
+            const Text('Rendezvous secret', style: TextStyle(color: kDim, fontSize: 11, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+            TextField(
+              controller: secCtl,
+              style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 13),
+              decoration: _fieldDeco('shared secret'),
+            ),
+            const SizedBox(height: 10),
+            const Text('Hub(s), comma-separated', style: TextStyle(color: kDim, fontSize: 11, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+            TextField(
+              controller: hubCtl,
+              style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 13),
+              keyboardType: TextInputType.url,
+              decoration: _fieldDeco('https://hub.fly.dev'),
+            ),
+            if (meshStatus.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(meshStatus, style: TextStyle(color: meshStatusColor, fontSize: 12.5, height: 1.4, fontFamily: 'monospace')),
+            ],
+            const SizedBox(height: 14),
+            Row(children: [
+              TextButton(
+                onPressed: () async {
+                  secCtl.clear();
+                  await MeshReach.save('', []);
+                  setSheet(() { meshStatus = 'mesh reach cleared'; meshStatusColor = kDim; });
+                },
+                child: const Text('Clear', style: TextStyle(color: kDim)),
+              ),
+              const Spacer(),
+              FilledButton.tonalIcon(
+                onPressed: meshBusy ? null : () async {
+                  final hubs = hubCtl.text.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+                  final secret = secCtl.text.trim();
+                  await MeshReach.save(secret, hubs);
+                  if (hubs.isEmpty) {
+                    setSheet(() { meshStatus = 'enter at least one hub'; meshStatusColor = const Color(0xFFE0A83E); });
+                    return;
+                  }
+                  String shortAcct(String a) => a.length > 20 ? '${a.substring(0, 12)}…${a.substring(a.length - 6)}' : a;
+                  if (secret.isEmpty) {
+                    // PUBLIC discovery — no secret. Ask the hubs which nodes are attached.
+                    setSheet(() { meshBusy = true; meshStatus = 'discovering public nodes on the hub…'; meshStatusColor = kDim; });
+                    await MeshReach.discoverVia(hubs);
+                    final found = await MeshReach.probeDiscovered();
+                    if (found.isEmpty) {
+                      setSheet(() { meshBusy = false; meshStatus = '✗ this hub lists no public nodes right now'; meshStatusColor = const Color(0xFFEF6C9B); });
+                      return;
+                    }
+                    final lines = found.map((f) => '✓ ${shortAcct('${f['account']}')}  type=${f['type']} ver=${f['ver'] ?? '?'}').join('\n');
+                    setSheet(() {
+                      meshBusy = false;
+                      meshStatus = 'discovered ${found.length} public node(s) — no code:\n$lines\n  added to your relay set';
+                      meshStatusColor = const Color(0xFF4DD0A7);
+                    });
+                    return;
+                  }
+                  // PRIVATE — derive the token from the secret.
+                  setSheet(() { meshBusy = true; meshStatus = 'reaching node through hub…'; meshStatusColor = kDim; });
+                  final info = await MeshReach.probe();
+                  if (info == null) {
+                    setSheet(() { meshBusy = false; meshStatus = '✗ no node answered through the hub (is it dialed in?)'; meshStatusColor = const Color(0xFFEF6C9B); });
+                    return;
+                  }
+                  setSheet(() {
+                    meshBusy = false;
+                    meshStatus = '✓ reached node ${shortAcct('${info['account']}')}\n  type=${info['type']} ver=${info['ver'] ?? '?'}\n  the hub is routing to it now';
+                    meshStatusColor = const Color(0xFF4DD0A7);
+                  });
+                },
+                icon: const Icon(Icons.wifi_tethering, size: 18),
+                label: Text(meshBusy ? 'working…' : 'Save & reach'),
+              ),
+            ]),
           ]),
         ),
-      ),
+        ),
+      )),
     );
   }
 
@@ -6034,30 +6520,44 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       _loading = true;
       _error = null;
     });
-    // Cold start: paint the last cached feed immediately so the first frame isn't blank while we fetch.
+    // Cold start: paint the PERSISTED feed immediately (instant, no network), then below fetch ONLY
+    // posts newer than the newest cached one and MERGE — instead of re-downloading the first page on
+    // every launch and throwing the cache away.
     if (_posts.isEmpty) {
-      final cached = await Api.cachedFeed();
-      if (cached != null && mounted && _posts.isEmpty) {
-        setState(() {
-          _posts = cached.posts;
-          _relaysUp = cached.relaysUp;
-          _relaysTotal = cached.relaysTotal;
-        });
+      final cached = await Api.loadCachedPosts();
+      if (cached.isNotEmpty && mounted && _posts.isEmpty) {
+        setState(() => _posts = cached);
       }
     }
     try {
-      // Slim launch: fetch ONLY what the first paint needs — the feed, identity, and moderation labels
-      // (3 requests, not 5). Notifications + engagement counts aren't needed to render the feed, so they
-      // load just after (see _loadSecondary) — a lighter startup burst and a faster first frame.
-      final results = await Future.wait([Api.feed(limit: _pageSize), Api.me(), Api.labels()]);
+      // Slim launch: fetch ONLY what the first paint needs — the feed, identity, and moderation labels.
+      // With a warm cache the feed fetch is INCREMENTAL (since = newest we already hold), so a relaunch
+      // pulls just the new posts; an empty cache (first run) fetches the first page. Notifications +
+      // engagement counts load just after (see _loadSecondary) — a lighter startup burst.
+      final haveTs = _newestTs();
+      final incremental = _posts.isNotEmpty && haveTs > 0;
+      final results = await Future.wait([
+        incremental ? Api.feed(since: haveTs - 1) : Api.feed(limit: _pageSize),
+        Api.me(),
+        Api.labels(),
+      ]);
       final fd = results[0] as FeedData;
       final me = results[1] as Map<String, dynamic>;
       final labelers = results[2] as List<Labeler>;
       setState(() {
-        // Never blank a good feed with a momentarily-empty one (e.g. a just-restarted node whose feed
-        // cache is still warming). Only replace when the fetch has posts, or we truly had none.
-        if (fd.posts.isNotEmpty || _posts.isEmpty) _posts = fd.posts;
-        _newPosts.clear();                    // a full refresh already includes everything
+        if (incremental) {
+          // MERGE new posts into the persisted timeline (dedupe by id) — never replace what we cached.
+          final seen = _posts.map((p) => p.id).toSet();
+          final fresh = fd.posts.where((p) => !seen.contains(p.id)).toList();
+          if (fresh.isNotEmpty) {
+            _posts = [...fresh, ..._posts]..sort((a, b) => b.ts.compareTo(a.ts));
+          }
+        } else {
+          // First run / empty cache. Never blank a good feed with a momentarily-empty one (e.g. a
+          // just-restarted node whose feed cache is still warming).
+          if (fd.posts.isNotEmpty || _posts.isEmpty) _posts = fd.posts;
+        }
+        _newPosts.clear();
         // (fd.onchainBlocks is always 0 — the feed is off-chain. The header's "Nano txns" count comes
         //  from the user's own on-chain block count instead; see _refreshTxCount.)
         if (fd.posts.isNotEmpty) {
@@ -6070,6 +6570,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         _labelers = labelers;
         _loading = false;
       });
+      _persistFeed();   // keep the on-device cache current, bounded to feedCacheSize
       _syncSupporter(); // reflect current supporter state now that the account is known
       _initProfile();   // pull our own profile (name/avatar) into the cache
       _refreshTxCount(); // header "Nano txns" = your on-chain block count (now the account is known)
@@ -6659,6 +7160,31 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                   ),
                 ),
               ]),
+              // The single most important thing to say at the moment money is about to arrive: this
+              // account is PUBLIC and PERMANENT on the Nano ledger, and how it gets funded is what ties
+              // it — or doesn't — to a real name. Shown every time, not once, because the deanonymising
+              // mistake (a withdrawal from a KYC exchange) can happen at any funding, not just the first.
+              // Tap opens the full explanation. See docs/ANONYMITY.md §1 "Identity is money".
+              const SizedBox(height: 14),
+              InkWell(
+                onTap: () { Navigator.pop(ctx); _showFundingPrivacy(); },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                      color: const Color(0xFF4DD0A7).withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: const Color(0xFF4DD0A7).withValues(alpha: 0.32))),
+                  child: Row(children: [
+                    const Icon(Icons.public, size: 18, color: Color(0xFF4DD0A7)),
+                    const SizedBox(width: 10),
+                    const Expanded(
+                      child: Text('Public ledger: funding this account from a KYC exchange can link it to your real name.',
+                          style: TextStyle(color: kText, fontSize: 12.5, height: 1.35)),
+                    ),
+                    const Icon(Icons.chevron_right, size: 18, color: Color(0xFF4DD0A7)),
+                  ]),
+                ),
+              ),
               // The backup nag belongs HERE — at the moment you invite money in — rather than in front
               // of a claim. Blocking a claim never protected anything: the funds are already assigned
               // to this account on-chain, so losing the seed loses them whether or not they were
@@ -6685,6 +7211,58 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                   ),
                 ),
               ],
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // The full funding-privacy explanation, opened from the note on the receive sheet and once at
+  // wallet creation. Deliberately plain and non-alarmist: it describes how a public ledger works and
+  // the one mistake that undoes pseudonymity, rather than promising anonymity the app cannot give.
+  // Mirrors docs/ANONYMITY.md — "pseudonymous, with an audit trail on a public ledger".
+  void _showFundingPrivacy() {
+    Widget para(String s) => Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: Text(s, style: const TextStyle(color: kDim, fontSize: 13.5, height: 1.5)),
+        );
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: kBg,
+      builder: (ctx) => SafeArea(
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Row(children: const [
+                Icon(Icons.public, size: 20, color: Color(0xFF4DD0A7)),
+                SizedBox(width: 10),
+                Text('Your account is public',
+                    style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 18)),
+              ]),
+              const SizedBox(height: 16),
+              para('Your identity here is a Nano account. The Nano ledger is public and permanent — anyone can look up this account\'s balance and every payment it has ever sent or received, forever.'),
+              para('If you fund it from an exchange that knows who you are (any KYC exchange), that withdrawal ties this account to your legal name. If you move funds between this account and another one of yours, the two become linkable as well.'),
+              para('To stay pseudonymous: fund this account in a way that isn\'t tied to your name, and keep it separate from accounts that are. What you post and who you message is end-to-end encrypted — but the money is not, because the ledger is shared by everyone.'),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                    color: kCard, borderRadius: BorderRadius.circular(10), border: Border.all(color: kLine)),
+                child: const Text('This is how a public ledger works — not something the app can hide for you.',
+                    style: TextStyle(color: kDim, fontSize: 12.5, height: 1.4)),
+              ),
+              const SizedBox(height: 18),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  style: FilledButton.styleFrom(backgroundColor: kAccent, foregroundColor: Colors.black),
+                  child: const Text('Got it', style: TextStyle(fontWeight: FontWeight.w800)),
+                ),
+              ),
             ]),
           ),
         ),
@@ -7158,10 +7736,26 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
   @override
   void initState() {
     super.initState();
-    _load();
+    _showCachedThenRefresh();
   }
 
   List<GroupChat> _groups = [];
+
+  /// Paint the on-device store first (instant), then refresh from the network. A returning user's
+  /// conversations are already on disk, so making them watch a cold-fetch spinner to see them was
+  /// pure waited-for-nothing. Only drops the spinner if the cache actually has something — an empty
+  /// cache keeps the spinner rather than flashing "No messages" before the fetch answers.
+  Future<void> _showCachedThenRefresh() async {
+    final cached = await Api.dmInboxCached();
+    if (mounted && _loading && cached.isNotEmpty) {
+      setState(() {
+        _convos = cached.where((x) => !widget.isBlocked('${x['peer']}')).toList();
+        _groups = GroupChat.extract(cached);
+        _loading = false;
+      });
+    }
+    await _load();
+  }
 
   Future<void> _load() async {
     final c = await Api.dmInbox();
@@ -7172,6 +7766,19 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
       _groups = GroupChat.extract(c);
       _loading = false;
     });
+    // PREFETCH every peer's profile the moment the list loads, rather than waiting for each row's
+    // avatar to lazily fetch as it scrolls into view. Without this the inbox paints each conversation
+    // under its owner's DEFAULT handle ('you.xno' — which most accounts share) and only resolves to
+    // the real name a beat later, so a thread that reads "Jiован" in its header shows as "you.xno" in
+    // the list. ensure() de-dups and no-ops once cached, so this is cheap and idempotent.
+    for (final x in _convos) {
+      ProfileCache.I.ensure('${x['peer']}');
+    }
+    for (final g in _groups) {
+      for (final m in g.members) {
+        ProfileCache.I.ensure(m);
+      }
+    }
   }
 
   /// The name this person is shown under everywhere else in the app.
@@ -7354,7 +7961,12 @@ class _DmInboxScreenState extends State<DmInboxScreen> {
                         leading: AuthorAvatar(account: peer, handle: handle, radius: 22),
                         title: AnimatedBuilder(
                           animation: ProfileCache.I,
-                          builder: (_, __) => Text(ProfileCache.I.displayName(peer, handle),
+                          // _handleOf, not the bare display name: when the profile has not loaded and
+                          // the handle is the shared default 'you.xno', it appends the account
+                          // discriminator so the row is distinguishable instead of reading like a
+                          // conversation with yourself. Once the profile resolves both show the same
+                          // real name ("Jiован").
+                          builder: (_, __) => Text(_handleOf(peer),
                               style: const TextStyle(color: kText, fontWeight: FontWeight.w700)),
                         ),
                         subtitle: last == null ? null : Text(

@@ -22,7 +22,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # 2.2.1 → 2.2.2 …; anchored at 2.2.x because the phone already installed 2.2.0 and the version doubles as
 # the update-check comparison — can't go below it. NB the emitted versionCode may differ from N; only
 # that it INCREASES matters — verify with `aapt2 dump badging` if unsure.)
-version: 2.5.2+22502
+version: 2.5.3+22503
 
 environment:
   sdk: ^3.12.2

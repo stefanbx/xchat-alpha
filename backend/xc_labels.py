@@ -19,7 +19,7 @@ agg = xc.aggregate_reports(RELAYS)                             # post_id -> {'we
 # The feed cache is the authoritative live-post set; if it isn't available yet, don't prune (fail open).
 live_ids = None
 try:
-    feed = json.load(open('/tmp/xc_feed_agg.json'))           # read-only, never consume the cache
+    feed = json.load(open(xc.FEED_CACHE))                     # read-only, never consume the cache
     live_ids = {p.get('id') for p in feed.get('posts', [])}
 except Exception:
     live_ids = None
