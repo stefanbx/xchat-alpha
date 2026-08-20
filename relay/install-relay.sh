@@ -598,10 +598,13 @@ CONF
         rm -f "$PLIST" "$UNIT"
         [ "$OS" != Darwin ] && systemctl --user daemon-reload 2>/dev/null || true
         rm -f "$HOME/.local/bin/xchat"                                  # the cli symlink
-        rm -rf "$HOME/Applications/ӾChat.app" "$HOME/Applications/ӾChat Relay Settings.app"
+        rm -rf "$HOME/Applications/ӾChat.app" "$HOME/Applications/ӾChat Relay Settings.app" \
+               "$HOME/Applications/ӾChat Relay Manual.app"
         rm -f "$HOME/.local/share/applications/xchat.desktop" \
               "$HOME/.local/share/applications/xchat-relay-settings.desktop" \
-              "$HOME/Desktop/xchat.desktop" "$HOME/Desktop/xchat-relay-settings.desktop"
+              "$HOME/.local/share/applications/xchat-relay-manual.desktop" \
+              "$HOME/Desktop/xchat.desktop" "$HOME/Desktop/xchat-relay-settings.desktop" \
+              "$HOME/Desktop/xchat-relay-manual.desktop"
         rm -rf "$XC_HOME"
         ok "removed — relay, settings page, command and shortcuts."
         say "  (a PATH line marked 'added by xchat-relay' may remain in your shell profile)"
@@ -770,6 +773,10 @@ fetch "$SRC/relay/xc_relayd.py"    "$XC_HOME/xc_relayd.py"
 fetch "$SRC/relay/xc_tunnel.py"    "$XC_HOME/xc_tunnel.py"   # mesh reverse-tunnel (entry hub + client); xc_relayd imports it
 fetch "$SRC/backend/xc_common.py"  "$XC_HOME/xc_common.py"
 fetch "$SRC/relay/xc_admin.py"     "$XC_HOME/xc_admin.py"
+# The operator handbook: how the mesh works + a full command manual, served at :ADMIN/manual and
+# opened by `xchat manual` or the desktop shortcut. Non-fatal if it can't be fetched — it is docs,
+# not a dependency, so a network blip must never fail an install over it.
+fetch "$SRC/relay/manual.html"     "$XC_HOME/manual.html" || warn "couldn't fetch the manual (docs only) — 'xchat manual' will 404 until the next update"
 fetch "$SRC/backend/xc_workd.py"   "$XC_HOME/xc_workd.py"
 # The self-announce helper. It used to ship only with --with-node, which meant a RELAY-ONLY install —
 # the default one-liner — had no way to announce itself even when the operator had done everything
@@ -1500,6 +1507,12 @@ case "${1:-help}" in
     logs)     tail -f "$XC_HOME/relay.log" ;;
     settings) open_url "$ADMIN_URL" ;;
     app)      open_url "$APP_URL" ;;
+    manual|docs|handbook)
+              # Prefer the relay-served copy (nice URL, always current); fall back to the file on disk
+              # so the handbook opens even when the settings server happens to be down.
+              if curl -fsS -o /dev/null "$ADMIN_URL/manual" 2>/dev/null; then open_url "$ADMIN_URL/manual"
+              elif [ -f "$XC_HOME/manual.html" ]; then open_url "file://$XC_HOME/manual.html"
+              else echo "manual not installed — re-run the installer to fetch it"; fi ;;
     earnings) curl -fsS "$ADMIN_URL/api/state" 2>/dev/null \
                 | python3 -c 'import sys,json; d=json.load(sys.stdin); e=d.get("earnings") or {}; \
 print("payout :", d.get("payout") or "(none set)"); \
@@ -1532,6 +1545,7 @@ print("average:", d.get("avg_s"), "seconds a block")' 2>/dev/null || echo "work 
         echo "  xchat status     is it running, and on what address"
         echo "  xchat app        open ӾChat in your browser"
         echo "  xchat settings   open the settings page for your relay"
+        echo "  xchat manual     open the handbook: how the mesh works + every command"
         echo "  xchat earnings   what your relay has been paid"
         echo "  xchat storage    how much of your disk it is using"
         echo "  xchat work       proof-of-work stats (what makes tips fast)"
@@ -1603,6 +1617,7 @@ PLIST
     mkdir -p "$HOME/Applications"
     make_app "ӾChat" "$APP_URL" "$HOME/Applications"
     make_app "ӾChat Relay Settings" "$ADMIN_URL" "$HOME/Applications"
+    make_app "ӾChat Relay Manual" "$ADMIN_URL/manual" "$HOME/Applications"
     ok "shortcuts added to your Applications folder (search Spotlight for 'ӾChat')"
 else
     APPS="$HOME/.local/share/applications"
@@ -1622,6 +1637,7 @@ DESK
     }
     make_desktop "ӾChat" "$APP_URL" "xchat"
     make_desktop "ӾChat Relay Settings" "$ADMIN_URL" "xchat-relay-settings"
+    make_desktop "ӾChat Relay Manual" "$ADMIN_URL/manual" "xchat-relay-manual"
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS" 2>/dev/null || true
     ok "shortcuts added to your applications menu"
 fi

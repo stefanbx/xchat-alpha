@@ -250,7 +250,7 @@ label.check input{width:auto;margin:2px 0 0}
 </style></head><body><div class=wrap>
 <h1>Your ӾChat relay</h1>
 <p class=sub>Only you can see this page — it listens on this computer alone and is not part of what
-   your relay serves to the internet.</p>
+   your relay serves to the internet. &nbsp;<a href="/manual">Open the handbook &rarr;</a></p>
 <div class=card><h2>Status</h2><div id=status>loading…</div></div>
 <div class=card><h2>Earnings</h2><div id=earn>loading…</div></div>
 <div class=card><h2>Verify &amp; withdraw</h2><div id=verify>loading…</div></div>
@@ -418,6 +418,16 @@ class A(BaseHTTPRequestHandler):
             return self._send(200, PAGE, 'text/html; charset=utf-8')
         if p == '/api/state':
             return self._send(200, json.dumps(state()))
+        if p == '/manual':
+            # The operator handbook shipped with the relay (relay/manual.html). Read from disk at
+            # request time so an --update refreshes it with no admin restart; 404 if this install
+            # predates it (an older package simply has no file to serve).
+            try:
+                with open(os.path.join(XC_HOME, 'manual.html'), 'rb') as f:
+                    return self._send(200, f.read(), 'text/html; charset=utf-8')
+            except OSError:
+                return self._send(404, '<h1>Manual not installed</h1>'
+                                       '<p>Re-run the installer to fetch it.</p>', 'text/html; charset=utf-8')
         self._send(404, '{"error":"not found"}')
 
     def do_POST(self):

@@ -1,0 +1,807 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ӾChat Relay — Operator Handbook</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;700;900&family=Source+Serif+4:opsz,wght@8..60,400;8..60,500;8..60,600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+  :root{
+    --ground:#eef1f5; --surface:#ffffff; --surface-2:#f6f8fb;
+    --ink:#151d29; --body:#33404f; --muted:#697989; --faint:#9aa8b6;
+    --border:#d3dbe6; --border-strong:#b6c1d0;
+    --teal:#0f8c99; --teal-soft:#dff0f2;
+    --amber:#b1720b; --amber-soft:#f6ecd7;
+    --green:#1f8b4c; --green-soft:#dcefe1;
+    --red:#c03a29; --red-soft:#f6e0dc;
+    --shadow:0 1px 2px rgba(20,30,45,.05),0 8px 28px rgba(20,30,45,.06);
+  }
+  :root:not([data-theme="light"]){
+    @media (prefers-color-scheme: dark){
+      --ground:#0b111a; --surface:#111a26; --surface-2:#0e1622;
+      --ink:#e4eaf3; --body:#b7c3d2; --muted:#7f8ea0; --faint:#5a6a7c;
+      --border:#243243; --border-strong:#324256;
+      --teal:#41c6d4; --teal-soft:#123037;
+      --amber:#e2a63c; --amber-soft:#2f2612;
+      --green:#4fc47c; --green-soft:#123020;
+      --red:#e57562; --red-soft:#331b18;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 34px rgba(0,0,0,.4);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#0b111a; --surface:#111a26; --surface-2:#0e1622;
+    --ink:#e4eaf3; --body:#b7c3d2; --muted:#7f8ea0; --faint:#5a6a7c;
+    --border:#243243; --border-strong:#324256;
+    --teal:#41c6d4; --teal-soft:#123037;
+    --amber:#e2a63c; --amber-soft:#2f2612;
+    --green:#4fc47c; --green-soft:#123020;
+    --red:#e57562; --red-soft:#331b18;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 34px rgba(0,0,0,.4);
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--ground); color:var(--body);
+    font-family:"Source Serif 4",Georgia,serif; font-size:18px; line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1060px; margin:0 auto; padding:clamp(20px,5vw,72px) clamp(18px,5vw,40px) 96px}
+  .col{max-width:70ch}
+
+  h1,h2,h3,.eyebrow,.chip,.metric,th,.mono,code,.tag{font-family:"Chivo",system-ui,sans-serif}
+  h1{font-weight:900; font-size:clamp(2.1rem,6vw,3.5rem); line-height:1.02; letter-spacing:-.02em;
+     color:var(--ink); text-wrap:balance; margin:0}
+  h2{font-weight:700; font-size:clamp(1.5rem,3.4vw,2.1rem); line-height:1.1; letter-spacing:-.015em;
+     color:var(--ink); text-wrap:balance; margin:0 0 .5rem}
+  h3{font-weight:700; font-size:1.12rem; letter-spacing:-.005em; color:var(--ink); margin:1.8rem 0 .4rem}
+  p{margin:0 0 1.05rem}
+  a{color:var(--teal); text-underline-offset:2px}
+  strong{color:var(--ink); font-weight:600}
+
+  .eyebrow{font-size:.72rem; font-weight:700; letter-spacing:.16em; text-transform:uppercase; color:var(--teal)}
+  .mono,code{font-family:"JetBrains Mono",ui-monospace,monospace}
+  code{font-size:.86em; background:var(--surface-2); border:1px solid var(--border);
+       padding:.08em .38em; border-radius:5px; color:var(--ink); white-space:nowrap}
+  .lede{font-size:clamp(1.12rem,2.1vw,1.32rem); line-height:1.5; color:var(--body)}
+  .lede strong{color:var(--ink)}
+
+  /* header */
+  header{margin-bottom:2.4rem}
+  .kicker{display:flex; gap:.7rem; align-items:center; flex-wrap:wrap; margin-bottom:1.3rem}
+  .kicker .eyebrow{margin:0}
+  .dot{width:5px;height:5px;border-radius:50%;background:var(--border-strong)}
+  .meta-row{display:flex; gap:1.4rem; flex-wrap:wrap; margin-top:1.5rem;
+            font-family:"JetBrains Mono",monospace; font-size:.76rem; color:var(--muted)}
+  .meta-row b{color:var(--ink); font-weight:500}
+
+  /* section scaffolding */
+  section{margin-top:3.6rem; scroll-margin-top:1rem}
+  .sec-head{display:flex; gap:.9rem; align-items:baseline; margin-bottom:1.1rem}
+  .sec-num{font-family:"JetBrains Mono",monospace; font-size:.9rem; font-weight:700;
+           color:var(--teal); flex:none; padding-top:.15rem}
+  .sec-head .col{margin:0}
+
+  /* verdict card */
+  .verdict{background:var(--surface); border:1px solid var(--border); border-radius:14px;
+           box-shadow:var(--shadow); padding:clamp(20px,3vw,32px); margin-top:2rem}
+  .verdict-top{display:flex; align-items:center; gap:.6rem; margin-bottom:.9rem}
+  .stamp{font-family:"Chivo",sans-serif; font-weight:900; font-size:.74rem; letter-spacing:.08em;
+         text-transform:uppercase; padding:.3em .7em; border-radius:6px; color:#fff; background:var(--green)}
+  .stamp.warn{background:var(--amber)}
+  .verdict h2{margin:0}
+  .verdict p:last-child{margin-bottom:0}
+
+  /* figure */
+  figure{margin:1.8rem 0 1.2rem; background:var(--surface); border:1px solid var(--border);
+         border-radius:14px; box-shadow:var(--shadow); overflow:hidden}
+  .fig-scroll{overflow-x:auto; padding:clamp(14px,3vw,28px)}
+  figure svg{display:block; max-width:100%; height:auto; margin:0 auto; color:var(--body); min-width:520px}
+  figcaption{border-top:1px solid var(--border); background:var(--surface-2);
+             padding:.7rem clamp(14px,3vw,22px); font-size:.86rem; line-height:1.45; color:var(--muted)}
+  figcaption b{color:var(--ink); font-weight:600; font-family:"Chivo",sans-serif}
+
+  /* svg helpers */
+  .s-fg{stroke:var(--body)} .f-fg{fill:var(--ink)} .f-body{fill:var(--body)} .f-muted{fill:var(--muted)}
+  .s-teal{stroke:var(--teal)} .f-teal{fill:var(--teal)} .fill-teal-soft{fill:var(--teal-soft)}
+  .s-amber{stroke:var(--amber)} .f-amber{fill:var(--amber)} .fill-amber-soft{fill:var(--amber-soft)}
+  .s-green{stroke:var(--green)} .f-green{fill:var(--green)} .fill-green-soft{fill:var(--green-soft)}
+  .s-red{stroke:var(--red)} .f-red{fill:var(--red)} .fill-red-soft{fill:var(--red-soft)}
+  .fill-surface{fill:var(--surface)} .fill-surface2{fill:var(--surface-2)}
+  .box{fill:var(--surface); stroke:var(--border-strong)}
+  svg text{font-family:"Chivo",sans-serif}
+  .t-title{font-weight:700; fill:var(--ink)}
+  .t-sub{fill:var(--muted); font-family:"JetBrains Mono",monospace}
+  .t-lbl{fill:var(--body); font-family:"JetBrains Mono",monospace}
+  .dash{stroke-dasharray:5 4}
+
+  /* two-up */
+  .two{display:grid; grid-template-columns:1fr 1fr; gap:1rem; margin:1.6rem 0}
+  @media(max-width:640px){.two{grid-template-columns:1fr}}
+  .panel{background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:20px 22px}
+  .panel h3{margin:0 0 .5rem; display:flex; align-items:center; gap:.5rem}
+  .panel.priv{border-left:3px solid var(--amber)}
+  .panel.pub{border-left:3px solid var(--teal)}
+  .panel p{font-size:.96rem; margin-bottom:.7rem}
+  .panel p:last-child{margin-bottom:0}
+
+  /* table */
+  .tbl-wrap{overflow-x:auto; margin:1.5rem 0; border:1px solid var(--border); border-radius:12px}
+  table{border-collapse:collapse; width:100%; font-size:.92rem; min-width:560px}
+  th,td{text-align:left; padding:.72rem .95rem; border-bottom:1px solid var(--border); vertical-align:top}
+  th{font-size:.72rem; letter-spacing:.09em; text-transform:uppercase; color:var(--muted);
+     background:var(--surface-2); font-weight:700; white-space:nowrap}
+  tr:last-child td{border-bottom:none}
+  td{font-family:"Source Serif 4",serif}
+  td.mono,td .mono{font-size:.84rem; color:var(--ink)}
+  .yes{color:var(--green); font-weight:700} .no{color:var(--red); font-weight:700}
+  .part{color:var(--amber); font-weight:700}
+
+  /* callout */
+  .note{background:var(--surface-2); border:1px solid var(--border); border-left:3px solid var(--teal);
+        border-radius:0 10px 10px 0; padding:16px 20px; margin:1.5rem 0; font-size:.96rem}
+  .note.amber{border-left-color:var(--amber)}
+  .note.red{border-left-color:var(--red)}
+  .note .lbl{font-family:"Chivo",sans-serif; font-weight:700; font-size:.74rem; letter-spacing:.08em;
+             text-transform:uppercase; color:var(--muted); display:block; margin-bottom:.35rem}
+  .note.amber .lbl{color:var(--amber)} .note.red .lbl{color:var(--red)} .note .lbl.teal{color:var(--teal)}
+  .note p:last-child{margin-bottom:0}
+
+  /* list */
+  ul.clean{list-style:none; padding:0; margin:1.1rem 0}
+  ul.clean li{position:relative; padding-left:1.5rem; margin-bottom:.7rem; font-size:1rem}
+  ul.clean li::before{content:"→"; position:absolute; left:0; color:var(--teal);
+                      font-family:"Chivo",sans-serif; font-weight:700}
+  ol.steps{padding-left:0; list-style:none; counter-reset:s; margin:1.1rem 0}
+  ol.steps li{position:relative; padding-left:2.4rem; margin-bottom:.85rem; counter-increment:s; font-size:1rem}
+  ol.steps li::before{content:counter(s); position:absolute; left:0; top:0;
+    width:1.7rem; height:1.7rem; border-radius:50%; background:var(--teal-soft); color:var(--teal);
+    font-family:"JetBrains Mono",monospace; font-weight:700; font-size:.82rem;
+    display:flex; align-items:center; justify-content:center}
+
+  .src{font-family:"JetBrains Mono",monospace; font-size:.76rem; color:var(--faint)}
+
+  hr.rule{border:none; border-top:1px solid var(--border); margin:3.6rem 0 0}
+
+  footer{margin-top:3rem; padding-top:1.4rem; border-top:1px solid var(--border);
+         font-family:"JetBrains Mono",monospace; font-size:.76rem; color:var(--muted); line-height:1.7}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="kicker">
+    <span class="eyebrow">Architecture Report</span><span class="dot"></span>
+    <span class="eyebrow" style="color:var(--muted)">Mesh Network</span><span class="dot"></span>
+    <span class="eyebrow" style="color:var(--muted)">Branch: mesh-public-discovery</span>
+  </div>
+  <h1>How the ӾChat mesh works today</h1>
+  <p class="lede" style="margin-top:1.2rem; max-width:64ch">
+    A field map of the live network — <strong>who is reachable, how they are found, and how the mesh
+    heals itself</strong> — and a straight answer to one question: can a git-delivered relay boot up as a
+    self-healing node that points at the right hub and gets announced, out of the box?
+  </p>
+  <div class="meta-row">
+    <span>SCOPE&nbsp; <b>relay/ · deploy/ · app/lib/mesh.dart</b></span>
+    <span>LAYERS&nbsp; <b>on-chain discovery + reverse tunnel</b></span>
+    <span>STATUS&nbsp; <b>as-built, 2026-08-20</b></span>
+  </div>
+</header>
+
+<!-- ============ VERDICT ============ -->
+<div class="verdict">
+  <div class="verdict-top"><span class="stamp">Shipped · auto-promote is the default</span></div>
+  <h2 style="font-size:clamp(1.3rem,2.6vw,1.7rem)">A fresh install now becomes a self-healing node — or a hub — with zero config. One constraint still governs it: nodes need hubs.</h2>
+  <p style="margin-top:1rem">
+    As of this revision the recommendation in §7 is <strong>implemented</strong>. A node never needed a hub
+    address baked in — with <code>XC_TUNNEL_AUTO=1</code> it discovers entry hubs <em>on-chain</em> by
+    capability, seeded from the correct bootstrap list — and the "wake up and heal" machinery (respawn
+    supervisor, tunnel-rebuild watchdog, ledger-driven failover) was always inherited by every mode. What
+    changed: <code>install-relay.sh</code> no longer falls through to a Cloudflare quick tunnel. With no flag
+    it <strong>auto-promotes</strong> — a public IP becomes a hub, anything behind NAT becomes a public,
+    self-healing node — and <code>--update</code> now inherits a running relay's mode instead of re-homing it.
+    The one hard constraint remains, by design: <strong>a node is only reachable through a live hub</strong>,
+    so the hosted hubs stay the guaranteed floor. Diagrams and the shipped commands below.
+  </p>
+</div>
+
+<!-- ============ 1 · THE CAST ============ -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">§1</span>
+    <div class="col"><span class="eyebrow">The cast</span>
+    <h2>Three roles, one distinction that decides everything</h2></div>
+  </div>
+  <div class="col">
+    <p>Every participant runs the <em>same</em> relay binary (<code>xc_relayd.py</code>, plus the node
+    <code>/api</code> layer). What a box <em>is</em> comes down to a single runtime fact — does it dial
+    outward through a tunnel? — read lazily at request time:</p>
+    <ul class="clean">
+      <li><strong>Hub</strong> — a relay with a public IP. Reachable directly, and can front NAT'd relays as
+        an <em>entry</em>. Advertises capability <code>t1</code>. <span class="src">relay_type() → 'hub'</span></li>
+      <li><strong>Node</strong> — a relay behind NAT. Cannot accept inbound; reachable <em>only</em> through
+        hubs. It is a tunnel <em>client</em>. <span class="src">relay_type() → 'node'</span></li>
+      <li><strong>App</strong> — the phone. Holds no server; reaches nodes and hubs over HTTPS and reads the
+        Nano ledger to heal its endpoint list.</li>
+    </ul>
+    <p>"Entry" and "hub" are the same box seen from two sides: <em>hub</em> is the app-facing word,
+    <em>entry</em> is the tunnel-code word. A box is a <code>node</code> the instant
+    <code>XC_TUNNEL_ENTRIES</code> or <code>XC_TUNNEL_AUTO</code> is set (it dials out); otherwise it is a
+    <code>hub</code>. A client can never also be an entry — you can't front others while hiding behind them.</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 900 430" role="img" aria-label="Topology: apps reach hubs directly and reach NAT'd nodes through hubs; nodes dial outward to hubs; hubs gossip and both register on the Nano ledger.">
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--body)"/></marker>
+          <marker id="ah-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--teal)"/></marker>
+          <marker id="ah-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--amber)"/></marker>
+        </defs>
+
+        <!-- ledger plane -->
+        <rect x="24" y="24" width="852" height="66" rx="10" class="fill-surface2" stroke="var(--border)"/>
+        <text x="44" y="52" class="t-title" font-size="14">Nano ledger</text>
+        <text x="44" y="72" class="t-sub" font-size="11">rendezvous accounts 0x3A · 0x3B · 0x3C — keyless, read-only, no owner</text>
+        <circle cx="660" cy="57" r="9" class="fill-teal-soft s-teal"/><circle cx="705" cy="57" r="9" class="fill-teal-soft s-teal"/><circle cx="750" cy="57" r="9" class="fill-teal-soft s-teal"/>
+        <text x="790" y="61" class="t-sub" font-size="10">check-ins</text>
+
+        <!-- hubs row -->
+        <g>
+          <rect x="250" y="170" width="180" height="74" rx="11" class="box" stroke-width="1.5"/>
+          <text x="340" y="200" text-anchor="middle" class="t-title" font-size="15">HUB</text>
+          <text x="340" y="221" text-anchor="middle" class="t-sub" font-size="10.5">public IP · cap t1</text>
+          <text x="340" y="236" text-anchor="middle" class="t-sub" font-size="10.5">xchat-alpha-node</text>
+
+          <rect x="490" y="170" width="180" height="74" rx="11" class="box" stroke-width="1.5"/>
+          <text x="580" y="200" text-anchor="middle" class="t-title" font-size="15">HUB</text>
+          <text x="580" y="221" text-anchor="middle" class="t-sub" font-size="10.5">public IP · cap t1</text>
+          <text x="580" y="236" text-anchor="middle" class="t-sub" font-size="10.5">xchat-relay-1</text>
+        </g>
+        <!-- hub gossip -->
+        <line x1="430" y1="207" x2="490" y2="207" class="s-fg" stroke-width="1.5" marker-end="url(#ah)" marker-start="url(#ah)"/>
+        <text x="460" y="198" text-anchor="middle" class="t-sub" font-size="9.5">gossip</text>
+        <!-- hub -> ledger -->
+        <line x1="340" y1="170" x2="340" y2="92" class="s-teal dash" stroke-width="1.4" marker-end="url(#ah-teal)"/>
+        <line x1="580" y1="170" x2="580" y2="92" class="s-teal dash" stroke-width="1.4" marker-end="url(#ah-teal)"/>
+        <text x="352" y="130" class="t-lbl f-teal" font-size="9.5">announce URL</text>
+
+        <!-- app -->
+        <rect x="40" y="300" width="150" height="70" rx="11" class="box" stroke-width="1.5"/>
+        <text x="115" y="330" text-anchor="middle" class="t-title" font-size="15">APP</text>
+        <text x="115" y="350" text-anchor="middle" class="t-sub" font-size="10.5">phone client</text>
+        <!-- app scans ledger -->
+        <path d="M55,300 C50,180 60,110 120,92" fill="none" class="s-teal dash" stroke-width="1.4" marker-end="url(#ah-teal)"/>
+        <text x="24" y="210" class="t-lbl f-teal" font-size="9.5" transform="rotate(-90 24 210)">scan / heal endpoints</text>
+        <!-- app -> hub direct -->
+        <line x1="190" y1="322" x2="250" y2="240" class="s-fg" stroke-width="1.6" marker-end="url(#ah)"/>
+        <text x="205" y="300" class="t-sub" font-size="9.5">https</text>
+
+        <!-- nodes row -->
+        <g>
+          <rect x="250" y="330" width="150" height="66" rx="11" class="box dash" stroke-width="1.5"/>
+          <text x="325" y="358" text-anchor="middle" class="t-title" font-size="14">NODE</text>
+          <text x="325" y="378" text-anchor="middle" class="t-sub" font-size="10">behind NAT</text>
+
+          <rect x="700" y="330" width="150" height="66" rx="11" class="box dash" stroke-width="1.5"/>
+          <text x="775" y="358" text-anchor="middle" class="t-title" font-size="14">NODE</text>
+          <text x="775" y="378" text-anchor="middle" class="t-sub" font-size="10">behind NAT</text>
+        </g>
+        <!-- node dials out to hub -->
+        <path d="M325,330 C325,285 335,255 428,244" fill="none" class="s-amber" stroke-width="1.8" marker-end="url(#ah-amber)"/>
+        <text x="300" y="300" class="t-lbl f-amber" font-size="9.5">dial out (long-poll)</text>
+        <path d="M775,330 C775,285 700,250 672,244" fill="none" class="s-amber" stroke-width="1.8" marker-end="url(#ah-amber)"/>
+
+        <!-- app reaches node THROUGH hub -->
+        <path d="M170,300 C230,150 470,150 560,168" fill="none" class="s-teal" stroke-width="1.8" marker-end="url(#ah-teal)"/>
+        <text x="360" y="140" text-anchor="middle" class="t-lbl f-teal" font-size="10">app → node  =  GET  &lt;hub&gt;/r/&lt;token&gt;/…</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 1 — Topology.</b> A hub is dialed <em>into</em>; a node dials <em>out</em>. The app
+    talks to a hub directly, and reaches a NAT'd node only by addressing that node's routing token <em>at the
+    hub</em>. Everyone finds everyone else through the ledger (teal) — no directory server.</figcaption>
+  </figure>
+</section>
+
+<!-- ============ 2 · DISCOVERY ============ -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">§2</span>
+    <div class="col"><span class="eyebrow">Discovery · Layer 1</span>
+    <h2>Finding a public relay: the ledger is the directory</h2></div>
+  </div>
+  <div class="col">
+    <p>There is no registry server and no DNS to trust. A public relay makes itself findable by writing to the
+    one shared surface everyone can already read — the <strong>Nano ledger</strong>. Three keyless
+    <em>rendezvous accounts</em> (derived from fixed seeds <code>0x3A / 0x3B / 0x3C</code>) act as meeting
+    points: plural, so losing one is survivable; ownerless, because the network only ever <em>reads</em> them.</p>
+    <p>To announce, a relay derives a keypair from its own URL, sends a dust "check-in" to each rendezvous
+    account, then commits its URL as the <em>link</em> field of its latest block — recoverable by any client
+    with a plain <code>block_info</code> RPC and no IPFS. A ledger scan of the rendezvous receivables yields the
+    live relay set. On top of that sits fast HTTP <strong>gossip</strong>: a signed
+    <code>{url,account,ts,sig}</code> record pushed to bootstraps and a random peer sample, relayable onward
+    because the signature travels with it.</p>
+    <p class="src">xc_common.py:593-604, 948-1030 · xc_relayd.py:1042 announce_self, 1172 gossip_out</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 900 300" role="img" aria-label="A public relay announces by dust check-ins to three rendezvous accounts and by committing its URL in its chain frontier; clients and relays discover it by scanning the rendezvous and by HTTP gossip.">
+        <defs>
+          <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--body)"/></marker>
+          <marker id="a2-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--teal)"/></marker>
+          <marker id="a2-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--green)"/></marker>
+        </defs>
+        <!-- relay -->
+        <rect x="30" y="110" width="160" height="80" rx="11" class="box" stroke-width="1.5"/>
+        <text x="110" y="142" text-anchor="middle" class="t-title" font-size="15">Public relay</text>
+        <text x="110" y="164" text-anchor="middle" class="t-sub" font-size="10.5">key = f(its URL)</text>
+
+        <!-- rendezvous -->
+        <rect x="360" y="30" width="200" height="48" rx="9" class="fill-teal-soft s-teal" stroke-width="1.3"/>
+        <text x="460" y="59" text-anchor="middle" class="t-lbl f-teal" font-size="12">rendezvous 0x3A</text>
+        <rect x="360" y="126" width="200" height="48" rx="9" class="fill-teal-soft s-teal" stroke-width="1.3"/>
+        <text x="460" y="155" text-anchor="middle" class="t-lbl f-teal" font-size="12">rendezvous 0x3B</text>
+        <rect x="360" y="222" width="200" height="48" rx="9" class="fill-teal-soft s-teal" stroke-width="1.3"/>
+        <text x="460" y="251" text-anchor="middle" class="t-lbl f-teal" font-size="12">rendezvous 0x3C</text>
+
+        <!-- check-ins -->
+        <line x1="190" y1="135" x2="360" y2="55" class="s-teal" stroke-width="1.5" marker-end="url(#a2-teal)"/>
+        <line x1="190" y1="150" x2="360" y2="150" class="s-teal" stroke-width="1.5" marker-end="url(#a2-teal)"/>
+        <line x1="190" y1="165" x2="360" y2="245" class="s-teal" stroke-width="1.5" marker-end="url(#a2-teal)"/>
+        <text x="230" y="120" class="t-sub" font-size="10">dust check-in ×3</text>
+
+        <!-- URL commit note -->
+        <rect x="30" y="212" width="230" height="58" rx="9" class="fill-surface2" stroke="var(--border)"/>
+        <text x="45" y="235" class="t-lbl f-body" font-size="10.5">frontier block link =</text>
+        <text x="45" y="253" class="t-lbl f-fg" font-size="11">url_to_link("https://…")</text>
+
+        <!-- consumers -->
+        <rect x="700" y="40" width="170" height="70" rx="11" class="box" stroke-width="1.5"/>
+        <text x="785" y="70" text-anchor="middle" class="t-title" font-size="14">App / peer</text>
+        <text x="785" y="90" text-anchor="middle" class="t-sub" font-size="10">scans rendezvous</text>
+        <line x1="560" y1="80" x2="700" y2="75" class="s-teal" stroke-width="1.5" marker-end="url(#a2-teal)"/>
+        <text x="600" y="66" class="t-sub" font-size="9.5">discover</text>
+
+        <rect x="700" y="180" width="170" height="70" rx="11" class="box" stroke-width="1.5"/>
+        <text x="785" y="210" text-anchor="middle" class="t-title" font-size="14">Bootstraps</text>
+        <text x="785" y="230" text-anchor="middle" class="t-sub" font-size="10">the 2 Fly hubs</text>
+        <path d="M190,175 C420,300 520,300 700,225" fill="none" class="s-green" stroke-width="1.6" marker-end="url(#a2-green)"/>
+        <text x="430" y="292" text-anchor="middle" class="t-lbl f-green" font-size="10">HTTP gossip: signed {url, sig} → /relay_announce</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 2 — On-chain relay discovery.</b> Two independent findability paths: durable
+    <em>ledger</em> announcement (teal — survives restarts, readable by any RPC) and fast <em>gossip</em>
+    (green — spreads a signed record peer-to-peer). A relay needs a funded operator key only for the ledger path.</figcaption>
+  </figure>
+</section>
+
+<!-- ============ 3 · TUNNEL ============ -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">§3</span>
+    <div class="col"><span class="eyebrow">Discovery · Layer 2</span>
+    <h2>Reaching a NAT'd node: a reverse tunnel with no external service</h2></div>
+  </div>
+  <div class="col">
+    <p>A relay on a laptop can dial out but nothing can dial in. The usual fix is Cloudflare, localhost.run, or
+    Tailscale — an external service and a single point of failure. ӾChat's alternative uses <em>other ӾChat
+    hubs</em> as entries. The node opens <strong>outbound long-poll connections to several hubs at once</strong>
+    and serves itself through all of them. Kill any one hub and the others carry it.</p>
+    <p>The transport is nothing but HTTP: a hanging <code>GET /_tunnel/poll</code> waits for work, a
+    <code>POST /_tunnel/reply</code> returns the response. It passes through every ingress untouched, needs no
+    WebSocket, and adds no dependency. One extra round-trip of latency is the whole cost.</p>
+    <p class="src">xc_tunnel.py:170-225 (entry) · 246-407 (client) · xc_relayd.py:1385-1420</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 900 340" role="img" aria-label="A public request to a hub is framed under a request id, dequeued by the node's held long-poll, served against the node's own local port, and posted back as a reply that wakes the waiting request.">
+        <defs>
+          <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--body)"/></marker>
+          <marker id="a3-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--teal)"/></marker>
+          <marker id="a3-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--amber)"/></marker>
+        </defs>
+
+        <!-- columns -->
+        <text x="110" y="34" text-anchor="middle" class="t-title" font-size="14">APP</text>
+        <text x="450" y="34" text-anchor="middle" class="t-title" font-size="14">HUB  (entry)</text>
+        <text x="790" y="34" text-anchor="middle" class="t-title" font-size="14">NODE  (behind NAT)</text>
+        <line x1="110" y1="48" x2="110" y2="310" class="s-fg" stroke-width="1" opacity=".25"/>
+        <line x1="450" y1="48" x2="450" y2="310" class="s-fg" stroke-width="1" opacity=".25"/>
+        <line x1="790" y1="48" x2="790" y2="310" class="s-fg" stroke-width="1" opacity=".25"/>
+
+        <!-- step 0: held poll pre-exists -->
+        <path d="M790,80 C620,80 620,80 450,80" fill="none" class="s-amber dash" stroke-width="1.7" marker-end="url(#a3-amber)"/>
+        <text x="620" y="72" text-anchor="middle" class="t-lbl f-amber" font-size="10.5">0 · held GET /_tunnel/poll?token=… (signed)</text>
+
+        <!-- step 1: app request -->
+        <path d="M110,130 C280,130 280,130 450,130" fill="none" class="s-teal" stroke-width="1.8" marker-end="url(#a3-teal)"/>
+        <text x="280" y="122" text-anchor="middle" class="t-lbl f-teal" font-size="10.5">1 · GET /r/&lt;token&gt;/relays</text>
+
+        <!-- step 2: framed handoff down the held poll -->
+        <path d="M450,175 C620,175 620,175 790,175" fill="none" class="s-fg" stroke-width="1.7" marker-end="url(#a3)"/>
+        <text x="620" y="167" text-anchor="middle" class="t-sub" font-size="10.5">2 · frame {reqid, req} → poll returns</text>
+
+        <!-- node local dispatch -->
+        <rect x="720" y="196" width="150" height="40" rx="8" class="fill-surface2" stroke="var(--border)"/>
+        <text x="795" y="221" text-anchor="middle" class="t-lbl f-body" font-size="10">3 · serve on 127.0.0.1</text>
+
+        <!-- step 4: reply back -->
+        <path d="M790,262 C620,262 620,262 450,262" fill="none" class="s-fg" stroke-width="1.7" marker-end="url(#a3)"/>
+        <text x="620" y="254" text-anchor="middle" class="t-sub" font-size="10.5">4 · POST /_tunnel/reply {reqid, resp}</text>
+
+        <!-- step 5: wake waiter -->
+        <path d="M450,300 C280,300 280,300 110,300" fill="none" class="s-teal" stroke-width="1.8" marker-end="url(#a3-teal)"/>
+        <text x="280" y="292" text-anchor="middle" class="t-lbl f-teal" font-size="10.5">5 · response bytes (event wakes the request)</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 3 — The reverse-tunnel round trip.</b> The node's outbound poll (step 0, amber) is
+    already parked at the hub before any request arrives. The hub never initiates a connection to the node — it
+    only hands work <em>down a connection the node opened</em>. Several hubs hold such polls at once, so no
+    single hub is a point of failure.</figcaption>
+  </figure>
+</section>
+
+<!-- ============ 4 · TOKENS ============ -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">§4</span>
+    <div class="col"><span class="eyebrow">Anonymity · Layer A</span>
+    <h2>Why the address is a rotating token, not an account</h2></div>
+  </div>
+  <div class="col">
+    <p>A hub relays a node's bytes, so it inevitably sees the flows it carries. What it must <em>not</em> learn
+    is <em>whose</em> flows they are. So routing is keyed on an ephemeral <strong>token</strong>, never the
+    node's ledger account:</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 900 250" role="img" aria-label="The routing token is the ed25519 public key of a blake2b hash of the rendezvous secret, the entry id, and the epoch; it differs per hub and rotates every hour.">
+        <defs><marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--body)"/></marker></defs>
+        <!-- inputs -->
+        <rect x="30" y="40" width="180" height="44" rx="8" class="fill-amber-soft s-amber" stroke-width="1.2"/>
+        <text x="120" y="61" text-anchor="middle" class="t-lbl f-amber" font-size="11">rendezvous secret</text>
+        <text x="120" y="76" text-anchor="middle" class="t-sub" font-size="9">shared out-of-band</text>
+        <rect x="30" y="103" width="180" height="44" rx="8" class="box" stroke-width="1.2"/>
+        <text x="120" y="124" text-anchor="middle" class="t-lbl f-body" font-size="11">entry_id</text>
+        <text x="120" y="139" text-anchor="middle" class="t-sub" font-size="9">the hub's URL</text>
+        <rect x="30" y="166" width="180" height="44" rx="8" class="box" stroke-width="1.2"/>
+        <text x="120" y="187" text-anchor="middle" class="t-lbl f-body" font-size="11">epoch</text>
+        <text x="120" y="202" text-anchor="middle" class="t-sub" font-size="9">⌊ unixtime / 3600 ⌋</text>
+
+        <!-- KDF -->
+        <line x1="210" y1="62" x2="300" y2="118" class="s-fg" stroke-width="1.4" marker-end="url(#a4)"/>
+        <line x1="210" y1="125" x2="300" y2="125" class="s-fg" stroke-width="1.4" marker-end="url(#a4)"/>
+        <line x1="210" y1="188" x2="300" y2="132" class="s-fg" stroke-width="1.4" marker-end="url(#a4)"/>
+        <rect x="300" y="100" width="150" height="52" rx="9" class="fill-surface2" stroke="var(--border-strong)" stroke-width="1.4"/>
+        <text x="375" y="123" text-anchor="middle" class="t-lbl f-fg" font-size="12">blake2b · KDF</text>
+        <text x="375" y="140" text-anchor="middle" class="t-sub" font-size="9">→ 32-byte seed</text>
+
+        <line x1="450" y1="126" x2="520" y2="126" class="s-fg" stroke-width="1.4" marker-end="url(#a4)"/>
+        <rect x="520" y="100" width="150" height="52" rx="9" class="fill-surface2" stroke="var(--border-strong)" stroke-width="1.4"/>
+        <text x="595" y="130" text-anchor="middle" class="t-lbl f-fg" font-size="12">ed25519 pubkey</text>
+
+        <line x1="670" y1="126" x2="740" y2="126" class="s-teal" stroke-width="1.8" marker-end="url(#a4)"/>
+        <rect x="740" y="96" width="140" height="60" rx="10" class="fill-teal-soft s-teal" stroke-width="1.6"/>
+        <text x="810" y="122" text-anchor="middle" class="t-lbl f-teal" font-size="13" font-weight="700">TOKEN</text>
+        <text x="810" y="140" text-anchor="middle" class="t-sub" font-size="9">= the routing id</text>
+
+        <text x="455" y="235" text-anchor="middle" class="t-sub" font-size="10.5">different per hub (entry_id)  ·  rotates every hour (epoch)  ·  not invertible to the account</text>
+      </svg>
+    </div>
+    <figcaption><b>Figure 4 — Token derivation.</b> Because <code>entry_id</code> is in the hash, colluding hubs
+    can't link one node across them; because <code>epoch</code> is in the hash, no hub can aggregate its traffic
+    past an hour. The real account rides <em>inside</em> the request end-to-end, never as the routing key. The
+    Dart client reproduces this byte-for-byte, so the phone derives the same token the node serves.</figcaption>
+  </figure>
+  <div class="col">
+    <p>This is <strong>Layer A</strong>: it unlinks a flow from an identity. It does <em>not</em> defeat a
+    single hub correlating "this inbound request ↔ this outbound reply" by timing — that needs ≥2 hops (a mix
+    layer, Layer B), which is a separate, not-yet-built feature.</p>
+  </div>
+</section>
+
+<!-- ============ 5 · PRIVATE VS PUBLIC ============ -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">§5</span>
+    <div class="col"><span class="eyebrow">Reachability</span>
+    <h2>"Announced" means two different things for a node</h2></div>
+  </div>
+  <div class="col">
+    <p>This is the crux of the original question. A node <strong>never announces itself on-chain</strong> — its
+    only routable identity would be a loopback address every hub would learn, fail to probe, and tombstone. So
+    "getting a node announced" is <em>not</em> the ledger path from §2. A node has exactly two reachability
+    modes, and the difference is one environment variable:</p>
+  </div>
+
+  <div class="two">
+    <div class="panel priv">
+      <h3><span style="color:var(--amber)">◆</span> Private-by-secret <span class="src" style="margin-left:auto">default</span></h3>
+      <p>The node stays invisible. It appears in no directory. Only someone holding the <strong>rendezvous
+      secret</strong> can derive its token and reach it at <code>&lt;hub&gt;/r/&lt;token&gt;</code>.</p>
+      <p>The hub never lists it; the account↔hub link is never exposed. Maximum anonymity, zero automatic
+      discovery — you hand the secret out yourself.</p>
+      <p class="src">XC_MESH_PUBLIC unset · gossip_out() returns early</p>
+    </div>
+    <div class="panel pub">
+      <h3><span style="color:var(--teal)">◆</span> Public listing <span class="src" style="margin-left:auto">--public</span></h3>
+      <p>Each poll carries a <code>public=1</code> flag, so every hub adds the node's token to its
+      <code>/mesh_nodes</code> list. Apps sweep that list and reach the node <strong>with no secret at all</strong>.</p>
+      <p>This is what "announced" means for a node. The cost, stated in the code: it "trades the node's anonymity
+      — its account↔hub link becomes visible — for zero-config reachability."</p>
+      <p class="src">XC_MESH_PUBLIC=1 · EntryHub.public_nodes() · GET /mesh_nodes</p>
+    </div>
+  </div>
+  <div class="col">
+    <p>So a git-default node that is <em>discoverable by every app</em> must ship with
+    <code>XC_MESH_PUBLIC=1</code> (<code>--public</code>). That is a deliberate privacy trade, not a free win —
+    worth making the default explicit about.</p>
+  </div>
+</section>
+
+<!-- ============ 6 · SELF-HEAL ============ -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">§6</span>
+    <div class="col"><span class="eyebrow">Resilience</span>
+    <h2>"Wake up and heal" — what already ships</h2></div>
+  </div>
+  <div class="col">
+    <p>The healing the question asks for is not hypothetical; it is layered through the system already. Five
+    independent mechanisms keep the mesh alive, from a single crashed process up to a whole dead host:</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 900 320" role="img" aria-label="Five nested self-healing layers from innermost process respawn out to client-side ledger failover.">
+        <defs><marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--green)"/></marker></defs>
+        <!-- nested rings as stacked bars -->
+        <g font-size="12">
+          <rect x="30" y="30" width="840" height="46" rx="9" class="fill-green-soft s-green" stroke-width="1.2"/>
+          <text x="52" y="52" class="t-lbl f-green" font-size="12" font-weight="700">1 · Process respawn</text>
+          <text x="52" y="68" class="t-sub" font-size="10">while true: run xc_relayd.py; on exit → log, sleep 3s, restart  (entrypoint.sh & run.sh)</text>
+
+          <rect x="30" y="86" width="840" height="46" rx="9" class="fill-green-soft s-green" stroke-width="1.2"/>
+          <text x="52" y="108" class="t-lbl f-green" font-size="12" font-weight="700">2 · Child heartbeat</text>
+          <text x="52" y="124" class="t-sub" font-size="10">run.sh every 5s: admin / workd / node dead? → restart it in place</text>
+
+          <rect x="30" y="142" width="840" height="46" rx="9" class="fill-green-soft s-green" stroke-width="1.2"/>
+          <text x="52" y="164" class="t-lbl f-green" font-size="12" font-weight="700">3 · Tunnel watchdog</text>
+          <text x="52" y="180" class="t-sub" font-size="10">public URL unreachable ~3 min → tear down &amp; rebuild the tunnel  (skipped for direct/hub)</text>
+
+          <rect x="30" y="198" width="840" height="46" rx="9" class="fill-green-soft s-green" stroke-width="1.2"/>
+          <text x="52" y="220" class="t-lbl f-green" font-size="12" font-weight="700">4 · Machine restart</text>
+          <text x="52" y="236" class="t-sub" font-size="10">Fly health check on /api/status fails → restart the box; 1024mb so it survives the OOM that killed it</text>
+
+          <rect x="30" y="254" width="840" height="46" rx="9" class="fill-green-soft s-green" stroke-width="1.2"/>
+          <text x="52" y="276" class="t-lbl f-green" font-size="12" font-weight="700">5 · Client &amp; peer failover</text>
+          <text x="52" y="292" class="t-sub" font-size="10">app re-heals endpoints from the ledger · probe + tombstone GC re-learns a recovered relay automatically</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption><b>Figure 5 — Nested healing.</b> Innermost (1) is a bare respawn loop; outermost (5) routes
+    around a host that never comes back at all. Layers 1–3 live in the installer/entrypoint an operator already
+    runs; 4 is Fly config; 5 is the client and the gossip prober. A NAT'd node <em>inherits all five</em>.</figcaption>
+  </figure>
+  <div class="col">
+    <p>The self-healing is generic to the relay, not to any one mode. A node installed with
+    <code>--mesh-tunnel</code> gets the respawn loop, the heartbeat, and — crucially — the mesh client's own
+    resilience: it reconciles its <code>(hub, epoch)</code> set every cycle, so hubs joining or leaving and the
+    hourly token rotation are absorbed without a restart.</p>
+  </div>
+</section>
+
+<!-- ============ 7 · THE ANSWER ============ -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">§7</span>
+    <div class="col"><span class="eyebrow">The question, answered — and shipped</span>
+    <h2>Yes — the git default is now a self-healing node (or a hub)</h2></div>
+  </div>
+  <div class="col">
+    <p>A fresh <code>install-relay.sh</code> used to resolve to <code>MODE=quick</code> — a Cloudflare quick
+    tunnel whose URL changes every restart and <em>cannot</em> be announced. That fallthrough is gone. With no
+    flag the installer now reads what the box can do and picks a role; the pieces people assumed were missing
+    were already present. Status of each requirement, and what actually changed:</p>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Requirement</th><th>Now</th><th>How</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><b>Tools to run a node</b></td>
+          <td><span class="yes">Was already there</span></td>
+          <td>One <code>curl … | sh</code> installs relay + node + tunnel client. A git operator has the full toolset.</td>
+        </tr>
+        <tr>
+          <td><b>Correct hub address</b></td>
+          <td><span class="yes">Never needed one</span></td>
+          <td><code>XC_TUNNEL_AUTO=1</code> discovers hubs on-chain by the <code>t1</code> cap, seeded by the (correct) bootstrap list. Nothing to hard-code per node.</td>
+        </tr>
+        <tr>
+          <td><b>Wake up &amp; heal</b></td>
+          <td><span class="yes">Was already there</span></td>
+          <td>Respawn + heartbeat + tunnel watchdog + client failover (§6), inherited by every mode.</td>
+        </tr>
+        <tr>
+          <td><b>Is a node by default</b></td>
+          <td><span class="yes">Shipped</span></td>
+          <td>Zero-flag default now <strong>auto-promotes</strong>: public IP → hub, NAT → mesh node. <code>--quick</code> keeps the old tunnel.</td>
+        </tr>
+        <tr>
+          <td><b>Gets announced</b></td>
+          <td><span class="yes">Shipped</span></td>
+          <td>An auto-promoted node sets <code>XC_MESH_PUBLIC=1</code> (discoverable, no secret). <code>--mesh-tunnel</code> alone opts back to private (§5).</td>
+        </tr>
+        <tr>
+          <td><b>Update never re-homes it</b></td>
+          <td><span class="yes">Shipped</span></td>
+          <td><code>--update</code> now inherits the mode baked into <code>run.sh</code> — and fixed a latent bug that reverted any non-quick install to quick.</td>
+        </tr>
+        <tr>
+          <td><b>Can be paid</b></td>
+          <td><span class="part">Still manual</span></td>
+          <td>Default takes no payments; the operator sets <code>RELAY_ACCT</code> to their own wallet on the settings page, or earns nothing.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note red">
+    <span class="lbl">The one hard constraint</span>
+    <p>A node is <strong>reachable only through a hub</strong>. If the git default makes <em>everyone</em> a
+    node and nobody runs <code>--hub</code>, there are no entries to dial — every node is invisible and the
+    mesh has no floor to stand on. "Default to node" cannot mean "default to node <em>everywhere</em>." The
+    network needs a guaranteed population of public hubs before a node-heavy default is safe.</p>
+  </div>
+
+  <figure>
+    <div class="fig-scroll">
+      <svg viewBox="0 0 900 250" role="img" aria-label="Comparison: a healthy default detects a public IP and becomes a hub, otherwise becomes a public self-healing node; a naive default makes everything a node and leaves no hub to reach them.">
+        <defs>
+          <marker id="a7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--body)"/></marker>
+          <marker id="a7-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--green)"/></marker>
+          <marker id="a7-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--red)"/></marker>
+        </defs>
+        <!-- left: shipped -->
+        <text x="230" y="30" text-anchor="middle" class="t-title f-green" font-size="13">SHIPPED · auto-promote</text>
+        <rect x="150" y="46" width="160" height="40" rx="8" class="box" stroke-width="1.3"/>
+        <text x="230" y="71" text-anchor="middle" class="t-lbl f-body" font-size="11">install: public IP?</text>
+        <path d="M150,66 C100,66 90,120 150,120" fill="none" class="s-green" stroke-width="1.5" marker-end="url(#a7-green)"/>
+        <text x="86" y="98" text-anchor="middle" class="t-sub" font-size="9">yes</text>
+        <rect x="150" y="100" width="160" height="40" rx="8" class="fill-teal-soft s-teal" stroke-width="1.3"/>
+        <text x="230" y="125" text-anchor="middle" class="t-lbl f-teal" font-size="11">→ HUB (entry)</text>
+        <path d="M310,66 C360,66 370,180 310,180" fill="none" class="s-green" stroke-width="1.5" marker-end="url(#a7-green)"/>
+        <text x="372" y="120" text-anchor="middle" class="t-sub" font-size="9">no</text>
+        <rect x="150" y="160" width="160" height="40" rx="8" class="fill-green-soft s-green" stroke-width="1.3"/>
+        <text x="230" y="185" text-anchor="middle" class="t-lbl f-green" font-size="11">→ NODE (public)</text>
+        <text x="230" y="228" text-anchor="middle" class="t-sub" font-size="10">hubs keep appearing → nodes always have an entry</text>
+
+        <line x1="450" y1="40" x2="450" y2="220" class="s-fg dash" stroke-width="1" opacity=".3"/>
+
+        <!-- right: naive -->
+        <text x="675" y="30" text-anchor="middle" class="t-title f-red" font-size="13">NAÏVE · everyone a node</text>
+        <rect x="510" y="70" width="120" height="38" rx="8" class="box dash" stroke-width="1.3"/>
+        <text x="570" y="94" text-anchor="middle" class="t-lbl f-body" font-size="11">NODE</text>
+        <rect x="510" y="150" width="120" height="38" rx="8" class="box dash" stroke-width="1.3"/>
+        <text x="570" y="174" text-anchor="middle" class="t-lbl f-body" font-size="11">NODE</text>
+        <rect x="720" y="110" width="150" height="40" rx="8" class="fill-red-soft s-red" stroke-width="1.4"/>
+        <text x="795" y="130" text-anchor="middle" class="t-lbl f-red" font-size="11">no hub to dial</text>
+        <text x="795" y="145" text-anchor="middle" class="t-sub" font-size="9">unreachable</text>
+        <path d="M630,89 C680,89 690,120 720,124" fill="none" class="s-red dash" stroke-width="1.5" marker-end="url(#a7-red)"/>
+        <path d="M630,169 C680,169 690,140 720,136" fill="none" class="s-red dash" stroke-width="1.5" marker-end="url(#a7-red)"/>
+      </svg>
+    </div>
+    <figcaption><b>Figure 6 — The default that ships.</b> It keys on the one fact the installer can already
+    detect — <code>detect_public_ip()</code>, now classified by <code>is_public_ip()</code>: a public box
+    promotes itself to a hub, a NAT'd box becomes a public node. That keeps entries appearing organically.
+    The flat "everyone's a node" default on the right — which has no one left to dial — is what was avoided.</figcaption>
+  </figure>
+
+  <div class="col">
+    <h3>What shipped</h3>
+    <ol class="steps">
+      <li><strong>The default auto-promotes.</strong> The zero-flag path now resolves a public IP to a hub and
+        everything else to a public, self-healing node — reusing <code>detect_public_ip()</code> plus a new
+        <code>is_public_ip()</code> that rejects RFC1918, CGNAT, loopback and link-local. <code>--quick</code>
+        was added to still ask for the old Cloudflare tunnel; <code>--mesh-tunnel</code> alone stays private.</li>
+      <li><strong>Update is safe.</strong> Re-running the installer inherits the mode a prior install baked into
+        <code>run.sh</code> — no silent re-homing — which also fixed a latent bug that reverted non-quick
+        installs to quick on every update.</li>
+      <li><strong>The privacy trade is spoken aloud.</strong> The install prints which role it picked and how to
+        override, including that a public node reveals which hub carries it, with <code>--mesh-tunnel</code> as
+        the private opt-out.</li>
+      <li><strong>Guarded by tests.</strong> Two source-level tests extract and run the real shipped shell — the
+        classifier's boundaries, and the resolution across fresh installs and updates.</li>
+    </ol>
+    <p style="margin-top:1.4rem">Still deliberately the operator's own step: <strong>setting a payout wallet</strong>
+    (default takes no payments) and <strong>on-chain announcement of a hub</strong> (needs a funded key). And the
+    architectural constraint is unchanged — a node is only as reachable as the hub population is healthy, so the
+    hosted hubs remain the funded floor.</p>
+  </div>
+</section>
+
+<!-- ============ 8 · COMMAND MANUAL ============ -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">§8</span>
+    <div class="col"><span class="eyebrow">Operator manual</span>
+    <h2>The commands your relay gives you</h2></div>
+  </div>
+  <div class="col">
+    <p>Installing drops one command — <code>xchat</code> — on your <code>PATH</code>. It's the day-to-day
+    driver. The relay, its settings page, and the local node all start on their own at login and stay up on
+    their own; nothing here needs to be run to <em>start</em> them.</p>
+  </div>
+
+  <h3 style="max-width:70ch">Everyday — <code>xchat &lt;command&gt;</code></h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">xchat status</td><td>Is it running, and on what public address.</td></tr>
+        <tr><td class="mono">xchat url</td><td>Prints the relay's current public address.</td></tr>
+        <tr><td class="mono">xchat app</td><td>Opens the ӾChat app in your browser.</td></tr>
+        <tr><td class="mono">xchat settings</td><td>Opens the settings page — payout wallet, storage cap, peers.</td></tr>
+        <tr><td class="mono">xchat manual</td><td>Opens this handbook.</td></tr>
+        <tr><td class="mono">xchat earnings</td><td>Payout account, balance in XNO, and payments received.</td></tr>
+        <tr><td class="mono">xchat storage</td><td>Disk use: files stored, MB of the cap, shard share &amp; replica target.</td></tr>
+        <tr><td class="mono">xchat work</td><td>Proof-of-work stats (CPU/GPU, blocks solved, avg seconds) — what makes tips fast.</td></tr>
+        <tr><td class="mono">xchat node</td><td>Your local node: up or not, ledger height, and its LAN address for the phone.</td></tr>
+        <tr><td class="mono">xchat logs</td><td>Follows the relay log (ctrl-C to stop).</td></tr>
+        <tr><td class="mono">xchat stop · start · restart</td><td>Controls the whole login service (relay + settings + node together).</td></tr>
+        <tr><td class="mono">xchat update · check-update</td><td>Pulls the latest code in place · reports if a newer version exists.</td></tr>
+        <tr><td class="mono">xchat uninstall</td><td>Stops it and removes <code>~/.xchat-relay</code>, the command, and shortcuts.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3 style="max-width:70ch">Setup &amp; how it goes public — <code>sh install-relay.sh &lt;flag&gt;</code></h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Flag</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">(no flag)</td><td><b>Auto-promote</b> — public IP → hub, behind NAT → public self-healing node. The default.</td></tr>
+        <tr><td class="mono">--quick</td><td>Force a Cloudflare quick tunnel (the old default; churns its name, can't be announced).</td></tr>
+        <tr><td class="mono">--mesh-tunnel [--public]</td><td>Reach through other hubs, no external service. <code>--public</code> lists it for zero-secret discovery; omit for private-by-secret.</td></tr>
+        <tr><td class="mono">--hub [&lt;addr&gt;]</td><td>Public-IP box: bind straight to the internet as a <code>t1</code> entry that fronts NAT'd relays.</td></tr>
+        <tr><td class="mono">--tailscale · --localhost-run</td><td>Stable free addresses via Tailscale Funnel or an SSH reverse tunnel.</td></tr>
+        <tr><td class="mono">--domain &lt;host&gt; [--tunnel-token &lt;t&gt;]</td><td>Your own hostname; with a token, a Cloudflare named tunnel.</td></tr>
+        <tr><td class="mono">--with-node · --no-node</td><td>Run the full <code>/api</code> node (default) or a storage-only relay.</td></tr>
+        <tr><td class="mono">--setup-operator</td><td>Create the key that announces a permanent address on the ledger (spends XNO dust).</td></tr>
+        <tr><td class="mono">--setup-worker</td><td>A free, permanent <code>workers.dev</code> address in front of a quick tunnel.</td></tr>
+        <tr><td class="mono">--status · --update · --start · --stop · --uninstall</td><td>Same lifecycle actions as the <code>xchat</code> verbs.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <span class="lbl teal">Two web surfaces, both local</span>
+    <p><b>Settings page</b> — <code>http://127.0.0.1:7402</code>, this machine only: set your payout wallet
+    (with on-chain proof-of-control), storage cap and peers, and see what you've been paid. <b>Node
+    <code>/api</code></b> — <code>:8790</code>, what the ӾChat app talks to. Both start automatically at login and
+    are kept alive by a 5-second heartbeat; a public hub also binds its port to the internet.</p>
+  </div>
+</section>
+
+<hr class="rule">
+<footer>
+  ӾChat relay — operator handbook &amp; mesh report · updated 2026-08-20<br>
+  Primary sources: relay/xc_relayd.py · relay/xc_tunnel.py · relay/install-relay.sh · relay/xc_admin.py · deploy/entrypoint.sh · app/lib/mesh.dart<br>
+  Reopen any time with <code>xchat manual</code>. Diagrams depict the live mechanism as shipped.
+</footer>
+
+</div>
+</body>
+</html>
