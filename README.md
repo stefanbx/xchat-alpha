@@ -45,12 +45,12 @@ seed** — and post.  ·  **Read the design** → [`docs/WHITEPAPER.md`](docs/WH
 
 ## Install the app
 
-Download `apk/xchat-alpha.apk` (**v2.3.5**) onto an Android phone and open it (allow "install from
+Download `apk/xchat-alpha.apk` (**v2.5.3**) onto an Android phone and open it (allow "install from
 this source" once). **Verify it first:**
 
 ```
 sha256sum xchat-alpha.apk
-# expected: 672c3378dec2a6506d17699a9c9f404ebe21738ac86a84e0dd803d799bf59433
+# expected: 540cb0001db4bec4955eabe4d0d75977bf33041bad82d1eda5aeddc436e87918
 ```
 
 Signing certificate SHA-256: `d3c83e1a08edc6339a95489bce6cd017e10c921272af15429aa07a9919b7788e`
@@ -87,7 +87,10 @@ node + a relay + IPFS into one image (`fly deploy`). The reference hosted node r
 
 ## Run your own relay
 
-A relay is pure Python and stores only signed bytes.
+A relay is pure Python and stores only signed bytes — it holds no seed, verifies signatures, and can
+only *fail to serve*, never forge. Running one **adds capacity to the network**: the app discovers
+relays on-chain and through peer gossip, then spreads posts, pins, DMs and updates across all of
+them. More relays = more places every load-bearing part can be routed around.
 
 **The one-command way** (macOS/Linux) — for anyone who'd rather not think about any of the below:
 
@@ -95,52 +98,86 @@ A relay is pure Python and stores only signed bytes.
 curl -fsSL https://xchat-alpha-node.fly.dev/relay.sh | sh
 ```
 
-[`relay/install-relay.sh`](relay/install-relay.sh) installs into `~/.xchat-relay`, opens a free
-Cloudflare quick tunnel so a laptop behind NAT still gets a reachable `https://` URL, and registers
-the relay to start at login (launchd / systemd `--user`). The relay binds to loopback only — the
-tunnel is the sole way in. `--status` shows the URL, `--uninstall` removes everything. The same URL
-serves the script as plain text, so read it first.
+[`relay/install-relay.sh`](relay/install-relay.sh) installs into `~/.xchat-relay`, makes it reachable
+from the internet, and registers it to start at login (launchd / systemd `--user`). With **no flag it
+auto-promotes**: a box with a **public IP becomes a hub** (binds straight to the internet, no external
+service); a box **behind NAT becomes a public mesh node** (reachable through other xchat hubs, no
+external service). The same URL serves the script as plain text, so read it first. `--status` shows
+what's running and the public URL; `--update` upgrades in place; `--uninstall` removes everything.
 
-A quick tunnel's hostname changes on every restart, so **a relay's identity is its own keypair, not
-its URL**. Each relay generates one on first run (kept beside its state file, holds no funds) and
-signs `relay_announce` records binding *account → current url*. Peers key on the account, so a relay
-that comes back at a new address **replaces** its old entry instead of leaving a dead one behind, and
+### Ways to go public
+
+Pick one; each is a full command (`sh install-relay.sh <flag>`). "App auto-uses it" means the app
+picks it up automatically — the app only auto-lists **`https`** relays, so plain-HTTP modes must be
+announced on-chain or pointed at by hand.
+
+| Flag | What you get | External service | App auto-uses it |
+|------|--------------|------------------|------------------|
+| *(none)* | Auto: public IP → hub, behind NAT → public mesh node | None | ✅ (as applicable) |
+| `--hub [addr]` | **Your own public IP/host** — binds direct, announces `http://<ip>:PORT`. The zero-dependency way to run a public hub that fronts NAT'd relays. Open the port in your firewall. | None | ⚠️ HTTP — announce it or add it manually |
+| `--mesh-tunnel` | **No external service and no single point of failure.** Discovers public xchat hubs and is reachable through *all of them at once*; kill one, the others carry it. Private-by-secret. | None | Secret-only |
+| `--mesh-tunnel --public` | Same, but hubs **list** it so every app auto-discovers it with no secret. Reached as `<hub>/r/<token>`, so its own IP is never exposed. | None | ✅ |
+| `--tailscale` | Free **permanent** address via Tailscale Funnel (`tailscale up` + enable Funnel first) | Tailscale | ✅ |
+| `--localhost-run` | Free SSH reverse tunnel → short `*.lhr.life` name, no account, no Cloudflare. Register the printed key for a name that never changes. Needs `ssh`. | localhost.run | ✅ |
+| `--quick` | Free Cloudflare quick tunnel. Needs nothing, but the hostname **changes every restart** (can't be announced) and rate-limits. | Cloudflare | ✅ (until restart) |
+| `--domain relay.example.com` | You already route that name to this machine (reverse proxy / existing tunnel) | your setup | ✅ |
+| `--domain … --tunnel-token TOKEN` | **Most reliable** — your own domain over a *named* Cloudflare tunnel. Stable name, unlimited bandwidth. | Cloudflare | ✅ |
+| `--setup-worker` | Free permanent `*.workers.dev` front for a quick-tunnel node, so the published address never changes | Cloudflare | ✅ |
+
+> **`--mesh-tunnel` does not give apps a direct connection.** A mesh node has no public address of
+> its own — it dials *out* to public hubs, and apps reach it *through* them at `<hub>/r/<token>/…`.
+> The hub reverse-proxies the request down the tunnel; the node's IP is never exposed, and routing is
+> by an opaque token so even the hub carrying the traffic can't tell whose relay it is. For apps to
+> connect **straight to the box's own address**, use `--hub` (direct IP) or an HTTPS mode
+> (`--domain` / `--tailscale` / `--quick`).
+
+The relay binds to `127.0.0.1` only unless it's a `--hub` (which listens on `0.0.0.0` by design) — for
+tunnel modes, the tunnel is the sole way in.
+
+### A relay's identity is its keypair, not its URL
+
+A quick tunnel's hostname changes on every restart, so **a relay's identity is its own keypair**. Each
+relay generates one on first run (kept beside its state file, holds no funds) and signs
+`relay_announce` records binding *account → current url*. Peers key on the account, so a relay that
+comes back at a new address **replaces** its old entry instead of leaving a dead one behind, and
 because the record is signed it can be gossiped on by any peer without that peer being able to alter
 the URL. Relays also re-probe what they know and forget a URL after `XC_RELAY_FAIL_MAX` consecutive
 failures — so address churn is self-healing rather than cumulative. Relays that predate this still
 interoperate: `/relays` keeps its flat url list and unsigned announces are accepted as before.
 
-**Want a permanent address instead?** Point a hostname at the machine and pass it:
+### Be findable (announce on-chain)
+
+Being *reachable* isn't the same as being *findable*. To be discovered by people who don't already
+have your URL, announce the relay on the XNO ledger — this needs a **permanent** address (32 chars or
+fewer) and a signing key. The installer sets both up, one command each, and never touches your seed:
 
 ```bash
-sh ~/.xchat-relay/install-relay.sh --domain relay.example.com
-sh ~/.xchat-relay/install-relay.sh --domain relay.example.com --tunnel-token <cloudflare-token>
+sh ~/.xchat-relay/install-relay.sh --setup-worker    # free permanent workers.dev address
+sh ~/.xchat-relay/install-relay.sh --setup-operator  # create the signing key + what to fund it with
 ```
 
-The first assumes you route that name to `127.0.0.1:7401` yourself (reverse proxy, existing tunnel);
-the second runs a Cloudflare *named* tunnel, whose hostname is permanent. With a stable name of 32
-characters or fewer you can also announce it on-chain (below) and be discovered with no bootstrap at
-all — the installer prints the exact command but never handles your seed.
+The announce spends a few *raw* (dust); the account just has to exist on-chain. From then on any node
+scanning the ledger finds your relay automatically — no coordination, no registration server. A
+`--public` mesh node skips even this: it's auto-discovered through the hubs with no ledger entry.
 
-**By hand**, if you want the pieces where you can see them:
+### By hand
+
+If you want the pieces where you can see them:
 
 ```bash
 cd relay
 python3 xc_relayd.py 7401 relay-state.json      # binds 0.0.0.0:7401
 ```
 
-Host it anywhere with a public URL (a small VM, Fly.io, etc.). Then **announce it on the XNO
-ledger** so clients discover it by scanning — this is the one on-chain *write*, made from a
-funded wallet by you, the relay operator:
+Host it anywhere with a public URL (a small VM, Fly.io, etc.), then announce it from a funded wallet
+**you** control (a real, tiny Nano transaction):
 
 ```bash
-# from a funded wallet you control (a real, tiny Nano transaction):
 python3 backend/xc_reldir.py announce https://your-relay.example.com
 ```
 
-That commits your relay's URL to your account's chain and checks in at the rendezvous accounts.
-From then on, any node scanning the ledger finds your relay automatically — no coordination, no
-registration server.
+That commits your relay's URL to your account's chain and checks in at the rendezvous accounts —
+after which any node scanning the ledger finds it automatically.
 
 ## Verify discovery yourself
 
