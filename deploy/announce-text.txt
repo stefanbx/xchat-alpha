@@ -1,1 +1,1 @@
-ӾChat 2.5.3 is live — faster and much more private: sealed-sender DMs, blind inbox reads, opt-in presence, and a feed that loads instantly. Tap to update.
+ӾChat 2.5.4 is live — faster and much more private: sealed-sender DMs, blind inbox reads, opt-in presence, and a feed that loads instantly. Tap to update.
