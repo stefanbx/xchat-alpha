@@ -4,6 +4,7 @@
 # and swappable — run several; clients DISCOVER the set from a bootstrap, no hardcoding.
 # Usage: xc_relayd.py <port> <store.json> [bootstrap_url ...]
 import json, sys, os, time, threading, sqlite3, urllib.request, random, hashlib, base64
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -112,7 +113,16 @@ comments = {}                        # post_id -> list of signed comment events 
 releases = {}                        # publisher account -> signed release record (self-update head)
 profiles = {}                        # account -> signed profile record (display name, bio, avatar/banner CIDs)
 dmkeys = {}                          # account -> signed X25519 DM public key record (E2E encryption)
-dms = []                             # list of encrypted direct messages (ciphertext only; relay can't read)
+dms_by_to = {}                       # recipient acct -> [encrypted DM record, ...] in arrival order.
+                                     # Bucketed by RECIPIENT (`to`, always present even for sealed v2 whose
+                                     # `from` is hidden) so eviction is per-mailbox, not one global ring.
+                                     # Ciphertext only — the relay can't read the bodies. Persisted; the
+                                     # on-disk `dms` flat list from older builds is migrated on load.
+_dm_total = 0                        # live record count across all buckets (== len(_dm_seen))
+_dm_order = deque()                  # record refs in global ARRIVAL order — drives strict oldest-first DM_MAX
+                                     # eviction AND the flat on-disk order. May hold evicted 'tombstones'
+                                     # (records popped by the per-/distinct-mailbox caps); they are skipped
+                                     # on eviction and squeezed out by periodic compaction.
 pollvotes = {}                       # poll_id -> {account: signed vote record} (one vote per account)
 reports = {}                         # post_id -> {account: signed report} (community moderation signal)
 tips_paid = {}                       # tip payhash -> cid, so one on-chain payment credits value once
@@ -158,7 +168,12 @@ HEAD_SKEW   = 900                                             # clock-skew slack
 MAX_HEADS   = int(os.environ.get('XC_MAX_HEADS', '50000'))    # hard cap on live authors (backstop)
 NOTIF_MAX   = int(os.environ.get('XC_NOTIF_MAX', '200'))      # per-recipient notification cap
 NOTIF_ACCTS = int(os.environ.get('XC_NOTIF_ACCTS', '20000'))  # cap on distinct notified accounts
-DM_MAX      = int(os.environ.get('XC_DM_MAX', '20000'))       # global ciphertext mailbox cap
+DM_MAX      = int(os.environ.get('XC_DM_MAX', '20000'))       # global ciphertext ceiling (memory backstop)
+DM_PER_ACCT = int(os.environ.get('XC_DM_PER_ACCT', '2000'))   # per-RECIPIENT mailbox cap — the fairness knob:
+                                                              # a chatty mailbox evicts only its OWN oldest, so
+                                                              # one busy pair can no longer flush everyone else's
+                                                              # unread out of the shared 20k ring.
+DM_ACCTS    = int(os.environ.get('XC_DM_ACCTS', '50000'))     # distinct recipient mailboxes (flood backstop)
 # Per-IP WRITE throttle. Note a shared node proxies many users under ONE IP, so this must be well
 # above legit aggregate node traffic — it's a coarse CPU throttle against a naive single-source
 # flood, NOT the memory guarantee. Memory is bounded regardless of rate by the caps + prune above.
@@ -287,6 +302,63 @@ def _dm_key(m):
     # exactly as before, new records dedup on an id that does not depend on a visible sender.
     mid = m.get('mid')
     return ('mid', mid) if mid else ('ft', m.get('from'), m.get('ts'))
+
+
+def _dm_forget(rec):
+    global _dm_total
+    k = _dm_key(rec)
+    if k in _dm_seen:
+        _dm_seen.discard(k); _dm_total -= 1
+
+
+def _dms_flat():
+    # Records in global arrival order, tombstones dropped — the on-disk `dms` list (stays flat so an OLDER
+    # relay can still read a store this one wrote), and the order that restores strict oldest-first eviction.
+    return [r for r in _dm_order if _dm_key(r) in _dm_seen]
+
+
+def _dm_evict_oldest():
+    # Remove the single globally-oldest LIVE record: walk arrival order, skipping tombstones left by the
+    # per-/distinct-mailbox caps. The oldest live record of any mailbox is that bucket's front (older ones
+    # were enqueued earlier and already left), so an identity match on b[0] is enough.
+    while _dm_order:
+        r = _dm_order.popleft()
+        if _dm_key(r) not in _dm_seen:
+            continue                                     # tombstone — already evicted by a per-mailbox cap
+        b = dms_by_to.get(r.get('to') or '')
+        if b and b[0] is r:
+            _dm_forget(b.pop(0))
+            if not b:
+                dms_by_to.pop(r.get('to') or '', None)
+        return
+
+
+def _dm_store(m):
+    # Store one ciphertext DM under its RECIPIENT's mailbox, then enforce three bounds in order:
+    #   1. per-recipient (DM_PER_ACCT) — fairness: only the chatty mailbox loses its own oldest;
+    #   2. distinct-recipient (DM_ACCTS) — evict whole oldest-inserted mailboxes under a spray flood;
+    #   3. global total (DM_MAX) — the hard RAM ceiling; sheds the globally OLDEST record (strict arrival
+    #      order, via _dm_order). This last path is rare: 1+2 keep the total modest in normal use.
+    # Returns True if the record was newly stored. Dedup is unchanged (_dm_key: `mid` for sealed v2).
+    global _dm_total, _dm_order
+    key = _dm_key(m)
+    if key in _dm_seen:
+        return False
+    to = m.get('to') or ''
+    _dm_seen.add(key); _dm_total += 1
+    dms_by_to.setdefault(to, []).append(m)
+    _dm_order.append(m)
+    bucket = dms_by_to[to]
+    while len(bucket) > DM_PER_ACCT:                      # 1) per-recipient fairness cap
+        _dm_forget(bucket.pop(0))
+    while len(dms_by_to) > DM_ACCTS:                      # 2) distinct-recipient backstop (oldest mailbox)
+        for r in dms_by_to.pop(next(iter(dms_by_to))):
+            _dm_forget(r)
+    while _dm_total > DM_MAX:                             # 3) global RAM ceiling — strict oldest-across-all
+        _dm_evict_oldest()
+    if len(_dm_order) > 2 * _dm_total + 64:               # squeeze out accumulated tombstones
+        _dm_order = deque(_dms_flat())
+    return True
 
 # Reading a mailbox: prove you own it.
 #
@@ -822,8 +894,10 @@ def blob_credit(cid, payhash):
 # --- persistence: the WHOLE relay state survives a restart, not just heads ---
 # (in-memory before this meant comments, uploaded media, likes, poll votes vanished on restart)
 _STATE_KEYS = ('engage', 'notifs', 'supporters', 'follows', 'comments',   # blobs now live in SQLite
-               'releases', 'profiles', 'dmkeys', 'dms', 'pollvotes', 'reports', 'pinned', 'pins_paid',
+               'releases', 'profiles', 'dmkeys', 'pollvotes', 'reports', 'pinned', 'pins_paid',
                'tips_paid', 'revocations')
+# DMs are persisted SEPARATELY (not via the generic loop above): on disk they stay a FLAT `dms` list in
+# arrival order — so an OLDER relay can still read a store this one writes — and load() re-buckets them.
 
 def _prune_loaded():
     # PRUNE-ON-LOAD. The per-table caps in the write handlers only bound NEW writes; state loaded from
@@ -865,8 +939,15 @@ def _prune_loaded():
     for pub, lst in list(releases.items()):
         if isinstance(lst, list):
             releases[pub] = _dedup_releases(lst)[-24:]   # drop duplicate-CID records left by older code, then cap
-    if len(dms) > DM_MAX:
-        del dms[:-DM_MAX]
+    for _t in list(dms_by_to):                           # 1) per-recipient cap (drop each mailbox's oldest)
+        _b = dms_by_to[_t]
+        while len(_b) > DM_PER_ACCT:
+            _dm_forget(_b.pop(0))
+    while len(dms_by_to) > DM_ACCTS:                      # 2) distinct-recipient backstop (oldest mailbox)
+        for _r in dms_by_to.pop(next(iter(dms_by_to))):
+            _dm_forget(_r)
+    while _dm_total > DM_MAX:                             # 3) global RAM ceiling — strict oldest-across-all
+        _dm_evict_oldest()
 
 def load_state():
     global heads
@@ -888,6 +969,15 @@ def load_state():
         for cid, b64 in (d.get('blobs') or {}).items():   # one-time migration: legacy in-JSON blobs -> SQLite
             if b64:
                 blob_put(cid, b64)
+        if isinstance(d.get('dms'), list):          # DM mailbox: flat list on disk -> per-recipient buckets,
+            for _m in d['dms']:                      # rebuilding the dedup index and arrival order as we go
+                _k = _dm_key(_m)
+                if _k in _dm_seen:
+                    continue
+                _dm_seen.add(_k)
+                dms_by_to.setdefault(_m.get('to') or '', []).append(_m)
+                _dm_order.append(_m)
+            globals()['_dm_total'] = len(_dm_seen)
         _prune_loaded()                              # bound the loaded state to the same caps as live writes
         mark_dirty()                                 # so the pruned (smaller) state is written back on next save
     except Exception:
@@ -898,6 +988,7 @@ def save():
     state = {'heads': list(heads.values())}
     for k in _STATE_KEYS:
         state[k] = globals()[k]
+    state['dms'] = _dms_flat()                       # DM mailbox: flat, arrival-ordered (older relays read it)
     tmp = STORE + '.tmp'
     try:
         json.dump(state, open(tmp, 'w'))
@@ -907,8 +998,7 @@ def save():
 
 load_state()
 blob_load_meta()
-for _m in dms:                                       # rebuild the DM dedup index from the loaded mailbox
-    _dm_seen.add(_dm_key(_m))
+_dm_order = deque(_dms_flat())                        # clean arrival order after prune-on-load dropped over-cap records
 for _pid, _recs in reports.items():                  # rebuild per-cid reporter weights -> blob penalty
     for _acc, _rec in (_recs or {}).items():
         _c = (_rec or {}).get('cid'); _rp = float((_rec or {}).get('rep', 0) or 0)
@@ -1548,7 +1638,7 @@ class H(BaseHTTPRequestHandler):
             if not ok:
                 self._send(403, json.dumps({'error': why, 'account': acc, 'dms': []}))
                 return
-            mine = [m for m in dms if m.get('to') == acc or m.get('from') == acc]
+            mine = list(dms_by_to.get(acc, ()))          # O(1) mailbox lookup (was an O(N) scan of every DM)
             self._send(200, json.dumps({'account': acc, 'dms': mine}))
         elif self.path.startswith('/comments'):
             pid = qs(self.path).get('post', '')
@@ -1792,7 +1882,7 @@ class H(BaseHTTPRequestHandler):
                         since = int(inner.get('since', 0) or 0)
                     except (TypeError, ValueError):
                         since = 0
-                    mine = [m for m in dms if m.get('to') == acc or m.get('from') == acc]
+                    mine = list(dms_by_to.get(acc, ()))  # O(1) mailbox lookup (was an O(N) scan of every DM)
                     if since:
                         mine = [m for m in mine if int(m.get('ts') or 0) >= since]
                     reply = {'account': acc, 'dms': mine}
@@ -1805,17 +1895,14 @@ class H(BaseHTTPRequestHandler):
                 # clear — the caller learns its request never opened. No mailbox contents are exposed.
                 self._send(400, json.dumps({'error': 'bad sealed read: %s' % e}))
         elif self.path.startswith('/dm'):
-            # store an encrypted DM (O(1) dedup by _dm_key: `mid` for sealed v2, else (from, ts)). The
-            # relay only holds ciphertext, and the mailbox is a bounded ring — oldest drops past DM_MAX.
+            # store an encrypted DM (O(1) dedup by _dm_key: `mid` for sealed v2, else (from, ts)). The relay
+            # only holds ciphertext. Bucketed by recipient and bounded per-mailbox (DM_PER_ACCT), by distinct
+            # mailbox (DM_ACCTS) and by global total (DM_MAX) — see _dm_store.
             try:
-                m = json.loads(raw); key = _dm_key(m)
-                if key not in _dm_seen:
-                    _dm_seen.add(key); dms.append(m)
-                    if len(dms) > DM_MAX:                                # bounded: evict oldest
-                        for x in dms[:-DM_MAX]:
-                            _dm_seen.discard(_dm_key(x))
-                        del dms[:-DM_MAX]
-                self._send(200, json.dumps({'ok': True, 'stored': len(dms)}))
+                m = json.loads(raw)
+                if _dm_store(m):
+                    mark_dirty()                                    # flush the new record within ≤5s (autosave)
+                self._send(200, json.dumps({'ok': True, 'stored': _dm_total}))
             except Exception as e:
                 self._send(400, json.dumps({'ok': False, 'error': str(e)}))
         elif self.path.startswith('/revoke'):
