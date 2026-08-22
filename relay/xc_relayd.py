@@ -984,17 +984,24 @@ def load_state():
         pass
 
 def save():
-    # atomic write of the full state (heads + everything else)
-    state = {'heads': list(heads.values())}
-    for k in _STATE_KEYS:
-        state[k] = globals()[k]
-    state['dms'] = _dms_flat()                       # DM mailbox: flat, arrival-ordered (older relays read it)
-    tmp = STORE + '.tmp'
+    # Atomic write of the full state. Build the snapshot INSIDE the guard: the head map and the DM tables
+    # are mutated by concurrent requests (ThreadingHTTPServer), so a plain iteration here can raise
+    # "changed size during iteration". If that happens we SKIP this write and the autosave retries in ~5s
+    # (it keeps _dirty set). The invariant is that the autosave thread must never die — it also runs
+    # prune(), so a dead autosave means state stops persisting AND heads/DMs grow unbounded (OOM).
     try:
+        with _heads_lock:
+            state = {'heads': list(heads.values())}
+        for k in _STATE_KEYS:
+            v = globals()[k]
+            state[k] = dict(v) if isinstance(v, dict) else list(v) if isinstance(v, (list, set, deque)) else v
+        state['dms'] = _dms_flat()                   # DM mailbox: flat, arrival-ordered (older relays read it)
+        tmp = STORE + '.tmp'
         json.dump(state, open(tmp, 'w'))
         os.replace(tmp, STORE)
+        return True
     except Exception:
-        pass
+        return False
 
 load_state()
 blob_load_meta()
@@ -1033,9 +1040,13 @@ def _autosave():                                     # flush every few seconds s
     global _dirty
     while True:
         time.sleep(5)
-        changed = prune()                            # expire heads / trim buckets each tick
-        if _dirty or changed:                        # only rewrite state when something changed
-            save(); _dirty = False
+        try:
+            changed = prune()                        # expire heads / trim buckets each tick
+            if _dirty or changed:                    # only rewrite state when something changed
+                if save():                           # keep _dirty set if the write raced — retry next tick
+                    _dirty = False
+        except Exception:
+            pass                                     # NEVER let the autosave thread die — it also prunes
 threading.Thread(target=_autosave, daemon=True).start()
 
 def qs(path):

@@ -3461,10 +3461,12 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   Future<void> _maybeAutoSettle(String account, String handle) async {
     if (account == _account) { setState(() => _pending.remove(account)); return; } // self-tip: nothing to settle
     if (!_autoSettle) return;
-    // RE-ENTRANCY GUARD: settle is a multi-second network+PoW round trip fired from every tip tap. Two
-    // overlapping settles for one creator would sign on the same (not-yet-advanced) frontier — one forks
-    // — and the second's success would clear a tally the first hadn't yet accounted for. One at a time.
-    if (_settling.contains(account) || _settleBusy) return;
+    // RE-ENTRANCY GUARD: settle is a multi-second network+PoW round trip fired from every tip tap. ALL
+    // settles sign against the wallet's single frontier, so two overlapping ones — even for DIFFERENT
+    // creators — sign on the same (not-yet-advanced) frontier and one forks (and the second clears a
+    // tally the first hadn't accounted for, and both read a stale _autoSpent). Serialize GLOBALLY: block
+    // if any settle at all is in flight, not just one for this creator.
+    if (_settling.isNotEmpty || _settleBusy) return;
     final amt = _pending[account] ?? 0;
     if (amt + 1e-9 < _autoThreshold) return; // below the per-creator threshold — keep tallying
     if (_autoSpent + amt > _autoCap + 1e-9) {
@@ -3585,7 +3587,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _settle() async {
-    if (_settleBusy) return;   // a batch settle is already running — a double-tap must not start a second
+    if (_settleBusy || _settling.isNotEmpty) return;   // already settling (a double-tap, OR an auto-settle in flight) — both sign the same wallet frontier
     _settleBusy = true;
     try {
     _pending.remove(_account);   // a self-tip settles as send-to-yourself — drop it so it can't get stuck

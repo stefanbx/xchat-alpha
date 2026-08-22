@@ -152,6 +152,11 @@ def engine():  # machine-readable form for the engine's /api/relaydir endpoint
     health = _measure(allr)
     for h in health:
         h['onchain'] = h['url'] in onchain_set          # announced on the ledger vs bootstrap-only
+    # Hide persistently-dead relays from the panel: a ledger-announced relay that is down AND has 0%
+    # uptime in the rolling window (answered no probe) is just noise — e.g. an old lhr.life tunnel a peer
+    # abandoned. Keep anything up or recently-flapping (reliability > 0). Server-side so even clients that
+    # predate the app-side filter stop showing them.
+    health = [h for h in health if h.get('up') or (h.get('reliability') or 0) > 0]
     doc = {'rendezvous': xc.rendezvous_accts(),
            'relays': onchain,                           # kept: the ledger-announced set (back-compat)
            'count': len(onchain),
