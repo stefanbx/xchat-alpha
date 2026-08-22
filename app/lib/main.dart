@@ -2257,15 +2257,25 @@ class Api {
       final r = await http.post(Uri.parse('$kBase/api/dm_send'),
           headers: {'Content-Type': 'application/json'}, body: jsonEncode(record));
       final ok = jsonDecode(r.body)['ok'] == true;
-      if (ok && sealed) {
-        // Fire the self-copy to the network (best-effort — the local store below still holds it on this
-        // device if the mirror send fails; only cross-device sync depends on it landing).
-        try {
-          await http.post(Uri.parse('$kBase/api/dm_send'),
-              headers: {'Content-Type': 'application/json'}, body: jsonEncode(selfRecord));
-        } catch (_) {}
-        // Persist our own copy now (immediacy), keyed by the self-copy's ct so the poll that later
-        // fetches that same record from our mailbox recognises it and does not duplicate the bubble.
+      if (ok) {
+        if (sealed) {
+          // Fire the self-copy to the network (best-effort — the local store below still holds it on this
+          // device if the mirror send fails; only cross-device sync depends on it landing).
+          try {
+            await http.post(Uri.parse('$kBase/api/dm_send'),
+                headers: {'Content-Type': 'application/json'}, body: jsonEncode(selfRecord));
+          } catch (_) {}
+        }
+        // Persist our own copy locally NOW so the send confirms from the STORE immediately, instead of
+        // waiting to read it back off a relay. That read-back is fragile: it can be slow, blind-only, or
+        // — for a sealed self-copy — sitting on our node's own co-located relay, which the blind path
+        // cannot address. When it fails, the optimistic bubble hangs on the pending clock forever
+        // ("can't send"). The store is the source of truth; _load() clears _pending as soon as the sent
+        // message appears here, no round-trip required. Keyed by the same ct the later poll fetches, so
+        // the network copy dedups (DmStore.get) instead of double-rendering.
+        //
+        // This now runs for v1 sends too: previously only sealed sends persisted here, so a v1 send's
+        // confirmation depended entirely on the relay echoing it back and hung when that path broke.
         await DmStore.load(w);
         DmStore.put(storeKey, text, ts, from: w.account, outgoing: true, peer: to, peerPk: peer);
         await DmStore.flush(w);
