@@ -15,6 +15,8 @@ import 'package:video_player/video_player.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:video_compress/video_compress.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:html/parser.dart' as htmlparser;   // sanitised HTML article renderer (HtmlBody)
+import 'package:html/dom.dart' as dom;
 import 'package:http/http.dart' as http;
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -165,7 +167,7 @@ Future<void> resolveWorkBase() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.5.7'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.5.8'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -4370,19 +4372,24 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
               ]),
             ),
             const SizedBox(height: 18),
-            MarkdownBody(
-              data: p.text,
-              styleSheet: MarkdownStyleSheet(
-                p: const TextStyle(color: kText, fontSize: 17, height: 1.6),
-                h1: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 24, height: 1.3),
-                h2: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 20, height: 1.3),
-                h3: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 18),
-                a: const TextStyle(color: kAccent),
-                blockquote: const TextStyle(color: kDim, fontSize: 16, height: 1.5),
-                code: const TextStyle(color: kAccent, fontFamily: 'monospace'),
-                listBullet: const TextStyle(color: kText, fontSize: 17),
+            // Rich HTML bodies render through the sanitised HtmlBody; plain-markdown articles (everything
+            // published before HTML support) keep the markdown renderer, so nothing already live changes.
+            if (HtmlBody.looksLikeHtml(p.text))
+              HtmlBody(p.text)
+            else
+              MarkdownBody(
+                data: p.text,
+                styleSheet: MarkdownStyleSheet(
+                  p: const TextStyle(color: kText, fontSize: 17, height: 1.6),
+                  h1: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 24, height: 1.3),
+                  h2: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 20, height: 1.3),
+                  h3: const TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 18),
+                  a: const TextStyle(color: kAccent),
+                  blockquote: const TextStyle(color: kDim, fontSize: 16, height: 1.5),
+                  code: const TextStyle(color: kAccent, fontFamily: 'monospace'),
+                  listBullet: const TextStyle(color: kText, fontSize: 17),
+                ),
               ),
-            ),
             const SizedBox(height: 24),
             Container(height: 1, color: kLine),
             const SizedBox(height: 12),
@@ -10561,15 +10568,22 @@ class _PostCardState extends State<PostCard> {
             GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: widget.onOpenThread,
-              child: (longText && !_expanded)
-                  // Collapsed: plain Text, because maxLines+ellipsis belongs to Text and a truncated
-                  // tappable span offers links whose end the reader cannot see.
-                  ? Text(p.text,
-                      maxLines: 6,
+              child: p.kind == 'article'
+                  // Articles show a CLEAN excerpt under the title — never the raw HTML/markdown source.
+                  // The formatted body is one tap away in the reader.
+                  ? Text(articleExcerpt(p.text),
+                      maxLines: 3,
                       overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: kText, fontSize: 15, height: 1.35))
-                  : _richBody(p.text,
-                      const TextStyle(color: kText, fontSize: 15, height: 1.35)),
+                      style: const TextStyle(color: kDim, fontSize: 14.5, height: 1.4))
+                  : (longText && !_expanded)
+                      // Collapsed: plain Text, because maxLines+ellipsis belongs to Text and a truncated
+                      // tappable span offers links whose end the reader cannot see.
+                      ? Text(p.text,
+                          maxLines: 6,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: kText, fontSize: 15, height: 1.35))
+                      : _richBody(p.text,
+                          const TextStyle(color: kText, fontSize: 15, height: 1.35)),
             ),
             // "Show more" EXPANDS the text in place. It used to open the thread instead, on the reasoning
             // that an inline expand would fight the open-thread tap on the body. It doesn't — the body
@@ -10577,7 +10591,7 @@ class _PostCardState extends State<PostCard> {
             // was strand you: inside a thread, a long REPLY is not the focused post, so it stayed
             // truncated and its "Show more" pushed ANOTHER thread view of the same conversation, showing
             // the same truncated reply. There was no way to read a long reply at all.
-            if (longText && !_expanded)
+            if (longText && !_expanded && p.kind != 'article')
               GestureDetector(
                 onTap: () => setState(() => _expanded = true),
                 child: const Padding(
@@ -10590,7 +10604,7 @@ class _PostCardState extends State<PostCard> {
             // post already carries its own media — two rectangles competing under one sentence, and
             // the author's photo is the one they chose. Skipped while collapsed too: the card would
             // preview a link the reader cannot yet see in the truncated text.
-            if (p.media == null && !(longText && !_expanded))
+            if (p.media == null && !(longText && !_expanded) && p.kind != 'article')
               Builder(builder: (_) {
                 final link = firstLink(p.text);
                 return link == null ? const SizedBox.shrink() : LinkPreview(url: link);
@@ -10661,8 +10675,14 @@ class _PostCardState extends State<PostCard> {
     showModalBottomSheet(
       context: context,
       backgroundColor: kBg,
+      // Content-sized + scrollable: the menu has grown (Comments, Bookmark, Share, Copy, Mute, Block,
+      // Edit/Delete, Report). A plain modal sheet caps at ~half the screen, which clipped the LAST item
+      // (Report) off the bottom on shorter screens. isScrollControlled lets it size to content, and the
+      // scroll view lets it scroll rather than clip when the list is longer than the screen.
+      isScrollControlled: true,
       builder: (_) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
+        child: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
           // Comments live on as a lightweight "quiet reply" tier alongside the X-style reply-posts —
           // reachable here from the overflow so the primary bubble stays the reply action.
           ListTile(
@@ -10767,6 +10787,7 @@ class _PostCardState extends State<PostCard> {
               },
             ),
         ]),
+        ),
       ),
     );
   }
@@ -10871,6 +10892,577 @@ class _KindBadge extends StatelessWidget {
               letterSpacing: .5)),
     );
   }
+}
+
+/// Renders a SANITISED subset of HTML as native Flutter widgets — the rich body of a channel article.
+///
+/// Channel articles are untrusted (anyone can publish one), so this is an ALLOWLIST, not a blocklist:
+/// only known-safe tags are rendered; `<script>`, `<iframe>`, `<form>`, event handlers and the like are
+/// dropped whole. Nothing executes — these are widgets, not a webview, so there is no JS engine to run.
+/// Links open in the SYSTEM browser and only when http(s) (via [openLink], same rule as post links).
+/// Images must be CONTENT-ADDRESSED (a relay CID): viewing an article then can't leak your IP to a
+/// stranger's server the way a remote `<img>` fetch would — remote images degrade to a tap-to-open card,
+/// matching how the app already refuses to unfurl a link's page on-device.
+///
+/// A body is rendered as HTML only when [looksLikeHtml] matches; plain markdown articles keep using
+/// MarkdownBody, so nothing already published changes.
+class HtmlBody extends StatefulWidget {
+  final String html;
+  const HtmlBody(this.html, {super.key});
+
+  static final RegExp _looksHtmlRe = RegExp(
+      r'<(h[1-6]|p|div|span|a|img|ul|ol|li|table|strong|em|b|i|u|br|hr|blockquote|pre|code|figure)\b',
+      caseSensitive: false);
+
+  /// True when a body should go through the HTML renderer rather than the markdown one.
+  static bool looksLikeHtml(String s) => _looksHtmlRe.hasMatch(s);
+
+  @override
+  State<HtmlBody> createState() => _HtmlBodyState();
+}
+
+class _HtmlBodyState extends State<HtmlBody> {
+  // Tags dropped ENTIRELY (node + subtree): active content, embeds, and metadata that has no place in
+  // a read-only article. Absence is the sanitiser — anything not handled below simply doesn't render.
+  static const _drop = {
+    'script', 'style', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'textarea',
+    'select', 'option', 'link', 'meta', 'svg', 'video', 'audio', 'canvas', 'noscript', 'head', 'title',
+  };
+  // Block-level tags: each starts a new stacked widget. Everything else is treated as inline.
+  static const _block = {
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol', 'blockquote', 'pre', 'hr', 'figure',
+    'figcaption', 'div', 'section', 'article', 'table', 'thead', 'tbody', 'tr', 'header', 'footer', 'main',
+    'center', 'aside',
+  };
+
+  // A tiny, SAFE colour vocabulary for inline `style="color:…"` — hex (#rgb/#rrggbb) plus these names.
+  // No rgb()/hsl()/url()/var() parsing: an allowlist can't smuggle a fetch or an expression.
+  static const Map<String, Color> _namedColors = {
+    'black': Color(0xFF000000), 'white': Color(0xFFFFFFFF), 'red': Color(0xFFE0245E),
+    'green': Color(0xFF17BF63), 'blue': kAccent, 'orange': Color(0xFFF5A623),
+    'yellow': Color(0xFFF5D90A), 'purple': Color(0xFF9C6ADE), 'pink': Color(0xFFEF6C9B),
+    'teal': Color(0xFF1DA1AA), 'gray': kDim, 'grey': kDim,
+  };
+
+  static const TextStyle _bodyStyle = TextStyle(color: kText, fontSize: 17, height: 1.6);
+
+  // Link tap recognizers live for the life of this State and are disposed together — rebuilt on each
+  // build so a hot-reload or setState can't leave a dangling recognizer pointing at freed spans.
+  final List<TapGestureRecognizer> _recognizers = [];
+
+  void _disposeRecognizers() {
+    for (final r in _recognizers) {
+      r.dispose();
+    }
+    _recognizers.clear();
+  }
+
+  @override
+  void dispose() {
+    _disposeRecognizers();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _disposeRecognizers();
+    dom.Document doc;
+    try {
+      doc = htmlparser.parse(widget.html);
+    } catch (_) {
+      return Text(widget.html, style: _bodyStyle);
+    }
+    final root = doc.body ?? doc.documentElement;
+    final out = <Widget>[];
+    if (root != null) _blocks(root.nodes, out);
+    if (out.isEmpty) out.add(Text(widget.html, style: _bodyStyle));
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: out);
+  }
+
+  // Walk a node list into block widgets; inline runs between blocks are gathered into a paragraph.
+  // `align` is the INHERITED text alignment — a <div style="text-align:center"> hands it to its kids.
+  void _blocks(List<dom.Node> nodes, List<Widget> out, [TextAlign align = TextAlign.start]) {
+    final inline = <dom.Node>[];
+    void flush() {
+      if (inline.isEmpty) return;
+      final spans = <InlineSpan>[];
+      for (final n in inline) {
+        _inline(n, _bodyStyle, spans);
+      }
+      inline.clear();
+      if (spans.isEmpty) return;
+      out.add(_para(spans, align: align));
+    }
+
+    for (final n in nodes) {
+      if (n is dom.Element) {
+        final tag = n.localName ?? '';
+        if (_drop.contains(tag)) continue;
+        if (_block.contains(tag) || tag == 'img') {
+          flush();
+          _blockElement(n, out, align);
+          continue;
+        }
+      }
+      inline.add(n);
+    }
+    flush();
+  }
+
+  void _blockElement(dom.Element el, List<Widget> out, TextAlign inherited) {
+    final align = _alignOr(el, inherited);
+    // A callout box can ride on <aside> or any <div>/<p class="note|tip|warning|…"> — check before the
+    // tag switch so a styled wrapper wins over its default block rendering.
+    final callout = _calloutKind(el);
+    if (callout != null) {
+      out.add(_callout(el, callout, align));
+      return;
+    }
+    switch (el.localName) {
+      case 'h1':
+        out.add(_heading(el, 26, FontWeight.w800, align));
+        return;
+      case 'h2':
+        out.add(_heading(el, 22, FontWeight.w800, align));
+        return;
+      case 'h3':
+        out.add(_heading(el, 19, FontWeight.w700, align));
+        return;
+      case 'h4':
+      case 'h5':
+      case 'h6':
+        out.add(_heading(el, 17, FontWeight.w700, align));
+        return;
+      case 'hr':
+        out.add(Padding(
+            padding: const EdgeInsets.symmetric(vertical: 14),
+            child: Container(height: 1, color: kLine)));
+        return;
+      case 'img':
+        out.add(_imageWidget(el.attributes['src'] ?? '', el.attributes['alt'] ?? ''));
+        return;
+      case 'table':
+        out.add(_table(el));
+        return;
+      case 'figure':
+        final fig = <Widget>[];
+        for (final c in el.nodes) {
+          if (c is dom.Element && c.localName == 'figcaption') {
+            fig.add(_caption(c, align));
+          } else {
+            _blocks([c], fig, align);
+          }
+        }
+        out.add(Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: fig)));
+        return;
+      case 'figcaption':
+        out.add(_caption(el, align));
+        return;
+      case 'pre':
+        out.add(Container(
+          width: double.infinity,
+          margin: const EdgeInsets.only(bottom: 12),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(color: kCard, borderRadius: BorderRadius.circular(8)),
+          child: Text(el.text,
+              style: const TextStyle(color: kText, fontFamily: 'monospace', fontSize: 14, height: 1.4)),
+        ));
+        return;
+      case 'blockquote':
+        final inner = <Widget>[];
+        _blocks(el.nodes, inner, align);
+        out.add(Container(
+          margin: const EdgeInsets.only(bottom: 12),
+          padding: const EdgeInsets.only(left: 14),
+          decoration: const BoxDecoration(border: Border(left: BorderSide(color: kAccent, width: 3))),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: inner),
+        ));
+        return;
+      case 'ul':
+        out.add(_list(el, false));
+        return;
+      case 'ol':
+        out.add(_list(el, true));
+        return;
+      case 'center':
+        _blocks(el.nodes, out, TextAlign.center);
+        return;
+      case 'p':
+        final spans = <InlineSpan>[];
+        for (final c in el.nodes) {
+          _inline(c, _bodyStyle, spans);
+        }
+        if (spans.isNotEmpty) out.add(_para(spans, align: align));
+        return;
+      default:
+        // div / section / thead / tbody / tr … — no box of their own; render the children and pass this
+        // element's alignment down so a wrapping text-align reaches the paragraphs inside.
+        _blocks(el.nodes, out, align);
+    }
+  }
+
+  // A run of inline spans as a FULL-WIDTH paragraph, so text-align has room to actually take effect.
+  Widget _para(List<InlineSpan> spans,
+      {TextAlign align = TextAlign.start, EdgeInsetsGeometry padding = const EdgeInsets.only(bottom: 12)}) {
+    return Padding(
+      padding: padding,
+      child: SizedBox(
+        width: double.infinity,
+        child: RichText(textAlign: align, text: TextSpan(children: spans)),
+      ),
+    );
+  }
+
+  Widget _heading(dom.Element el, double size, FontWeight weight, TextAlign align) {
+    final st = TextStyle(color: kText, fontWeight: weight, fontSize: size, height: 1.3);
+    final spans = <InlineSpan>[];
+    for (final c in el.nodes) {
+      _inline(c, st, spans);
+    }
+    return _para(spans, align: align, padding: const EdgeInsets.only(top: 8, bottom: 8));
+  }
+
+  Widget _caption(dom.Element el, TextAlign inherited) {
+    final spans = <InlineSpan>[];
+    for (final c in el.nodes) {
+      _inline(c, const TextStyle(color: kDim, fontSize: 13, height: 1.4, fontStyle: FontStyle.italic), spans);
+    }
+    return _para(spans,
+        align: _alignOr(el, TextAlign.center), padding: const EdgeInsets.only(top: 2, bottom: 8));
+  }
+
+  // A real grid for <table>. Uneven rows are padded to the widest so Flutter's Table stays valid; a row
+  // that is all <th> gets a tinted header background. Cells render the same inline spans as body text.
+  Widget _table(dom.Element el) {
+    final rows = <List<dom.Element>>[];
+    var cols = 0;
+    for (final tr in el.getElementsByTagName('tr')) {
+      final cells = tr.children.where((c) => c.localName == 'td' || c.localName == 'th').toList();
+      if (cells.isEmpty) continue;
+      rows.add(cells);
+      if (cells.length > cols) cols = cells.length;
+    }
+    if (rows.isEmpty || cols == 0) return const SizedBox.shrink();
+
+    TableRow buildRow(List<dom.Element> cells) {
+      final allHeader = cells.every((c) => c.localName == 'th');
+      final children = <Widget>[];
+      for (var c = 0; c < cols; c++) {
+        if (c >= cells.length) {
+          children.add(const SizedBox.shrink());
+          continue;
+        }
+        final cell = cells[c];
+        final header = cell.localName == 'th';
+        final base = TextStyle(
+            color: kText, fontSize: 15, height: 1.4,
+            fontWeight: header ? FontWeight.w700 : FontWeight.w400);
+        final spans = <InlineSpan>[];
+        for (final n in cell.nodes) {
+          _inline(n, base, spans);
+        }
+        children.add(Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: RichText(textAlign: _alignOr(cell, TextAlign.start), text: TextSpan(children: spans)),
+        ));
+      }
+      return TableRow(
+          decoration: allHeader ? const BoxDecoration(color: kCard) : null, children: children);
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Table(
+        border: TableBorder.all(color: kLine),
+        defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+        children: [for (final r in rows) buildRow(r)],
+      ),
+    );
+  }
+
+  Widget _callout(dom.Element el, String kind, TextAlign align) {
+    const accents = {
+      'warning': Color(0xFFF5A623),
+      'danger': Color(0xFFEF6C9B),
+      'tip': Color(0xFF17BF63),
+      'info': kAccent,
+      'note': kAccent,
+    };
+    final accent = accents[kind] ?? kAccent;
+    final inner = <Widget>[];
+    _blocks(el.nodes, inner, align);
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 2),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(10),
+        border: Border(left: BorderSide(color: accent, width: 3)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: inner),
+    );
+  }
+
+  // --- small, SAFE style helpers: parse only an allowlisted subset; no rgb()/url()/var()/expression ---
+
+  static Map<String, String> _styleOf(dom.Element el) {
+    final raw = el.attributes['style'];
+    if (raw == null || raw.isEmpty) return const {};
+    final m = <String, String>{};
+    for (final decl in raw.split(';')) {
+      final i = decl.indexOf(':');
+      if (i <= 0) continue;
+      final k = decl.substring(0, i).trim().toLowerCase();
+      final v = decl.substring(i + 1).trim();
+      if (k.isNotEmpty && v.isNotEmpty) m[k] = v;
+    }
+    return m;
+  }
+
+  static Color? _color(String? v) {
+    if (v == null) return null;
+    var s = v.trim().toLowerCase();
+    if (s.startsWith('#')) {
+      s = s.substring(1);
+      if (s.length == 3) s = s.split('').map((c) => '$c$c').join();
+      if (s.length != 6) return null;
+      final n = int.tryParse(s, radix: 16);
+      return n == null ? null : Color(0xFF000000 | n);
+    }
+    return _namedColors[s];
+  }
+
+  static TextAlign _alignOr(dom.Element el, TextAlign fallback) {
+    final a = (el.attributes['align'] ?? _styleOf(el)['text-align'] ?? '').toLowerCase();
+    switch (a) {
+      case 'center':
+        return TextAlign.center;
+      case 'right':
+      case 'end':
+        return TextAlign.right;
+      case 'justify':
+        return TextAlign.justify;
+      case 'left':
+      case 'start':
+        return TextAlign.left;
+      default:
+        return fallback;
+    }
+  }
+
+  String? _calloutKind(dom.Element el) {
+    final classes = (el.attributes['class'] ?? '')
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((c) => c.isNotEmpty)
+        .toSet();
+    for (final k in ['danger', 'warning', 'tip', 'info', 'note']) {
+      if (classes.contains(k)) return k;
+    }
+    if (el.localName == 'aside' || classes.contains('callout') || classes.contains('aside')) return 'note';
+    return null;
+  }
+
+  // Apply the SAFE inline-style subset (colour, weight, italic, underline/strike) on top of a base style.
+  TextStyle _applyInlineStyle(dom.Element el, TextStyle base) {
+    if (!el.attributes.containsKey('style') && !el.attributes.containsKey('color')) return base;
+    final st = _styleOf(el);
+    var s = base;
+    final col = _color(st['color'] ?? el.attributes['color']);
+    if (col != null) s = s.copyWith(color: col);
+    final w = st['font-weight'];
+    if (w == 'bold' || w == '700' || w == '800' || w == '900') s = s.copyWith(fontWeight: FontWeight.w700);
+    if (st['font-style'] == 'italic') s = s.copyWith(fontStyle: FontStyle.italic);
+    final dec = st['text-decoration'] ?? '';
+    if (dec.contains('underline')) s = s.copyWith(decoration: TextDecoration.underline);
+    if (dec.contains('line-through')) s = s.copyWith(decoration: TextDecoration.lineThrough);
+    return s;
+  }
+
+  Widget _list(dom.Element el, bool ordered) {
+    final items = el.children.where((c) => c.localName == 'li').toList();
+    final rows = <Widget>[];
+    for (var i = 0; i < items.length; i++) {
+      final spans = <InlineSpan>[];
+      for (final c in items[i].nodes) {
+        _inline(c, const TextStyle(color: kText, fontSize: 17, height: 1.5), spans);
+      }
+      rows.add(Padding(
+        padding: const EdgeInsets.only(bottom: 6),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          SizedBox(
+              width: 26,
+              child: Text(ordered ? '${i + 1}.' : '•',
+                  style: const TextStyle(color: kDim, fontSize: 17, height: 1.5))),
+          Expanded(child: RichText(text: TextSpan(children: spans))),
+        ]),
+      ));
+    }
+    return Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: rows));
+  }
+
+  Widget _imageWidget(String src, String alt) {
+    final s = src.trim();
+    if (s.startsWith('http://') || s.startsWith('https://')) {
+      return _RemoteImageCard(url: s, alt: alt);      // never fetched on-device — see class doc
+    }
+    final cid = s.startsWith('cid:') ? s.substring(4) : s;
+    if (cid.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: MediaImage(cid: cid, fit: BoxFit.cover, label: alt.isEmpty ? 'Article image' : alt),
+      ),
+    );
+  }
+
+  // Build inline spans for a node, carrying the ambient text style down through nested tags.
+  void _inline(dom.Node node, TextStyle style, List<InlineSpan> out) {
+    if (node is dom.Text) {
+      final t = node.text.replaceAll(RegExp(r'\s+'), ' ');
+      if (t.isNotEmpty) out.add(TextSpan(text: t, style: style));
+      return;
+    }
+    if (node is! dom.Element) return;
+    final tag = node.localName ?? '';
+    if (_drop.contains(tag)) return;
+    // Fold any safe inline style (colour/weight/italic/underline) into the ambient style before the
+    // tag-specific handling, so e.g. `<span style="color:#e0245e">` or `<b style="color:red">` works.
+    style = _applyInlineStyle(node, style);
+    switch (tag) {
+      case 'br':
+        out.add(const TextSpan(text: '\n'));
+        return;
+      case 'img':
+        out.add(WidgetSpan(
+            alignment: PlaceholderAlignment.middle,
+            child: _imageWidget(node.attributes['src'] ?? '', node.attributes['alt'] ?? '')));
+        return;
+      case 'b':
+      case 'strong':
+        _inlineChildren(node, style.copyWith(fontWeight: FontWeight.w700), out);
+        return;
+      case 'i':
+      case 'em':
+        _inlineChildren(node, style.copyWith(fontStyle: FontStyle.italic), out);
+        return;
+      case 'u':
+        _inlineChildren(node, style.copyWith(decoration: TextDecoration.underline), out);
+        return;
+      case 's':
+      case 'strike':
+      case 'del':
+        _inlineChildren(node, style.copyWith(decoration: TextDecoration.lineThrough), out);
+        return;
+      case 'code':
+        _inlineChildren(node, style.copyWith(fontFamily: 'monospace', color: kAccent), out);
+        return;
+      case 'a':
+        final href = (node.attributes['href'] ?? '').trim();
+        final ok = href.startsWith('http://') || href.startsWith('https://');
+        final linkStyle = style.copyWith(
+            color: kAccent, decoration: ok ? TextDecoration.underline : null);
+        if (ok) {
+          final rec = TapGestureRecognizer()..onTap = () => openLink(href);
+          _recognizers.add(rec);
+          final tmp = <InlineSpan>[];
+          _inlineChildren(node, linkStyle, tmp);
+          for (final sp in tmp) {
+            out.add(sp is TextSpan
+                ? TextSpan(text: sp.text, children: sp.children, style: sp.style, recognizer: rec)
+                : sp);
+          }
+        } else {
+          _inlineChildren(node, linkStyle, out);   // javascript:/relative/other schemes → plain text
+        }
+        return;
+      default:
+        // span / font / small / mark / sub / sup / abbr … — keep the text, drop the wrapper.
+        _inlineChildren(node, style, out);
+    }
+  }
+
+  void _inlineChildren(dom.Element el, TextStyle style, List<InlineSpan> out) {
+    for (final c in el.nodes) {
+      _inline(c, style, out);
+    }
+  }
+}
+
+/// A remote `<img>` in an article, shown as a tap-to-open card instead of being fetched here. Fetching
+/// it on this device would hand the reader's IP and read-time to whatever server the (untrusted) author
+/// pointed at — the same reason the app unfurls links on the node, never on the phone.
+class _RemoteImageCard extends StatelessWidget {
+  final String url;
+  final String alt;
+  const _RemoteImageCard({required this.url, required this.alt});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: InkWell(
+        onTap: () => openLink(url),
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+              color: kCard, borderRadius: BorderRadius.circular(10), border: Border.all(color: kLine)),
+          child: Row(children: [
+            const Icon(Icons.image_outlined, color: kDim, size: 20),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(alt.isEmpty ? 'Image' : alt,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: kText, fontSize: 14, fontWeight: FontWeight.w600)),
+                const Text('Remote image · tap to open in browser',
+                    style: TextStyle(color: kDim, fontSize: 12)),
+              ]),
+            ),
+            const Icon(Icons.open_in_new, color: kDim, size: 16),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+/// A clean, one-glance excerpt of an article body for the FEED CARD. The full formatted body lives in
+/// the reader; the card should never show raw `<tags>` (HTML) or `#`/`*` punctuation (markdown). For
+/// HTML we reuse the same parser as the renderer to pull just the text; for markdown we strip the
+/// common block/inline marks. Whitespace is collapsed so a multi-line source becomes one tidy line.
+String articleExcerpt(String body) {
+  var s = body;
+  if (HtmlBody.looksLikeHtml(s)) {
+    // Drop active/embedded blocks WHOLE (their content must not leak into the preview), then flatten
+    // every remaining tag to a space so block boundaries don't fuse two words ("BriefingThis").
+    s = s.replaceAll(
+        RegExp(r'<(script|style|iframe|object|embed|noscript)\b[^>]*>.*?</\1>',
+            caseSensitive: false, dotAll: true),
+        ' ');
+    s = s.replaceAll(RegExp(r'<[^>]+>'), ' ');
+    s = s
+        .replaceAll('&nbsp;', ' ')
+        .replaceAll('&amp;', '&')
+        .replaceAll('&lt;', '<')
+        .replaceAll('&gt;', '>')
+        .replaceAll('&quot;', '"')
+        .replaceAll('&#39;', "'");
+  } else {
+    s = s
+        .replaceAll(RegExp(r'^\s{0,3}#{1,6}\s*', multiLine: true), '') // headings
+        .replaceAll(RegExp(r'^\s{0,3}>\s?', multiLine: true), '')      // blockquotes
+        .replaceAll(RegExp(r'[*_`~]'), '');                            // inline emphasis marks
+  }
+  return s.replaceAll(RegExp(r'\s+'), ' ').trim();
 }
 
 // A content-addressed image fetched via the engine (IPFS or relay cache). Content-addressed means
@@ -11996,6 +12588,7 @@ class _ComposeSheetState extends State<ComposeSheet> {
   final _titleCtl = TextEditingController();
   final List<TextEditingController> _pollOpts = [TextEditingController(), TextEditingController()];
   bool _article = false, _poll = false;
+  bool _preview = false;    // article composer: show the rendered body (Markdown/HTML) below the editor
   Uint8List? _mediaBytes;   // attached photo/GIF/video
   String _mediaKind = '';   // 'photo' | 'movie'
   final _picker = ImagePicker();
@@ -12308,7 +12901,52 @@ class _ComposeSheetState extends State<ComposeSheet> {
                         border: InputBorder.none, counterText: ''),
                   ),
                 ),
+                if (_article)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 4),
+                    child: Row(children: [
+                      const Icon(Icons.code, size: 14, color: kDim),
+                      const SizedBox(width: 5),
+                      const Expanded(
+                        child: Text('Body supports Markdown and HTML',
+                            style: TextStyle(color: kDim, fontSize: 12)),
+                      ),
+                      GestureDetector(
+                        onTap: () => setState(() => _preview = !_preview),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(_preview ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                              size: 15, color: kAccent),
+                          const SizedBox(width: 4),
+                          Text(_preview ? 'Hide preview' : 'Preview',
+                              style: const TextStyle(color: kAccent, fontSize: 12.5, fontWeight: FontWeight.w600)),
+                        ]),
+                      ),
+                    ]),
+                  ),
                 for (int i = 0; i < segCount; i++) _segRow(i),
+                if (_article && _preview && _cs.isNotEmpty)
+                  Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.only(top: 4, bottom: 4),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                        color: kCard, borderRadius: BorderRadius.circular(10), border: Border.all(color: kLine)),
+                    // The controller is itself a Listenable, so the preview re-renders on every keystroke
+                    // without a full-sheet setState.
+                    child: AnimatedBuilder(
+                      animation: _cs.first,
+                      builder: (_, __) {
+                        final body = _cs.first.text;
+                        if (body.trim().isEmpty) {
+                          return const Text('Nothing to preview yet.',
+                              style: TextStyle(color: kDim, fontSize: 13));
+                        }
+                        return HtmlBody.looksLikeHtml(body)
+                            ? HtmlBody(body)
+                            : MarkdownBody(data: body);
+                      },
+                    ),
+                  ),
                 if (_hasMedia) Padding(
                   padding: const EdgeInsets.only(left: 52, top: 8),
                   child: Stack(children: [

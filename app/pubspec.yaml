@@ -22,7 +22,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # 2.2.1 → 2.2.2 …; anchored at 2.2.x because the phone already installed 2.2.0 and the version doubles as
 # the update-check comparison — can't go below it. NB the emitted versionCode may differ from N; only
 # that it INCREASES matters — verify with `aapt2 dump badging` if unsure.)
-version: 2.5.7+22507
+version: 2.5.8+22508
 
 environment:
   sdk: ^3.12.2
@@ -44,6 +44,7 @@ dependencies:
   image_picker: ^1.1.2
   video_compress: ^3.1.4   # on-device video compression so more clips fit under the relay pin cap
   flutter_markdown: ^0.7.4 # render article bodies (long-form) as formatted markdown
+  html: ^0.15.4            # DOM parser for the sanitised HTML article renderer (HtmlBody)
   open_filex: ^4.5.0
   path_provider: ^2.1.4
   crypto: ^3.0.5

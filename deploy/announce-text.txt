@@ -1,1 +1,1 @@
-ӾChat 2.5.7 is live — edit & delete posts and DMs, disappearing photos, @-mentions, pinned posts, follower lists, undo a tip, trending & hidden words. Tap to update.
+ӾChat 2.5.8 is live — channel articles now render rich HTML (tables, callouts, alignment, colour), plus a fix so Report is back on every post. Tap to update.
