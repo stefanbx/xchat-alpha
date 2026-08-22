@@ -10,6 +10,7 @@ import 'package:flutter/foundation.dart' show kIsWeb, setEquals;
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart' show TapGestureRecognizer;
 import 'package:flutter/services.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:video_compress/video_compress.dart';
@@ -2637,21 +2638,37 @@ class Api {
   }
 
   // on-device signed: the app signs the profile record locally; the node only verifies + relays.
-  static Future<Map<String, dynamic>?> profileSet(String display, String bio, String avatar, String banner, {NanoWallet? signer, String type = ''}) async {
+  static Future<Map<String, dynamic>?> profileSet(String display, String bio, String avatar, String banner, {NanoWallet? signer, String type = '', String? pinned}) async {
     final w = signer ?? gWallet;   // `signer` lets a channel set ITS OWN profile (name/desc/avatar)
     if (w == null) return null;
     final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final s = w.signMsg(w.profileMsg(ts, display, bio, avatar, banner));
+    // Pinned post: carried and signed SEPARATELY (additive), so it never changes the profile canon and
+    // an old client ignores it. `pinned == ''` clears the pin; `pinned == null` leaves it untouched.
+    final ps = pinned != null ? w.signMsg(w.pinMsg(ts, pinned)) : null;
     try {
       final r = await http.post(Uri.parse('$kBase/api/profile_set'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({'account': w.account, 'display': display, 'bio': bio, 'avatar': avatar,
                             'banner': banner, 'ts': ts, 'sig': s['sig'], 'pub': s['pub'],
-                            if (type.isNotEmpty) 'type': type}));
+                            if (type.isNotEmpty) 'type': type,
+                            if (pinned != null) 'pinned': pinned,
+                            if (ps != null) 'pinned_sig': ps['sig']}));
       return jsonDecode(r.body);
     } catch (_) {
       return null;
     }
+  }
+
+  // Pin (or, with postId '', unpin) a post to your profile. Re-publishes your profile with the current
+  // display/bio/avatar/banner plus the separately-signed pinned marker.
+  static Future<bool> setPinned(String postId) async {
+    final w = gWallet;
+    if (w == null) return false;
+    final p = await profileGet(w.account) ?? {};
+    final r = await profileSet('${p['display'] ?? ''}', '${p['bio'] ?? ''}',
+        '${p['avatar'] ?? ''}', '${p['banner'] ?? ''}', pinned: postId);
+    return r?['ok'] == true;
   }
 
   // upload an image; returns its content-addressed cid (pinned to the relays)
@@ -2736,6 +2753,17 @@ class Api {
       if (f is List) return f.map((e) => '$e').where((e) => e.isNotEmpty).toList();
       if (f is String && f.isNotEmpty) return f.split(',').where((e) => e.isNotEmpty).toList();
       return [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // Who follows `account` (the reverse edge), unioned across relays by the node's /api/followers.
+  static Future<List<String>> followersGet(String account) async {
+    try {
+      final r = await http.get(Uri.parse('$kBase/api/followers?account=$account'));
+      return ((jsonDecode(r.body)['followers'] as List?) ?? const [])
+          .map((e) => '$e').where((e) => e.isNotEmpty).toList();
     } catch (_) {
       return [];
     }
@@ -4146,7 +4174,8 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         onMute: post.account == _account ? null : () => _toggleMute(post.account, post.handle),
         onBlock: post.account == _account ? null : () => _toggleBlock(post.account, post.handle),
         onDelete: post.account == _account ? () => _deletePost(post) : null,   // your own posts only
-        onEdit: (post.account == _account && post.kind == 'post') ? () => _editPost(post) : null);
+        onEdit: (post.account == _account && post.kind == 'post') ? () => _editPost(post) : null,
+        onPinProfile: post.account == _account ? () => _pinToProfile(post) : null);
   }
 
   // ---- threads: posts chained by reply_to ----
@@ -5124,6 +5153,16 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         ],
       ),
     );
+  }
+
+  // Pin one of your own posts to the top of your profile (X-style). Re-publishes your profile with a
+  // separately-signed pinned marker.
+  Future<void> _pinToProfile(Post p) async {
+    final ok = await Api.setPinned(p.id);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: kCard,
+        content: Text(ok ? 'pinned to your profile' : 'could not pin — try again')));
   }
 
   Future<void> _refreshLabels() async {                  // pull the updated community-report labels
@@ -6917,7 +6956,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       isScrollControlled: true,
       backgroundColor: kBg,
       builder: (_) => ComposeSheet(handle: _handle, account: _account, quotedPost: quotedPost,
-          replyToPost: replyToPost, channels: _myChannels),
+          replyToPost: replyToPost, channels: _myChannels, people: _knownHandles()),
     );
     if (res == null || res.segments.isEmpty) return;
     // Build the compose intent. The head signs a node-assigned CID+seq that only exist after the node
@@ -9428,7 +9467,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final banner = (src['banner'] ?? '') as String;
     final following = (src['following'] ?? 0) as int;
     final followers = (src['followers'] ?? 0) as int;
+    final pinnedId = '${src['pinned'] ?? ''}';
     final mine = widget.allPosts.where((p) => p.account == widget.account).toList();
+    // The pinned post floats to the top of the Posts tab (X-style). Only a post that is actually theirs
+    // can pin — a forged id that matches nothing just doesn't show.
+    if (pinnedId.isNotEmpty) {
+      final idx = mine.indexWhere((p) => p.id == pinnedId);
+      if (idx > 0) mine.insert(0, mine.removeAt(idx));
+    }
     final media = mine.where((p) => p.media != null || p.kind == 'movie').toList();
     final shown = _tab == 0 ? mine : media;
 
@@ -9509,9 +9555,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         ),
                         const SizedBox(height: 12),
                         Row(children: [
-                          _count(following, 'Following'),
+                          _count(following, 'Following', () => _openFollowList('following')),
                           const SizedBox(width: 20),
-                          _count(followers, 'Followers'),
+                          _count(followers, 'Followers', () => _openFollowList('followers')),
                           const SizedBox(width: 20),
                           _count(mine.length, 'Posts'),
                         ]),
@@ -9529,18 +9575,48 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   padding: EdgeInsets.symmetric(vertical: 40),
                   child: Center(child: Text('Nothing here yet', style: TextStyle(color: kDim))))),
               SliverList(delegate: SliverChildBuilderDelegate(
-                (_, i) => Column(children: [Container(color: kLine, height: 1), widget.cardBuilder(shown[i])]),
+                (_, i) {
+                  final p = shown[i];
+                  final isPinned = _tab == 0 && pinnedId.isNotEmpty && p.id == pinnedId;
+                  return Column(children: [
+                    Container(color: kLine, height: 1),
+                    if (isPinned)
+                      const Padding(
+                        padding: EdgeInsets.only(left: 16, top: 8),
+                        child: Align(
+                          alignment: Alignment.centerLeft,
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            Icon(Icons.push_pin, size: 13, color: kDim),
+                            SizedBox(width: 5),
+                            Text('Pinned',
+                                style: TextStyle(color: kDim, fontSize: 12, fontWeight: FontWeight.w600)),
+                          ]),
+                        ),
+                      ),
+                    widget.cardBuilder(p),
+                  ]);
+                },
                 childCount: shown.length,
               )),
             ]),
     );
   }
 
-  Widget _count(int n, String label) => Row(children: [
-        Text('$n', style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 15)),
-        const SizedBox(width: 5),
-        Text(label, style: const TextStyle(color: kDim, fontSize: 14)),
-      ]);
+  Widget _count(int n, String label, [VoidCallback? onTap]) => InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 2),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Text('$n', style: const TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 15)),
+            const SizedBox(width: 5),
+            Text(label, style: const TextStyle(color: kDim, fontSize: 14)),
+          ]),
+        ),
+      );
+
+  void _openFollowList(String mode) => Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => FollowListScreen(account: widget.account, mode: mode)));
 
   Widget _tabBtn(String label, int i) {
     final on = _tab == i;
@@ -9832,7 +9908,7 @@ class PostCard extends StatefulWidget {
   final bool liked, reposted;
   final int commentCount;
   final VoidCallback onTip, onLike, onRepost, onReport, onComment;
-  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete, onEdit, onReply;
+  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete, onEdit, onReply, onPinProfile;
   /// Tapping an @handle or a #tag inside the body. The card cannot resolve either itself — a handle
   /// maps to an account only in the feed's view of the network — so it reports and lets the caller act.
   final void Function(String handle)? onTapHandle;
@@ -9869,6 +9945,7 @@ class PostCard extends StatefulWidget {
       this.onPin,
       this.onDelete,
       this.onEdit,
+      this.onPinProfile,
       this.muted = false,
       this.blocked = false,
       this.bookmarked = false,
@@ -10419,6 +10496,27 @@ class _PostCardState extends State<PostCard> {
                   style: TextStyle(color: kDim, fontSize: 11)),
               onTap: () { Navigator.pop(context); widget.onBookmark!(); },
             ),
+          ListTile(
+            leading: const Icon(Icons.ios_share, color: kText),
+            title: const Text('Share', style: TextStyle(color: kText, fontWeight: FontWeight.w600)),
+            subtitle: const Text('send this post out via the system share sheet',
+                style: TextStyle(color: kDim, fontSize: 11)),
+            onTap: () {
+              Navigator.pop(context);
+              final p = widget.post;
+              Share.share('@${p.handle}: ${p.text}\n\nvia ӾChat');
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.copy_outlined, color: kText),
+            title: const Text('Copy text', style: TextStyle(color: kText, fontWeight: FontWeight.w600)),
+            onTap: () {
+              Clipboard.setData(ClipboardData(text: widget.post.text));
+              Navigator.pop(context);
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                  backgroundColor: kCard, content: Text('copied')));
+            },
+          ),
           if (widget.onMute != null)
             ListTile(
               leading: Icon(widget.muted ? Icons.volume_up_outlined : Icons.volume_off_outlined, color: kText),
@@ -10446,6 +10544,14 @@ class _PostCardState extends State<PostCard> {
               subtitle: const Text('pay a little XNO so the relays keep this alive — pay-to-pin',
                   style: TextStyle(color: kDim, fontSize: 11)),
               onTap: () { Navigator.pop(context); widget.onPin!(); },
+            ),
+          if (widget.onPinProfile != null)
+            ListTile(
+              leading: const Icon(Icons.push_pin_outlined, color: kAccent),
+              title: const Text('Pin to profile', style: TextStyle(color: kText, fontWeight: FontWeight.w600)),
+              subtitle: const Text('float this post to the top of your profile',
+                  style: TextStyle(color: kDim, fontSize: 11)),
+              onTap: () { Navigator.pop(context); widget.onPinProfile!(); },
             ),
           if (widget.onEdit != null)
             ListTile(
@@ -10833,6 +10939,78 @@ class _WalletHistoryScreenState extends State<WalletHistoryScreen> {
                       );
                     },
                   ),
+                ),
+    );
+  }
+}
+
+// A tappable Following / Followers list for a profile. Following comes from the account's own signed
+// follow record; Followers is the reverse edge scanned across relays. Each row resolves its name via
+// ProfileCache and opens that profile on tap.
+class FollowListScreen extends StatefulWidget {
+  const FollowListScreen({super.key, required this.account, required this.mode});
+  final String account;
+  final String mode; // 'following' | 'followers'
+  @override
+  State<FollowListScreen> createState() => _FollowListScreenState();
+}
+
+class _FollowListScreenState extends State<FollowListScreen> {
+  List<String>? _accts;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final a = widget.mode == 'followers'
+        ? await Api.followersGet(widget.account)
+        : await Api.followsGet(widget.account);
+    if (mounted) setState(() => _accts = a);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final accts = _accts;
+    final followers = widget.mode == 'followers';
+    return Scaffold(
+      backgroundColor: kBg,
+      appBar: AppBar(
+        backgroundColor: kBg, elevation: 0, iconTheme: const IconThemeData(color: kText),
+        title: Text(followers ? 'Followers' : 'Following',
+            style: const TextStyle(color: kText, fontWeight: FontWeight.w800)),
+      ),
+      body: accts == null
+          ? const Center(child: CircularProgressIndicator(color: kAccent))
+          : accts.isEmpty
+              ? Center(
+                  child: Text(followers ? 'No followers yet' : 'Not following anyone yet',
+                      style: const TextStyle(color: kDim, fontSize: 14)))
+              : ListView.separated(
+                  itemCount: accts.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1, color: kLine),
+                  itemBuilder: (_, i) {
+                    final acc = accts[i];
+                    return AnimatedBuilder(
+                      animation: ProfileCache.I,
+                      builder: (_, __) {
+                        ProfileCache.I.ensure(acc);
+                        final name = ProfileCache.I.displayName(acc, '').trim();
+                        final label = name.isNotEmpty
+                            ? name
+                            : (acc.length > 16 ? '${acc.substring(0, 13)}…' : acc);
+                        return ListTile(
+                          leading: AuthorAvatar(account: acc, handle: name, radius: 20),
+                          title: Text('@$label',
+                              style: const TextStyle(color: kText, fontWeight: FontWeight.w600)),
+                          subtitle: Text('·${acctTag(acc)}',
+                              style: const TextStyle(color: kDim, fontSize: 11, fontFamily: 'monospace')),
+                        );
+                      },
+                    );
+                  },
                 ),
     );
   }
@@ -11620,7 +11798,8 @@ class ComposeSheet extends StatefulWidget {
   final Post? quotedPost; // when set, this is a quote-post embedding that post
   final Post? replyToPost; // when set, this post is an X-style reply threaded under that post
   final List<String> channels; // the author's channels — an article can be published under one
-  const ComposeSheet({super.key, required this.handle, required this.account, this.quotedPost, this.replyToPost, this.channels = const []});
+  final Map<String, String> people; // account -> handle, for @-mention autocomplete (feed-seen accounts)
+  const ComposeSheet({super.key, required this.handle, required this.account, this.quotedPost, this.replyToPost, this.channels = const [], this.people = const {}});
   @override
   State<ComposeSheet> createState() => _ComposeSheetState();
 }
@@ -11641,6 +11820,109 @@ class _ComposeSheetState extends State<ComposeSheet> {
   bool get _hasMedia => _mediaBytes != null;
 
   bool _compressing = false;
+
+  // @-mention autocomplete (X-style): while you type "@part" in a body field, suggest matching handles;
+  // picking one inserts "@handle ". The mention renders as a tappable @handle in the feed (onTapHandle).
+  TextEditingController? _mentionCtl;      // the body field the mention is being typed in
+  int _mentionStart = -1;                  // index of the '@' that opened the token
+  String _mentionQuery = '';
+
+  // Find the "@token" the cursor sits in (if any) and drive the suggestion list from it. A mention
+  // starts at '@' that is at the field start or preceded by whitespace, and runs to the cursor with no
+  // whitespace in between.
+  void _onBodyChanged(TextEditingController c) {
+    final sel = c.selection;
+    final pos = sel.baseOffset;
+    if (!sel.isValid || sel.baseOffset != sel.extentOffset || pos < 0 || pos > c.text.length) {
+      _clearMention(); return;
+    }
+    final text = c.text;
+    int i = pos - 1;
+    while (i >= 0) {
+      final ch = text[i];
+      if (ch == '@') break;
+      if (ch == ' ' || ch == '\n' || ch == '\t') { i = -1; break; }
+      i--;
+    }
+    if (i < 0 || (i > 0 && text[i - 1] != ' ' && text[i - 1] != '\n' && text[i - 1] != '\t')) {
+      _clearMention(); return;
+    }
+    final query = text.substring(i + 1, pos);
+    if (query.length > 30) { _clearMention(); return; }
+    setState(() { _mentionCtl = c; _mentionStart = i; _mentionQuery = query; });
+  }
+
+  void _clearMention() {
+    if (_mentionCtl != null || _mentionStart != -1) {
+      setState(() { _mentionCtl = null; _mentionStart = -1; _mentionQuery = ''; });
+    }
+  }
+
+  // account -> the name to mention. Match on the PROFILE DISPLAY NAME (keyholder, Jiован…), because in
+  // xchat the feed handle is very often the default 'you.xno' and the display name is what distinguishes
+  // people. Inserting the display name is also what resolves: tapping @name opens their profile if it
+  // matches, else a Discover search for that name.
+  List<MapEntry<String, String>> _mentionMatches() {
+    if (_mentionCtl == null) return const [];
+    final q = _mentionQuery.toLowerCase();
+    final seen = <String>{};
+    final out = <MapEntry<String, String>>[];
+    for (final e in widget.people.entries) {
+      final name = ProfileCache.I.displayName(e.key, e.value).trim();
+      final key = name.toLowerCase();
+      if (name.isEmpty || key == 'you.xno' || key == 'anon.xno' || seen.contains(key)) continue;
+      if (q.isEmpty || key.contains(q)) { seen.add(key); out.add(MapEntry(e.key, name)); }
+      if (out.length >= 6) break;
+    }
+    return out;
+  }
+
+  void _applyMention(String handle) {
+    final c = _mentionCtl;
+    if (c == null || _mentionStart < 0) return;
+    final end = c.selection.baseOffset.clamp(0, c.text.length);
+    final newText = '${c.text.substring(0, _mentionStart)}@$handle ${c.text.substring(end)}';
+    final newPos = _mentionStart + handle.length + 2;   // caret after "@handle "
+    c.value = TextEditingValue(
+        text: newText, selection: TextSelection.collapsed(offset: newPos.clamp(0, newText.length)));
+    _clearMention();
+  }
+
+  // One post-body field (a thread segment). Extracted to a method so `c` is a LOCAL captured correctly
+  // by onChanged — a closure over the collection-for's `i` would read the loop's final value and index
+  // `_cs` out of bounds, silently killing the change handler (and the @-mention detection with it).
+  Widget _segRow(int i) {
+    final c = _cs[i];
+    return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Column(children: [
+        AuthorAvatar(account: widget.account, handle: widget.handle, radius: 20),
+        if (i < _cs.length - 1)
+          Expanded(child: Container(width: 2, color: kLine, margin: const EdgeInsets.symmetric(vertical: 4))),
+      ]),
+      const SizedBox(width: 12),
+      Expanded(
+        child: TextField(
+          controller: c,
+          autofocus: i == 0 && !_article,
+          maxLines: null,
+          minLines: _article ? 6 : (i == 0 ? 3 : 1),
+          onChanged: (_) => _onBodyChanged(c),
+          onTap: () => _onBodyChanged(c),
+          style: const TextStyle(color: kText, fontSize: 17, height: 1.4),
+          decoration: InputDecoration(
+              hintText: _article
+                  ? 'Write your article…'
+                  : _poll
+                      ? 'Ask a question…'
+                      : i == 0
+                          ? (_isQuote ? 'Add a comment' : 'What’s happening on-chain?')
+                          : 'Add another post…',
+              hintStyle: const TextStyle(color: kDim),
+              border: InputBorder.none),
+        ),
+      ),
+    ]);
+  }
 
   Future<void> _attach(bool video) async {
     final x = video
@@ -11681,6 +11963,16 @@ class _ComposeSheetState extends State<ComposeSheet> {
       return;
     }
     setState(() { _mediaBytes = bytes; _mediaKind = video ? 'movie' : 'photo'; });
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    // Warm the profile cache for @-mention suggestions: matches are keyed on the DISPLAY name, which
+    // isn't in the feed handle map, so make sure each candidate's profile is fetched. ensure() dedups.
+    for (final acc in widget.people.keys) {
+      ProfileCache.I.ensure(acc);
+    }
   }
 
   @override
@@ -11830,33 +12122,7 @@ class _ComposeSheetState extends State<ComposeSheet> {
                         border: InputBorder.none, counterText: ''),
                   ),
                 ),
-                for (int i = 0; i < segCount; i++)
-                  Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Column(children: [
-                      AuthorAvatar(account: widget.account, handle: widget.handle, radius: 20),
-                      if (i < _cs.length - 1) Expanded(child: Container(width: 2, color: kLine, margin: const EdgeInsets.symmetric(vertical: 4))),
-                    ]),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: TextField(
-                        controller: _cs[i],
-                        autofocus: i == 0 && !_article,
-                        maxLines: null,
-                        minLines: _article ? 6 : (i == 0 ? 3 : 1),
-                        style: const TextStyle(color: kText, fontSize: 17, height: 1.4),
-                        decoration: InputDecoration(
-                            hintText: _article
-                                ? 'Write your article…'
-                                : _poll
-                                    ? 'Ask a question…'
-                                    : i == 0
-                                        ? (_isQuote ? 'Add a comment' : 'What’s happening on-chain?')
-                                        : 'Add another post…',
-                            hintStyle: const TextStyle(color: kDim),
-                            border: InputBorder.none),
-                      ),
-                    ),
-                  ]),
+                for (int i = 0; i < segCount; i++) _segRow(i),
                 if (_hasMedia) Padding(
                   padding: const EdgeInsets.only(left: 52, top: 8),
                   child: Stack(children: [
@@ -11925,6 +12191,38 @@ class _ComposeSheetState extends State<ComposeSheet> {
                 ),
               ]),
             ),
+          ),
+          // @-mention suggestions, pinned just above the keyboard while you type "@part". Wrapped in an
+          // AnimatedBuilder so it fills in as the candidates' profiles (display names) finish loading.
+          AnimatedBuilder(
+            animation: ProfileCache.I,
+            builder: (_, __) {
+              if (_mentionCtl == null) return const SizedBox.shrink();
+              final matches = _mentionMatches();
+              if (matches.isEmpty) return const SizedBox.shrink();
+              return Container(
+                constraints: const BoxConstraints(maxHeight: 196),
+                margin: const EdgeInsets.only(top: 4),
+                decoration: BoxDecoration(
+                    color: kCard, borderRadius: BorderRadius.circular(12), border: Border.all(color: kLine)),
+                child: ListView(
+                  shrinkWrap: true,
+                  padding: EdgeInsets.zero,
+                  children: [
+                    for (final e in matches)
+                      ListTile(
+                        dense: true,
+                        leading: AuthorAvatar(account: e.key, handle: e.value, radius: 15),
+                        title: Text('@${e.value}',
+                            style: const TextStyle(color: kText, fontSize: 14, fontWeight: FontWeight.w600)),
+                        subtitle: Text('·${acctTag(e.key)}',
+                            style: const TextStyle(color: kDim, fontSize: 11, fontFamily: 'monospace')),
+                        onTap: () => _applyMention(e.value),
+                      ),
+                  ],
+                ),
+              );
+            },
           ),
           const SizedBox(height: 6),
           Align(

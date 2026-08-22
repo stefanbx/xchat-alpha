@@ -48,6 +48,16 @@ if mode == 'pub':
         except Exception:
             pass
     json.dump({"ok": True, "count": len(follows), "relays": pushed}, open('/tmp/xc_follows_result.json', 'w'))
+elif mode == 'followers':                                    # who follows this account (reverse edge)
+    acc = rd('/tmp/xc_follows_acct.txt')
+    seen = set()
+    for r in RELAYS:
+        try:
+            fl = json.loads(urllib.request.urlopen(r + '/followers?account=' + acc, timeout=4).read()).get('followers', [])
+            seen.update(a for a in fl if a)
+        except Exception:
+            pass
+    json.dump({"ok": True, "followers": sorted(seen)}, open('/tmp/xc_follows_result.json', 'w'))
 else:                                                        # get: fetch the newest valid record
     acc = rd('/tmp/xc_follows_acct.txt')
     best = None

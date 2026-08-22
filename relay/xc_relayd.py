@@ -1642,6 +1642,14 @@ class H(BaseHTTPRequestHandler):
             # community moderation signal: post_id -> {account: signed report}. The relay stores and
             # serves; the NODE verifies signatures + counts distinct reporters (relay verifies nothing).
             self._send(200, json.dumps({'reports': reports}))
+        elif self.path.startswith('/followers'):
+            # Who follows `acc`: the reverse edge. Scan the stored follow-lists for those that include it.
+            # (Must precede the '/follows' branch — '/followers' also startswith '/follows'.) Signature
+            # verification stays on the client's /follows fetch; this only reports graph edges.
+            acc = qs(self.path).get('account', '')
+            out = [a for a, r in list(follows.items())
+                   if isinstance(r, dict) and acc in (r.get('follows') or [])]
+            self._send(200, json.dumps({'account': acc, 'followers': out}))
         elif self.path.startswith('/follows'):
             acc = qs(self.path).get('account', '')
             self._send(200, json.dumps({'account': acc, 'record': follows.get(acc)}))

@@ -869,6 +869,9 @@ def route(path, query, body):
     if path.startswith('/api/follows_get'):
         with ipc_lock('follows'):
             put('/tmp/xc_follows_acct.txt', q('account')); spawn('xc_follows.py', 'get');  return read('/tmp/xc_follows_result.json', '{}')
+    if path.startswith('/api/followers'):
+        with ipc_lock('follows'):
+            put('/tmp/xc_follows_acct.txt', q('account')); spawn('xc_follows.py', 'followers'); return read('/tmp/xc_follows_result.json', '{}')
 
     if path.startswith('/api/comment_post'):
         with ipc_lock('comment'):

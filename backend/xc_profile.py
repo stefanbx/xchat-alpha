@@ -42,6 +42,12 @@ if mode == 'pub':
     # signed canon, so it's advisory only — worst case a profile mislabels itself; fine for a listing.
     if src.get('type'):
         rec['type'] = src.get('type')
+    # Pinned post: additive, SEPARATELY-signed field. Forward it only when its own signature verifies,
+    # so the node never relays a pin it did not check (a stripped or forged one simply doesn't appear).
+    pinned = src.get('pinned')
+    if pinned is not None and verify(pub, xc.sig_canon('profilepin', acc, ts, pinned), src.get('pinned_sig', '')):
+        rec['pinned'] = pinned
+        rec['pinned_sig'] = src.get('pinned_sig', '')
     pushed = 0
     for r in RELAYS:
         try:
@@ -77,8 +83,9 @@ else:                                                        # get: newest valid
         except Exception:
             pass
         try:
-            followers = max(followers, json.loads(urllib.request.urlopen(
-                r + '/followers?account=' + acc, timeout=4).read()).get('followers', 0))
+            fl = json.loads(urllib.request.urlopen(
+                r + '/followers?account=' + acc, timeout=4).read()).get('followers', [])
+            followers = max(followers, len(fl) if isinstance(fl, list) else int(fl or 0))
         except Exception:
             pass
     out = best or {'account': acc, 'display': '', 'bio': '', 'avatar': '', 'banner': ''}
