@@ -1,1 +1,1 @@
-ӾChat 2.5.5 is live — direct messages send reliably again, and a new animated key avatar. Tap to update.
+ӾChat 2.5.6 is live — steadier messaging and feed, cleaner notifications, and dead relays no longer clutter the list. Tap to update.
