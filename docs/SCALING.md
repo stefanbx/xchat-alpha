@@ -1,7 +1,7 @@
 # ӾChat — relay persistence & scaling
 
 How relay state survives restarts today, how many users one relay can serve, and the path to
-high traffic. Written against the alpha node (`backend/`, `relay/xc_relayd.py`, `deploy/`).
+high traffic. Written against the beta node (`backend/`, `relay/xc_relayd.py`, `deploy/`).
 
 ## 1. Persistence across restarts — DONE
 
@@ -29,7 +29,7 @@ relay by adding machines behind it; you add *more relays*.
 
 ## 2. How many users can one relay serve?
 
-Honest estimate for the current alpha relay: **512 MB RAM, 1 shared vCPU, Python
+Honest estimate for the current beta relay: **512 MB RAM, 1 shared vCPU, Python
 `ThreadingHTTPServer`, whole-state-as-one-JSON-file rewritten every 5 s.**
 
 Bottlenecks, in the order they bite:
@@ -49,7 +49,7 @@ Concrete:
 | **Text only** (posts, follows, likes, comments — media served elsewhere) | **~1,000–10,000 active users.** 10 k users of heads + engagement ≈ 10–50 MB of state; the 5 s dump stays sub-second; reads ~100–300 req/s. |
 | **With media in the relay blob cache** | **Falls over fast** — a few hundred media posts (MBs each) blow past 512 MB RAM and make the 5 s dump take *seconds*. |
 
-So as-is this is a **low-thousands-of-users alpha relay for text**, and much less if media rides in
+So as-is this is a **low-thousands-of-users beta relay for text**, and much less if media rides in
 it. It is not yet a high-traffic production relay — but the fixes below are incremental, not a
 rewrite.
 

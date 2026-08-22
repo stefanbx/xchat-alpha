@@ -48,7 +48,7 @@ in flight that is sent through it, and it knows the recipient — `to` is right 
 Three paths, in the order they matter:
 
 **1. Same-node fast path — sub-second, zero extra traffic.**
-Both parties talking to the same node (which is the alpha reality, and the common case for any node
+Both parties talking to the same node (which is the beta reality, and the common case for any node
 with a community on it). `dm_send` wakes any live subscriber for `to` the moment it accepts the
 record. No polling at all.
 
