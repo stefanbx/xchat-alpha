@@ -1,5 +1,8 @@
 FROM python:3.12-slim
-RUN pip install --no-cache-dir nanopy
+# PyNaCl is REQUIRED for blind mailbox reads (the relay's X25519 read key). Without it the relay serves
+# /relaykey and /dm_sealed_read as 404 ("blind read unavailable"), which silently breaks DM send
+# confirmation in the app — every send hangs on the pending clock. Do not drop it.
+RUN pip install --no-cache-dir nanopy pynacl
 WORKDIR /app
 COPY app/ /app/
 COPY entrypoint.sh /entrypoint.sh
