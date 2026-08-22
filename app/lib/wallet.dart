@@ -137,6 +137,7 @@ class NanoWallet {
   // v2, and one that has not still verifies nothing from this build until it updates.
   String reportMsg(String postId, int ts) => sigCanon('report', [account, postId, ts]);
   String deleteMsg(String postId, int ts) => sigCanon('delete', [account, postId, ts]);
+  String editPostMsg(String postId, String text, int ts) => sigCanon('editpost', [account, postId, text, ts]);
   String reshareMsg(String postId, int ts) => sigCanon('reshare', [account, postId, ts]);
 
   // ---- encrypted DMs (on-device): a SEPARATE X25519 keypair derived from the seed, sealing with

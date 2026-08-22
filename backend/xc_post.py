@@ -217,6 +217,37 @@ elif mode == 'delete':
     json.dump({"ok": True, "cid": cid, "seq": seq, "expires": expires, "post_id": pid,
                "head_msg": xc.sig_canon('head', acc, seq, cid, expires)}, open('/tmp/xc_post_result.json', 'w'))
 
+elif mode == 'edit':
+    # The app signed "editpost|account|post_id|text|ts" — verify it, replace that post's TEXT in the
+    # author's live thread (marking it edited), pin the new thread, and return the CID + seq for the app
+    # to sign the new head. Same shape as delete: nothing commits until submit, no seed is touched, and
+    # the head signature over the new CID is what authorises the changed content. Only the author can
+    # edit — pub must map to the account, and only that account's own thread is rebuilt.
+    rec = json.load(open('/tmp/xc_edit_rec.json'))
+    acc = rec.get('account', ''); pid = rec.get('post_id', ''); text = rec.get('text', ''); ts = rec.get('ts')
+    sig = rec.get('sig', ''); pub = rec.get('pub', ''); handle = rec.get('handle', 'you.xno')
+    if not (xc.pub_to_addr(pub) == acc and verify(pub, xc.sig_canon('editpost', acc, pid, text, ts), sig)):
+        json.dump({"ok": False, "error": "bad edit signature"}, open('/tmp/xc_post_result.json', 'w')); sys.exit()
+    thread, got_content, reached = current_thread(acc, handle)   # LIVE thread from the signed head + IPFS
+    if not reached:                                     # relays unreachable — refuse, don't wipe what we can't see
+        json.dump({"ok": False, "error": "relays unreachable — cannot rebuild thread"}, open('/tmp/xc_post_result.json', 'w')); sys.exit()
+    found = False
+    for p in thread.get('posts', []):
+        if p.get('id') == pid:
+            p['text'] = text                            # the head sig over the new CID vouches for this
+            p['edited'] = ts                            # surfaced as an "edited" marker in the feed
+            found = True
+            break
+    if not found:
+        json.dump({"ok": False, "error": "post not found in thread"}, open('/tmp/xc_post_result.json', 'w')); sys.exit()
+    cand = f'/tmp/xc_thread_cand_{acc}.json'
+    json.dump(thread, open(cand, 'w'))
+    cid = xc.ipfs_add(cand)
+    seq = next_seq(acc)
+    now = int(time.time()); expires = now + xc.HEAD_TTL
+    json.dump({"ok": True, "cid": cid, "seq": seq, "expires": expires, "post_id": pid,
+               "head_msg": xc.sig_canon('head', acc, seq, cid, expires)}, open('/tmp/xc_post_result.json', 'w'))
+
 elif mode == 'replicate':
     # BACKFILL: ensure every live head's content is on the relays as a blob (keyed by CID), so content
     # posted before replication existed (or held only in the origin's IPFS) is servable from any node.
@@ -240,4 +271,4 @@ elif mode == 'replicate':
     print(json.dumps({"ok": True, "cids": len(seen), "replicated": done}))
 
 else:
-    json.dump({"ok": False, "error": "unknown mode (use prepare|submit|delete|replicate)"}, open('/tmp/xc_post_result.json', 'w'))
+    json.dump({"ok": False, "error": "unknown mode (use prepare|submit|delete|edit|replicate)"}, open('/tmp/xc_post_result.json', 'w'))

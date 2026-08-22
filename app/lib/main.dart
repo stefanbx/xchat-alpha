@@ -1185,12 +1185,13 @@ class Post {
   final String? quote, replyTo; // quoted post id (quote-post) / parent post id (thread chain)
   final List<String>? poll; // poll options (kind == 'poll'); text is the question
   final int ts, likes, reposts;
+  final int edited; // unix-s the author last edited this post (0 = never); drives the "edited" marker
   int localLikes;
   bool liked;
   bool pending = false; // a locally-queued (offline) post not yet sent to any relay
   Post(this.id, this.handle, this.account, this.kind, this.text, this.title,
       this.media, this.thumb, this.dur, this.ts, this.likes, this.reposts,
-      {this.quote, this.replyTo, this.poll})
+      {this.quote, this.replyTo, this.poll, this.edited = 0})
       : localLikes = likes,
         liked = false;
   factory Post.fromJson(Map<String, dynamic> j) => Post(
@@ -1209,6 +1210,7 @@ class Post {
         quote: j['quote'],
         replyTo: j['reply_to'],
         poll: (j['poll']?['options'] as List?)?.map((e) => '$e').toList(),
+        edited: (j['edited'] is int) ? j['edited'] as int : 0,
       );
   // Round-trips through fromJson (same keys) for the on-device feed cache. Runtime-only fields
   // (liked/localLikes/pending) are intentionally not persisted — engagement counts refresh on load.
@@ -1222,6 +1224,7 @@ class Post {
         if (quote != null) 'quote': quote,
         if (replyTo != null) 'reply_to': replyTo,
         if (poll != null) 'poll': {'options': poll},
+        if (edited > 0) 'edited': edited,
       };
 }
 
@@ -1860,6 +1863,39 @@ class Api {
       if (cid == null) return false;
       final seq = d['seq'] as int, expires = d['expires'] as int;
       final hs = w.signMsg(w.headMsg(seq, cid, expires));            // 2) sign the new head over the new thread
+      final sub = await http
+          .post(Uri.parse('$kBase/api/post_submit'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({'author': w.account, 'handle': handle, 'seq': seq, 'cid': cid,
+                                'expires': expires, 'sig': hs['sig'], 'pub': hs['pub']}))
+          .timeout(const Duration(seconds: 30));
+      return (jsonDecode(sub.body)['ok'] == true);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Edit your own post. Same two-step as delete: (1) sign the edit event proving authorship + the new
+  // text; the node replaces that post's text in your thread and returns the new CID/seq; (2) sign the
+  // new head over that CID and submit. The seed never leaves the device; the head signature is what
+  // authorises the changed content.
+  static Future<bool> editPost(String postId, String newText, String handle) async {
+    final w = gWallet;
+    if (w == null) return false;
+    try {
+      final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final es = w.signMsg(w.editPostMsg(postId, newText, ts));
+      final pr = await http
+          .post(Uri.parse('$kBase/api/post_edit'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({'account': w.account, 'post_id': postId, 'text': newText, 'ts': ts,
+                                'sig': es['sig'], 'pub': es['pub'], 'handle': handle}))
+          .timeout(const Duration(seconds: 30));
+      final d = jsonDecode(pr.body) as Map<String, dynamic>;
+      final cid = d['cid'] as String?;
+      if (cid == null) return false;
+      final seq = d['seq'] as int, expires = d['expires'] as int;
+      final hs = w.signMsg(w.headMsg(seq, cid, expires));
       final sub = await http
           .post(Uri.parse('$kBase/api/post_submit'),
               headers: {'Content-Type': 'application/json'},
@@ -4102,7 +4138,8 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         onPin: (post.media != null && post.media!.isNotEmpty) ? () => _pinPost(post) : null,
         onMute: post.account == _account ? null : () => _toggleMute(post.account, post.handle),
         onBlock: post.account == _account ? null : () => _toggleBlock(post.account, post.handle),
-        onDelete: post.account == _account ? () => _deletePost(post) : null);   // your own posts only
+        onDelete: post.account == _account ? () => _deletePost(post) : null,   // your own posts only
+        onEdit: (post.account == _account && post.kind == 'post') ? () => _editPost(post) : null);
   }
 
   // ---- threads: posts chained by reply_to ----
@@ -5032,6 +5069,46 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
               Future.delayed(Duration(seconds: ok ? 3 : 0), () { if (mounted) _load(); });  // reconcile / restore
             },
             child: const Text('Delete', style: TextStyle(color: Color(0xFFEF6C9B), fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Edit your own post: prefilled dialog, optimistic text swap, then republish the thread with the change.
+  void _editPost(Post p) {
+    final ctl = TextEditingController(text: p.text);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kCard,
+        title: const Text('Edit post', style: TextStyle(color: kText, fontWeight: FontWeight.w700)),
+        content: TextField(
+          controller: ctl, autofocus: true, maxLines: null, minLines: 1,
+          style: const TextStyle(color: kText),
+          decoration: const InputDecoration(hintText: 'Your post', hintStyle: TextStyle(color: kDim)),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel', style: TextStyle(color: kDim))),
+          TextButton(
+            onPressed: () async {
+              final next = ctl.text.trim();
+              Navigator.pop(ctx);
+              if (next.isEmpty || next == p.text) return;
+              final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+              setState(() => _posts = _posts
+                  .map((x) => x.id == p.id ? Post.fromJson({...x.toJson(), 'text': next, 'edited': ts}) : x)
+                  .toList());                                                   // optimistic
+              final ok = await Api.editPost(p.id, next, p.handle);
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  backgroundColor: kCard,
+                  content: Text(ok ? 'edited — your thread was republished'
+                                   : 'edit failed — restoring')));
+              Future.delayed(Duration(seconds: ok ? 3 : 0), () { if (mounted) _load(); });  // reconcile / restore
+            },
+            child: const Text('Save', style: TextStyle(color: kAccent, fontWeight: FontWeight.w700)),
           ),
         ],
       ),
@@ -9608,7 +9685,7 @@ class PostCard extends StatefulWidget {
   final bool liked, reposted;
   final int commentCount;
   final VoidCallback onTip, onLike, onRepost, onReport, onComment;
-  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete, onReply;
+  final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete, onEdit, onReply;
   /// Tapping an @handle or a #tag inside the body. The card cannot resolve either itself — a handle
   /// maps to an account only in the feed's view of the network — so it reports and lets the caller act.
   final void Function(String handle)? onTapHandle;
@@ -9644,6 +9721,7 @@ class PostCard extends StatefulWidget {
       this.onBookmark,
       this.onPin,
       this.onDelete,
+      this.onEdit,
       this.muted = false,
       this.blocked = false,
       this.bookmarked = false,
@@ -10010,6 +10088,12 @@ class _PostCardState extends State<PostCard> {
                   style: const TextStyle(color: kDim, fontSize: 11.5, fontFamily: 'monospace')),
               const SizedBox(width: 6),
               Text('· ${timeAgo(p.ts)}', style: const TextStyle(color: kDim, fontSize: 13)),
+              if (p.edited > 0)
+                const Padding(
+                  padding: EdgeInsets.only(left: 5),
+                  child: Text('· edited',
+                      style: TextStyle(color: kDim, fontSize: 11.5, fontStyle: FontStyle.italic)),
+                ),
               const Spacer(),
               if (widget.softFlag != null && widget.softFlag!.flaggers.isNotEmpty) ...[
                 _SoftFlag(mod: widget.softFlag!),
@@ -10215,6 +10299,14 @@ class _PostCardState extends State<PostCard> {
               subtitle: const Text('pay a little XNO so the relays keep this alive — pay-to-pin',
                   style: TextStyle(color: kDim, fontSize: 11)),
               onTap: () { Navigator.pop(context); widget.onPin!(); },
+            ),
+          if (widget.onEdit != null)
+            ListTile(
+              leading: const Icon(Icons.edit_outlined, color: kAccent),
+              title: const Text('Edit post', style: TextStyle(color: kText, fontWeight: FontWeight.w600)),
+              subtitle: const Text('rewrite the text and republish — shows an “edited” mark',
+                  style: TextStyle(color: kDim, fontSize: 11)),
+              onTap: () { Navigator.pop(context); widget.onEdit!(); },
             ),
           if (widget.onDelete != null)
             ListTile(

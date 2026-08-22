@@ -820,6 +820,10 @@ def route(path, query, body):
         with ipc_lock('post'):
             put('/tmp/xc_delete_rec.json', json.dumps(body)); spawn('xc_post.py', 'delete')  # app-signed delete event
             return read('/tmp/xc_post_result.json', '{}')
+    if path.startswith('/api/post_edit'):
+        with ipc_lock('post'):
+            put('/tmp/xc_edit_rec.json', json.dumps(body)); spawn('xc_post.py', 'edit')      # app-signed edit event
+            return read('/tmp/xc_post_result.json', '{}')
     if path.startswith('/api/post_submit'):
         with ipc_lock('post'):
             put('/tmp/xc_head_rec.json', json.dumps(body)); spawn('xc_post.py', 'submit')     # app-signed head
