@@ -8164,8 +8164,20 @@ class _DmChatScreenState extends State<DmChatScreen> {
     super.initState();
     _load();
     SettingsStore.get().then((s) { if (mounted) setState(() => _readReceiptsOn = s.readReceipts); });
-    SharedPreferences.getInstance()
-        .then((p) => _sentReadUpTo = p.getInt(_readKey) ?? 0);   // resume the high-water mark
+    SharedPreferences.getInstance().then((p) {
+      _sentReadUpTo = p.getInt(_readKey) ?? 0;                    // resume the high-water mark
+      final del = p.getStringList(_delKey) ?? const [];          // resume locally-hidden messages
+      final ed = p.getString(_editKey);                          // resume my own edits
+      if (!mounted) return;
+      setState(() {
+        _deletedLocal.addAll(del);
+        if (ed != null && ed.isNotEmpty) {
+          try {
+            (jsonDecode(ed) as Map).forEach((k, v) => _localEdits['$k'] = '$v');
+          } catch (_) {}
+        }
+      });
+    });
     // A conversation that only loads once is a mailbox, not a chat: a reply landed on the relay and
     // you had to back out of the thread and re-open it to see it. Poll while the thread is on screen.
     // Push first, poll as the safety net. While a stream is live the poll drops to 30s, which is
@@ -8411,10 +8423,21 @@ class _DmChatScreenState extends State<DmChatScreen> {
     // Control messages are ACTED on, never drawn. Suppressing them here — before grouping, day
     // chips or search — means a reaction can never open a day separator of its own or leave a gap
     // between two messages that belong together. Unknown types are suppressed too: see DmCtl.
-    var all = [
-      for (final m in [..._msgs, ..._pending])
-        if (!hiddenInDm('${m['text']}')) m
-    ];
+    final edits = _edits();
+    final del = _deletes();
+    var all = <Map<String, dynamic>>[];
+    for (final m in [..._msgs, ..._pending]) {
+      if (hiddenInDm('${m['text']}')) continue;              // control messages are acted on, not drawn
+      final id = '${m['id'] ?? ''}';
+      final mine = m['outgoing'] == true;
+      // "delete for everyone" (author-side matched) or a local "delete for me" removes the bubble.
+      if (del[id] == mine || _deletedLocal.contains(id)) continue;
+      // An edit replaces the text and marks it "edited". My own edits apply locally-first (immediate,
+      // offline-safe); the peer's edits of their messages arrive as `edit` controls, author-side matched.
+      final e = edits[id];
+      final editedText = (mine ? _localEdits[id] : null) ?? ((e != null && e.out == mine) ? e.text : null);
+      all.add(editedText != null ? {...m, 'text': editedText, 'edited': true} : m);
+    }
     if (_query.isNotEmpty) {
       // Search the BODY, not the raw text: a hit inside the "> " quote of a reply would otherwise
       // match the message that quoted it as well as the original, which reads as a duplicate.
@@ -8519,6 +8542,53 @@ class _DmChatScreenState extends State<DmChatScreen> {
   }
 
   final Map<String, String> _pendingReacts = {};      // targetId -> emoji I just chose
+
+  // Locally hidden messages ("delete for me") — persisted per conversation so they stay gone across
+  // reopens. Distinct from a `delete` control message, which is "delete for everyone".
+  final Set<String> _deletedLocal = {};
+  // My edits of my OWN messages, applied locally-first and persisted: an edit is a change to MY copy
+  // that I also broadcast to the peer, so it must show on my device the instant I make it and survive
+  // even if the control message never reaches the peer (offline, or a peer with no reachable mailbox).
+  // The `edit` control still fires so the peer's client updates too.
+  final Map<String, String> _localEdits = {};
+  String get _delKey => 'xchat_dmdel_${widget.peer}';
+  String get _editKey => 'xchat_dmedit_${widget.peer}';
+  void _persistDeleted() {
+    SharedPreferences.getInstance().then((p) => p.setStringList(_delKey, _deletedLocal.toList()));
+  }
+  void _persistEdits() {
+    SharedPreferences.getInstance().then((p) => p.setString(_editKey, jsonEncode(_localEdits)));
+  }
+
+  // EDITS + UNSENDS, folded from control messages exactly like reactions. A message can only be edited
+  // or unsent by the side that AUTHORED it: an `edit`/`delete` control applies to a target only when
+  // its sender is on the same side (outgoing) as that target. A message and its own control always
+  // share a side on any given device (both flip together across devices), so `== m['outgoing']` is the
+  // whole check — a peer cannot edit or unsend YOUR message, nor you theirs. The control rides the
+  // sealed DM channel, so an edit's new text is as private as the original.
+  Map<String, ({String text, bool out})> _edits() {
+    final out = <String, ({String text, bool out})>{};
+    final all = [..._msgs]..sort((a, b) => ((a['ts'] ?? 0) as int).compareTo((b['ts'] ?? 0) as int));
+    for (final m in all) {
+      final c = DmCtl.parse('${m['text']}');
+      if (c == null || c.type != 'edit') continue;
+      final t = '${c.data['m'] ?? ''}';
+      if (t.isEmpty) continue;
+      out[t] = (text: '${c.data['t'] ?? ''}', out: m['outgoing'] == true);   // last edit wins (ts-sorted)
+    }
+    return out;
+  }
+
+  Map<String, bool> _deletes() {
+    final out = <String, bool>{};                       // targetId -> authored-by-outgoing
+    for (final m in _msgs) {
+      final c = DmCtl.parse('${m['text']}');
+      if (c == null || c.type != 'delete') continue;
+      final t = '${c.data['m'] ?? ''}';
+      if (t.isNotEmpty) out[t] = m['outgoing'] == true;
+    }
+    return out;
+  }
 
   // READ RECEIPTS — one per conversation, never one per message.
   //
@@ -8672,7 +8742,14 @@ class _DmChatScreenState extends State<DmChatScreen> {
   // Long-press is how both WhatsApp and Messenger expose per-message actions, so it is where people
   // already look for them.
   void _msgMenu(Map<String, dynamic> m) {
-    final body = _splitQuote('${m['text']}').$2;
+    final (quote, rest) = _splitQuote('${m['text']}');
+    final body = rest;
+    final (imgCid, _) = _splitImg(rest);
+    final out = m['outgoing'] == true;
+    final id = '${m['id'] ?? ''}';
+    // Edit only your own plain-text messages: a reply carries a quote and a photo carries a marker,
+    // and reconstructing either from an edit is not worth it for v1 — those keep just delete.
+    final canEdit = out && id.isNotEmpty && imgCid == null && quote == null;
     showModalBottomSheet(
       context: context, backgroundColor: kCard,
       shape: const RoundedRectangleBorder(
@@ -8712,9 +8789,80 @@ class _DmChatScreenState extends State<DmChatScreen> {
               Navigator.pop(ctx);
             },
           ),
+          if (canEdit)
+            ListTile(
+              leading: const Icon(Icons.edit_outlined, color: kAccent),
+              title: const Text('Edit', style: TextStyle(color: kText)),
+              onTap: () { Navigator.pop(ctx); _edit(m); },
+            ),
+          if (out && id.isNotEmpty)
+            ListTile(
+              leading: const Icon(Icons.delete_outline, color: Color(0xFFEF6C9B)),
+              title: const Text('Delete for everyone', style: TextStyle(color: Color(0xFFEF6C9B))),
+              onTap: () { Navigator.pop(ctx); _deleteEveryone(m); },
+            ),
+          if (id.isNotEmpty)
+            ListTile(
+              leading: const Icon(Icons.visibility_off_outlined, color: kDim),
+              title: const Text('Delete for me', style: TextStyle(color: kText)),
+              onTap: () { Navigator.pop(ctx); _deleteForMe(id); },
+            ),
         ]),
       ),
     );
+  }
+
+  Future<void> _edit(Map<String, dynamic> m) async {
+    final id = '${m['id'] ?? ''}';
+    if (id.isEmpty) return;
+    final current = _splitImg(_splitQuote('${m['text']}').$2).$2;   // the plain body
+    final ctl = TextEditingController(text: current);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kCard,
+        title: const Text('Edit message', style: TextStyle(color: kText, fontSize: 16)),
+        content: TextField(
+          controller: ctl, autofocus: true, maxLines: null,
+          style: const TextStyle(color: kText),
+          decoration: const InputDecoration(hintText: 'Message', hintStyle: TextStyle(color: kDim)),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel', style: TextStyle(color: kDim))),
+          TextButton(onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Save', style: TextStyle(color: kAccent))),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final next = ctl.text.trim();
+    if (next.isEmpty || next == current) return;
+    // Apply on MY device at once and persist it — my edit of my message shouldn't wait on, or be lost
+    // to, a failed round trip. Then fire the sealed `edit` control so the peer's client updates too
+    // (best-effort, like a reaction); both sides match the target by its ciphertext-derived id.
+    setState(() => _localEdits[id] = next);
+    _persistEdits();
+    await Api.dmSend(widget.peer, DmCtl.encode('edit', {'m': id, 't': next}));
+    await _load();
+  }
+
+  Future<void> _deleteEveryone(Map<String, dynamic> m) async {
+    final id = '${m['id'] ?? ''}';
+    if (id.isEmpty) return;
+    // Hide it here at once — the control message travels to the peer, but our own thread shouldn't
+    // wait on the round trip to reflect the unsend. HONEST LIMIT: this asks the peer's client to drop
+    // it; a screenshot or an older build that predates the type keeps their copy. The UI says so.
+    setState(() => _deletedLocal.add(id));
+    _persistDeleted();
+    await Api.dmSend(widget.peer, DmCtl.encode('delete', {'m': id}));
+    await _load();
+  }
+
+  void _deleteForMe(String id) {
+    if (id.isEmpty) return;
+    setState(() => _deletedLocal.add(id));
+    _persistDeleted();
   }
 
   /// Message text with the search term marked. Plain Text when nothing is being searched, so the
@@ -8841,6 +8989,16 @@ class _DmChatScreenState extends State<DmChatScreen> {
               // A photo sent with no caption should not leave an empty text line under it.
               if (body.isNotEmpty || imgCid == null)
                 _highlighted(body, out),
+              // Tell the reader the words changed — an edit that rewrote a message silently would be a
+              // trust problem, not a feature. WhatsApp/Signal both surface it the same way.
+              if (m['edited'] == true)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text('edited',
+                      style: TextStyle(
+                          color: out ? Colors.black.withValues(alpha: 0.45) : kDim,
+                          fontSize: 9.5, fontStyle: FontStyle.italic)),
+                ),
               if (showTime) ...[
                 const SizedBox(height: 3),
                 Row(mainAxisSize: MainAxisSize.min, children: [
