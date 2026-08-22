@@ -2171,14 +2171,14 @@ class Api {
   // own fetch reveals. Marker goes on its own first line so a caption can follow it, and so a client
   // that predates attachments shows one odd line plus a readable caption rather than nothing at all.
   static const dmImgTag = 'xchat:img:';
-  // A VIEW-ONCE (disappearing) photo. Same sealed-blob path as a normal DM photo; only the marker
-  // differs, so an older client that doesn't know it renders nothing rather than the raw line (the
-  // recipient just doesn't get the ephemeral behaviour). Client-enforced, like every disappearing
-  // photo — a screenshot or a modified client can keep it; the honest limit is stated in the UI.
+  // A DISAPPEARING photo. Same sealed-blob path as a normal DM photo; the marker differs and carries the
+  // view duration in seconds: `xchat:img1:<seconds>:<cid>`. An older client that doesn't know the marker
+  // renders nothing rather than the raw line (it just doesn't get the ephemeral behaviour). Enforced on
+  // the client, like every disappearing photo — the honest limit (not camera-proof) is stated in the UI.
   static const dmImgOnceTag = 'xchat:img1:';
 
   static Future<Map<String, dynamic>?> dmSendImage(String to, Uint8List bytes, String caption,
-      {bool once = false}) async {
+      {int? seconds}) async {
     final w = gWallet;
     if (w == null) return null;
     final peer = await dmKeyGet(to);
@@ -2187,9 +2187,9 @@ class Api {
     if (cid == null || cid.isEmpty) {
       return {'ok': false, 'error': 'could not store the image (${lastBlobErr ?? "no cid"})'};
     }
-    final tag = once ? dmImgOnceTag : dmImgTag;
     final body = caption.trim();
-    return dmSend(to, body.isEmpty ? '$tag$cid' : '$tag$cid\n$body');
+    final marker = seconds != null ? '$dmImgOnceTag$seconds:$cid' : '$dmImgTag$cid';
+    return dmSend(to, body.isEmpty ? marker : '$marker\n$body');
   }
 
   /// Fetch + decrypt a DM attachment. `peerPk` is the other party's DM key for this conversation —
@@ -4649,7 +4649,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     if (s.startsWith(Api.dmImgOnceTag)) {
       final sp = s.indexOf(' ');
       final rest = sp < 0 ? '' : s.substring(sp + 1).trim();
-      s = rest.isEmpty ? '🔥 Disappearing photo' : '🔥 $rest';
+      s = rest.isEmpty ? '⏱ Disappearing photo' : '⏱ $rest';
     } else if (s.startsWith(Api.dmImgTag)) {
       final sp = s.indexOf(' ');
       final rest = sp < 0 ? '' : s.substring(sp + 1).trim();
@@ -8387,19 +8387,66 @@ class _DmChatScreenState extends State<DmChatScreen> {
   // Pick a photo and send it. Same picker settings as a post (quality 88 / maxWidth 1600): a modern
   // phone photo is several MB raw, and a DM attachment gets sealed and base64'd on the way to a blob
   // store, so shipping the original would put tens of MB through a relay for one message.
-  Future<void> _sendImage({bool once = false}) async {
+  // Pick a disappearing photo, then choose how long it shows, then send.
+  Future<void> _sendDisappearing() async {
+    if (_sending) return;
+    final x = await ImagePicker().pickImage(
+        source: ImageSource.gallery, imageQuality: 88, maxWidth: 1600);
+    if (x == null || !mounted) return;
+    final secs = await _pickDuration();
+    if (secs == null || !mounted) return;
+    final bytes = await x.readAsBytes();
+    if (!mounted) return;
+    _sendPickedImage(bytes, seconds: secs);
+  }
+
+  // The duration chooser for a disappearing photo.
+  Future<int?> _pickDuration() {
+    return showModalBottomSheet<int>(
+      context: context, backgroundColor: kCard,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 14, 16, 6),
+            child: Align(alignment: Alignment.centerLeft,
+                child: Text('How long can they view it?',
+                    style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 15))),
+          ),
+          for (final s in const [3, 5, 10, 30])
+            ListTile(
+              leading: const Icon(Icons.timer_outlined, color: kAccent),
+              title: Text('$s seconds', style: const TextStyle(color: kText)),
+              onTap: () => Navigator.pop(ctx, s),
+            ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 4, 16, 12),
+            child: Text('It shows on a countdown, then deletes itself. Screen capture is blocked '
+                '(not camera-proof).', style: TextStyle(color: kDim, fontSize: 11.5)),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Future<void> _sendImage() async {
     if (_sending) return;
     final x = await ImagePicker().pickImage(
         source: ImageSource.gallery, imageQuality: 88, maxWidth: 1600);
     if (x == null || !mounted) return;
     final bytes = await x.readAsBytes();
     if (!mounted) return;
+    _sendPickedImage(bytes);
+  }
+
+  Future<void> _sendPickedImage(Uint8List bytes, {int? seconds}) async {
     final caption = _ctl.text.trim();     // whatever is already typed rides along as the caption
     setState(() {
       _sending = true; _err = null; _emoji = false;
       _ctl.clear();
     });
-    final r = await Api.dmSendImage(widget.peer, bytes, caption, once: once);
+    final r = await Api.dmSendImage(widget.peer, bytes, caption, seconds: seconds);
     if (!mounted) return;
     if (r != null && r['ok'] == true) {
       await _load();
@@ -8781,17 +8828,26 @@ class _DmChatScreenState extends State<DmChatScreen> {
     );
   }
 
-  /// Split an attachment marker off a message body → (cid, once, caption). `once` is true for a
-  /// view-once (disappearing) photo. Runs AFTER the quote split, so a reply that carries a photo works:
-  /// quote lines, then the marker, then the caption.
-  (String?, bool, String) _splitImg(String body) {
-    final once = body.startsWith(Api.dmImgOnceTag);
-    final tag = once ? Api.dmImgOnceTag : Api.dmImgTag;
-    if (!once && !body.startsWith(Api.dmImgTag)) return (null, false, body);
+  /// Split an attachment marker off a message body → (cid, seconds, caption). `seconds` is non-null for
+  /// a disappearing photo (its view duration). Runs AFTER the quote split, so a reply that carries a
+  /// photo works: quote lines, then the marker, then the caption.
+  (String?, int?, String) _splitImg(String body) {
+    if (body.startsWith(Api.dmImgOnceTag)) {
+      final rest = body.substring(Api.dmImgOnceTag.length);   // "<seconds>:<cid>" (+ optional "\n<caption>")
+      final nl = rest.indexOf('\n');
+      final head = (nl < 0 ? rest : rest.substring(0, nl)).trim();
+      final colon = head.indexOf(':');
+      if (colon <= 0) return (null, null, body);
+      final secs = int.tryParse(head.substring(0, colon));
+      final cid = head.substring(colon + 1).trim();
+      if (secs == null || cid.isEmpty) return (null, null, body);
+      return (cid, secs, nl < 0 ? '' : rest.substring(nl + 1).trimLeft());
+    }
+    if (!body.startsWith(Api.dmImgTag)) return (null, null, body);
     final nl = body.indexOf('\n');
-    final cid = (nl < 0 ? body.substring(tag.length) : body.substring(tag.length, nl)).trim();
-    if (cid.isEmpty) return (null, false, body);
-    return (cid, once, nl < 0 ? '' : body.substring(nl + 1).trimLeft());
+    final cid = (nl < 0 ? body.substring(Api.dmImgTag.length) : body.substring(Api.dmImgTag.length, nl)).trim();
+    if (cid.isEmpty) return (null, null, body);
+    return (cid, null, nl < 0 ? '' : body.substring(nl + 1).trimLeft());
   }
 
   void _wantImage(String cid) {
@@ -8839,12 +8895,11 @@ class _DmChatScreenState extends State<DmChatScreen> {
     );
   }
 
-  // A view-once (disappearing) photo: a covered card the recipient taps to open ONCE. Opening deletes
-  // the local copy and marks it gone (persisted). The sender sees the same card — they can look once
-  // too. Client-enforced, like every disappearing photo: a screenshot or a modified client defeats it,
-  // and the label doesn't pretend otherwise. The bytes are never rendered inline, so a passing glance
-  // at the thread can't reveal it.
-  Widget _oncePhoto(Map<String, dynamic> m, String cid, bool out) {
+  // A disappearing photo: a covered card the recipient taps to open ONCE, for `seconds` on a countdown,
+  // with screen capture blocked. Opening deletes the local copy and marks it gone (persisted). The
+  // sender sees the same card and can look once too. The bytes are never rendered inline, so a passing
+  // glance at the thread can't reveal it. Client-enforced — the timed viewer states it isn't camera-proof.
+  Widget _oncePhoto(Map<String, dynamic> m, String cid, int seconds, bool out) {
     final id = '${m['id'] ?? ''}';
     final consumed = _consumedPhotos.contains(id);
     final fg = out ? Colors.black.withValues(alpha: 0.78) : kText;
@@ -8863,8 +8918,8 @@ class _DmChatScreenState extends State<DmChatScreen> {
                   _consumePhoto(id, cid);                 // gone either way
                   return;
                 }
-                await Navigator.of(context)
-                    .push(MaterialPageRoute(builder: (_) => PhotoScreen(bytes: bytes)));
+                await Navigator.of(context).push(MaterialPageRoute(
+                    builder: (_) => DisappearingPhotoScreen(bytes: bytes, seconds: seconds)));
                 _consumePhoto(id, cid);                   // opened once → delete + mark gone
               },
         child: Container(
@@ -8876,7 +8931,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
             border: Border.all(color: out ? Colors.black.withValues(alpha: 0.15) : kLine),
           ),
           child: Row(mainAxisSize: MainAxisSize.min, children: [
-            Icon(consumed ? Icons.local_fire_department : Icons.local_fire_department_outlined,
+            Icon(consumed ? Icons.timer_off_outlined : Icons.timer_outlined,
                 size: 22,
                 color: consumed ? sub : (out ? Colors.black.withValues(alpha: 0.7) : kAccent)),
             const SizedBox(width: 9),
@@ -8884,10 +8939,12 @@ class _DmChatScreenState extends State<DmChatScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(consumed ? 'Photo opened' : 'Disappearing photo',
+                  Text(consumed ? 'Photo opened' : 'Disappearing photo · ${seconds}s',
                       style: TextStyle(color: fg, fontSize: 13.5, fontWeight: FontWeight.w700)),
                   const SizedBox(height: 1),
-                  Text(consumed ? 'gone — it was view-once' : (out ? 'they can open it once' : 'tap to view once'),
+                  Text(consumed
+                          ? 'gone — it showed for ${seconds}s'
+                          : (out ? 'they can open it once' : 'tap to view for ${seconds}s'),
                       style: TextStyle(color: sub, fontSize: 11)),
                 ],
               ),
@@ -9102,7 +9159,7 @@ class _DmChatScreenState extends State<DmChatScreen> {
     final out = m['outgoing'] == true;
     final pending = m['pending'] == true;
     final (quote, rest) = _splitQuote('${m['text']}');
-    final (imgCid, imgOnce, body) = _splitImg(rest);
+    final (imgCid, imgSecs, body) = _splitImg(rest);
     const r16 = Radius.circular(16), r5 = Radius.circular(5);
     return Column(
       crossAxisAlignment: out ? CrossAxisAlignment.end : CrossAxisAlignment.start,
@@ -9144,7 +9201,8 @@ class _DmChatScreenState extends State<DmChatScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               if (quote != null) _quoteBlock(quote, out),
-              if (imgCid != null) (imgOnce ? _oncePhoto(m, imgCid, out) : _attachment(imgCid, out)),
+              if (imgCid != null)
+                (imgSecs != null ? _oncePhoto(m, imgCid, imgSecs, out) : _attachment(imgCid, out)),
               // A photo sent with no caption should not leave an empty text line under it.
               if (body.isNotEmpty || imgCid == null)
                 _highlighted(body, out),
@@ -9255,25 +9313,17 @@ class _DmChatScreenState extends State<DmChatScreen> {
                     color: _emoji ? kAccent : kDim),
                 tooltip: _emoji ? 'Keyboard' : 'Emoji',
               ),
-              // Tap = normal photo; long-press = a disappearing (view-once) photo. An InkWell (not an
-              // IconButton) so the long-press reaches us — IconButton's own long-press shows its tooltip
-              // and would swallow the gesture. Keeps the common path one tap; the ephemeral option gets a
-              // discoverable home + a hint.
-              InkWell(
-                borderRadius: BorderRadius.circular(24),
-                onTap: _sending ? null : () => _sendImage(),
-                onLongPress: _sending
-                    ? null
-                    : () {
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                            duration: Duration(milliseconds: 1400),
-                            content: Text('Disappearing photo — deletes after they open it once')));
-                        _sendImage(once: true);
-                      },
-                child: Padding(
-                  padding: const EdgeInsets.all(8),
-                  child: Icon(Icons.image_outlined, color: _sending ? kLine : kDim),
-                ),
+              IconButton(
+                onPressed: _sending ? null : () => _sendImage(),
+                icon: Icon(Icons.image_outlined, color: _sending ? kLine : kDim),
+                tooltip: 'Send a photo',
+              ),
+              // A distinct button + symbol for a DISAPPEARING photo: pick a photo, choose how long it
+              // shows, and it self-deletes after the recipient's countdown (with screen capture blocked).
+              IconButton(
+                onPressed: _sending ? null : _sendDisappearing,
+                icon: Icon(Icons.timer_outlined, color: _sending ? kLine : kAccent),
+                tooltip: 'Disappearing photo',
               ),
               Expanded(
                 child: TextField(
@@ -10813,6 +10863,97 @@ class PhotoScreen extends StatelessWidget {
               ? Image.memory(bytes!, fit: BoxFit.contain)
               : MediaImage(cid: cid, fit: BoxFit.contain),
         ),
+      ),
+    );
+  }
+}
+
+// FLAG_SECURE gate (native, via MainActivity). Blocks OS screenshots + screen recording + the recents
+// thumbnail while a disappearing photo is on screen. NOT camera-proof — nothing an app does can be.
+class SecureScreen {
+  static const _ch = MethodChannel('xchat/secure');
+  static Future<void> on() async { try { await _ch.invokeMethod('on'); } catch (_) {} }
+  static Future<void> off() async { try { await _ch.invokeMethod('off'); } catch (_) {} }
+}
+
+// A disappearing photo: shown full-screen for a fixed number of seconds with a live countdown ring,
+// then it closes and the caller deletes it. Screen capture is blocked while it's up (see SecureScreen).
+class DisappearingPhotoScreen extends StatefulWidget {
+  const DisappearingPhotoScreen({super.key, required this.bytes, required this.seconds});
+  final Uint8List bytes;
+  final int seconds;
+  @override
+  State<DisappearingPhotoScreen> createState() => _DisappearingPhotoScreenState();
+}
+
+class _DisappearingPhotoScreenState extends State<DisappearingPhotoScreen>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c;
+
+  @override
+  void initState() {
+    super.initState();
+    SecureScreen.on();                         // block capture for the life of this screen
+    _c = AnimationController(vsync: this, duration: Duration(seconds: widget.seconds.clamp(1, 120)))
+      ..addStatusListener((s) {
+        if (s == AnimationStatus.completed && mounted) Navigator.of(context).maybePop();
+      })
+      ..forward();
+  }
+
+  @override
+  void dispose() {
+    _c.dispose();
+    SecureScreen.off();                        // re-allow capture everywhere else
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(children: [
+          Positioned.fill(child: Center(child: Image.memory(widget.bytes, fit: BoxFit.contain))),
+          // Countdown ring + remaining seconds, top-right.
+          Positioned(
+            top: 10, right: 14,
+            child: AnimatedBuilder(
+              animation: _c,
+              builder: (_, __) {
+                final remain = (widget.seconds * (1 - _c.value)).ceil().clamp(0, widget.seconds);
+                return SizedBox(
+                  width: 46, height: 46,
+                  child: Stack(alignment: Alignment.center, children: [
+                    SizedBox(
+                      width: 46, height: 46,
+                      child: CircularProgressIndicator(
+                          value: 1 - _c.value, strokeWidth: 3,
+                          backgroundColor: Colors.white24, color: kAccent),
+                    ),
+                    Text('$remain',
+                        style: const TextStyle(
+                            color: Colors.white, fontWeight: FontWeight.w800, fontSize: 15)),
+                  ]),
+                );
+              },
+            ),
+          ),
+          Positioned(
+            top: 6, left: 8,
+            child: IconButton(
+                icon: const Icon(Icons.close, color: Colors.white),
+                onPressed: () => Navigator.of(context).maybePop()),
+          ),
+          // Honest limit, stated where the viewer sees it.
+          Positioned(
+            bottom: 12, left: 0, right: 0,
+            child: Center(
+              child: Text('screen capture blocked · not camera-proof',
+                  style: TextStyle(color: Colors.white.withValues(alpha: 0.55), fontSize: 11)),
+            ),
+          ),
+        ]),
       ),
     );
   }
