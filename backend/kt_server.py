@@ -456,7 +456,11 @@ def api_dm_inbox(query):
         with _cf.ThreadPoolExecutor(max_workers=max(1, len(relays))) as ex:
             for got in ex.map(_one, relays):
                 for m in got:
-                    k = (m.get('from'), m.get('ts'))
+                    # Dedup like the relay/client (xc_relayd._dm_key): `mid` when present, else
+                    # (from, ts). Sealed v2 hides `from`, so (from, ts) collapses to (None, ts) and two
+                    # sealed DMs in the same second would drop all but one — silent message loss.
+                    _mid = m.get('mid')
+                    k = ('mid', _mid) if _mid else ('ft', m.get('from'), m.get('ts'))
                     if k in seen:
                         continue
                     seen.add(k)

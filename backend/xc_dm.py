@@ -171,7 +171,11 @@ else:                                                      # inbox: return RAW c
     with _cf.ThreadPoolExecutor(max_workers=max(1, len(RELAYS))) as ex:
         for got in ex.map(_one, RELAYS):
             for m in got:
-                k = (m.get('from'), m.get('ts'))
+                # Dedup like the relay/client (xc_relayd._dm_key): key on the sealed record's random
+                # `mid` when present, else (from, ts). Sealed v2 hides `from`, so (from, ts) collapses to
+                # (None, ts) and two sealed DMs in the same second would drop all but one — silent loss.
+                _mid = m.get('mid')
+                k = ('mid', _mid) if _mid else ('ft', m.get('from'), m.get('ts'))
                 if k in seen:
                     continue
                 seen.add(k)

@@ -5216,22 +5216,41 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
           if (notifs.isEmpty)
             const Padding(padding: EdgeInsets.symmetric(vertical: 20), child: Text('nothing new', style: TextStyle(color: kDim)))
           else
-            ...notifs.map((n) => Padding(
+            ...notifs.map((n) {
+              // Name the action from the notification's kind — it used to always say "mentioned you",
+              // so a tip or a like was mislabelled (users reported "it says mentioned but it's a tip").
+              final k = '${n['kind'] ?? ''}';
+              final verb = k == 'tip' ? 'tipped your post'
+                  : k == 'like' ? 'liked your post'
+                  : k == 'comment' ? 'commented on your post'
+                  : k == 'follow' ? 'followed you'
+                  : 'mentioned you';
+              // The header now names the action, so drop a verb prefix the text baked in (no "liked … liked:").
+              var detail = '${n['text']}';
+              for (final p in const ['liked: ', 'commented: ', 'tipped your post ']) {
+                if (detail.startsWith(p)) { detail = detail.substring(p.length); break; }
+              }
+              final from = '${n['from']}';
+              final initial = from.isEmpty ? '?' : from.substring(0, 1).toUpperCase();  // never RangeError on empty
+              return Padding(
                   padding: const EdgeInsets.only(bottom: 14),
                   child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    CircleAvatar(radius: 16, backgroundColor: avatarColor('${n['from']}'),
-                        child: Text('${n['from']}'.substring(0, 1).toUpperCase(),
+                    CircleAvatar(radius: 16, backgroundColor: avatarColor(from),
+                        child: Text(initial,
                             style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w800, fontSize: 13))),
                     const SizedBox(width: 10),
                     Expanded(
                         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text('@${n['from']} mentioned you · ${timeAgo(n['ts'] ?? 0)}',
+                      Text('@$from $verb · ${timeAgo(n['ts'] ?? 0)}',
                           style: const TextStyle(color: kDim, fontSize: 12)),
-                      const SizedBox(height: 2),
-                      Text('${n['text']}', style: const TextStyle(color: kText, fontSize: 14, height: 1.3)),
+                      if (detail.isNotEmpty) ...[
+                        const SizedBox(height: 2),
+                        Text(detail, style: const TextStyle(color: kText, fontSize: 14, height: 1.3)),
+                      ],
                     ])),
                   ]),
-                )),
+                );
+            }),
         ]),
       ),
     );
