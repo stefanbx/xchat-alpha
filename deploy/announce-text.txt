@@ -1,1 +1,1 @@
-ӾChat 2.5.6 is live — steadier messaging and feed, cleaner notifications, and dead relays no longer clutter the list. Tap to update.
+ӾChat 2.5.7 is live — edit & delete posts and DMs, disappearing photos, @-mentions, pinned posts, follower lists, undo a tip, trending & hidden words. Tap to update.
