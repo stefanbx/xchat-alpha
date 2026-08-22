@@ -836,6 +836,7 @@ def route(path, query, body):
     # Hottest endpoints — IN-PROCESS (no subprocess spawn / /tmp round-trip). ~0.18s/call saved + better
     # under concurrency; they're just relay fan-out (fire-and-forget writes, aggregated reads).
     if path.startswith('/api/like'):         return json.dumps(xc_engage.like(b('post_id'), b('delta')))
+    if path.startswith('/api/react'):        return json.dumps(xc_engage.react(b('post_id'), b('emoji'), b('delta')))
     if path.startswith('/api/repost'):       return json.dumps(xc_engage.repost(body))   # body = app-signed reshare rec
     if path.startswith('/api/tipstat'):
         # payhash/cid are optional: without them this is a display counter, with them the relay

@@ -1,6 +1,6 @@
 # ӾChat — a censorship-free X, discovered on the XNO ledger
 
-**Alpha whitepaper · v0.3 · app v2.3.5**
+**Beta whitepaper · v0.4 · app v2.5.9**
 
 ӾChat is a Twitter/X-style social app for phones with no company, no server account, and
 no removable point of control. Your identity is a cryptographic keypair, your posts are
@@ -226,7 +226,7 @@ Everything else — the entire social graph — never touches the ledger, so the
 matter how busy it gets.
 
 **Minimal custody.** The in-app wallet is a *tip float*, not a bank. A safety cap (2 XNO in the
-alpha) plus an optional auto-sweep to an external savings address the app cannot spend from bound
+beta) plus an optional auto-sweep to an external savings address the app cannot spend from bound
 how much is ever at risk inside the app; your savings live in your own wallet (see §9).
 
 ## 7. Self-delivery — updates verified against public source, with no single key
@@ -260,7 +260,7 @@ on any one secret:
   commit, and how many attestors agree. The one layer that isn't censorship-free is the OS install
   gate itself (Android allows sideload/self-update; iOS does not) — and the app says so.
 
-**Bootstrapping honesty — what's shipped vs. the target.** The alpha **implements today**: signed,
+**Bootstrapping honesty — what's shipped vs. the target.** The beta **implements today**: signed,
 content-addressed releases; the APK pinned + **auto-replicated** across plural relays **and mirrored on
 a hash-verified CDN URL** (fetched first for speed, relays as the fallback); the client **re-verifying
 the SHA-256 on-device** before an explicit-tap install; and an auto-update check (on launch + periodic). It uses a **single publisher key** (held outside the repo; the app pins only
@@ -313,7 +313,7 @@ right code still gets out — while wrong bytes, from anywhere, are rejected by 
    and its hash re-verified on-device. The *target* — **not yet shipped** — replaces that single key
    with a **reproducible build of the public source** confirmed by a **user-chosen K-of-N quorum** of
    independent attestations logged on-chain, so no single secret is load-bearing. It is deliberately a
-   growable anchor, but honesty requires stating that the alpha's update trust rests on that one key.
+   growable anchor, but honesty requires stating that the beta's update trust rests on that one key.
 3. **The rendezvous addresses** — the discovery bootstrap. *Keyless and plural* — meeting points,
    not controllers. This is the irreducible minimum every peer-to-peer system needs (Bitcoin has
    hardcoded DNS seeds); the design makes it as weak-as-possible rather than pretending it away.
@@ -392,7 +392,7 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
   running** (true of every self-custody wallet). Two-sided defense: (1) **verified distribution** keeps
   bad builds off your device in the first place (reproducible builds + confirmations); (2) **minimal
   custody** bounds the damage if one slips through — the app is meant to hold only a small **tip
-  float**, enforced by a **safety cap** (2 XNO in the alpha) plus an optional **auto-sweep** that
+  float**, enforced by a **safety cap** (2 XNO in the beta) plus an optional **auto-sweep** that
   forwards anything above the cap to an **external savings address the app holds no key for.** So a
   bad build's ceiling is the small cap, never your savings — real funds stay in your own wallet.
   ✅ (cap + auto-sweep, verified: 4.07 → 2.0 XNO, excess auto-moved out) · 🔨 (prevention side)
@@ -432,7 +432,7 @@ Here is each vector, its defense, and honest status (✅ done · 🔨 building b
 
 ### Network & privacy
 - **Relays/nodes see your IP and what you fetch.** → Network-metadata privacy (onion routing) is
-  🗺️; the alpha does **not** hide network metadata — treat it as public.
+  🗺️; the beta does **not** hide network metadata — treat it as public.
 
 ### Denial of service
 
@@ -505,7 +505,22 @@ because none of them ever hold a key. The node is pure Python and runs on any OS
 
 ## 11. Status & honesty
 
-This is an **alpha**.
+This is a **public beta**. The decentralization and money paths below are verified end-to-end on
+mainnet, and the app has grown from a proof-of-concept into a full X-style client — so it is past
+"alpha." It stays **beta**, not 1.0, for honest reasons: it runs against one small hosted node plus
+a couple of relays (small scale, unproven under load), recovery is seed-only (a lost seed is a lost
+account, and browser storage is weaker than the phone keystore), and there is **no global search or
+cross-follow discovery engine yet** — reach is still mostly your follow graph. Treat any account as
+disposable until you run your own node.
+
+**A full client, not a demo.** Beyond the architecture, the app ships the social surface people
+expect: a ranked feed with threads, quotes, reposts, likes and **emoji reactions**, native XNO
+**tips** (with undo before settlement), **polls**, **multi-image posts** (up to four, with a
+swipeable gallery), **rich-HTML long-form articles** for channels (tables, callouts, alignment,
+colour — rendered as native widgets, no JavaScript and no remote fetches), **edit and delete** for
+posts and DMs, **end-to-end encrypted DMs** with disappearing photos and reactions, @-mentions,
+pinned posts, follower/following lists, trending hashtags, muted ("hidden") words, and community
+reporting. The same app runs **in a browser** at any node's `/chat`.
 
 **Done.** The node is **pure Python** (`nanopy` ed25519-blake2b) and runs on any OS. Relay discovery
 is **verified end-to-end against the live mainnet ledger**: a second independent relay was announced

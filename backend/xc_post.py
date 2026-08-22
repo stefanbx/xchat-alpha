@@ -151,6 +151,7 @@ if mode == 'prepare':
         json.dump({"ok": False, "error": "bad post signature"}, open('/tmp/xc_post_result.json', 'w')); sys.exit()
     p = {"id": rec.get('id') or ("u" + str(ts)), "handle": handle, "account": acc, "kind": kind,
          "text": text, "ts": ts, "likes": 0, "reposts": 0, "media": rec.get('media') or None,
+         "medias": rec.get('medias') or None,
          "sig": sig, "pub": pub}
     for k in ('title', 'quote', 'reply_to'):
         if rec.get(k):

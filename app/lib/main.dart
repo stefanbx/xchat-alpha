@@ -167,7 +167,7 @@ Future<void> resolveWorkBase() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.5.8'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.5.9'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -452,6 +452,17 @@ class EngageStore {
   static Future<void> saveReposted(Set<String> s) => _save('xchat_reposted', s);
   static Future<Set<String>> viewed() => _get('xchat_viewed');
   static Future<void> saveViewed(Set<String> s) => _save('xchat_viewed', s);
+  // Which emoji THIS device reacted with, per post (one reaction per post per device). A map, not a set.
+  static Future<Map<String, String>> reactions() async {
+    final raw = (await SharedPreferences.getInstance()).getString('xchat_myreacts') ?? '{}';
+    try {
+      return (jsonDecode(raw) as Map).map((k, v) => MapEntry('$k', '$v'));
+    } catch (_) {
+      return {};
+    }
+  }
+  static Future<void> saveReactions(Map<String, String> m) async =>
+      (await SharedPreferences.getInstance()).setString('xchat_myreacts', jsonEncode(m));
 }
 
 // Android system notifications (likes / comments / tips / DMs) + the unread-DM count on the app icon.
@@ -1197,6 +1208,7 @@ class Post {
   final String? title, media, thumb, dur;
   final String? quote, replyTo; // quoted post id (quote-post) / parent post id (thread chain)
   final List<String>? poll; // poll options (kind == 'poll'); text is the question
+  final List<String>? medias; // 1..4 image CIDs for a multi-image post; media stays = medias[0] for old clients
   final int ts, likes, reposts;
   final int edited; // unix-s the author last edited this post (0 = never); drives the "edited" marker
   int localLikes;
@@ -1204,9 +1216,18 @@ class Post {
   bool pending = false; // a locally-queued (offline) post not yet sent to any relay
   Post(this.id, this.handle, this.account, this.kind, this.text, this.title,
       this.media, this.thumb, this.dur, this.ts, this.likes, this.reposts,
-      {this.quote, this.replyTo, this.poll, this.edited = 0})
+      {this.quote, this.replyTo, this.poll, this.medias, this.edited = 0})
       : localLikes = likes,
         liked = false;
+
+  /// The images to show, newest schema first: an explicit `medias` list (multi-image), else the single
+  /// legacy `media` when it's a photo. Empty for text/video/article posts.
+  List<String> get gallery {
+    if (medias != null && medias!.isNotEmpty) return medias!;
+    if (media != null && media!.isNotEmpty && kind == 'photo') return [media!];
+    return const [];
+  }
+
   factory Post.fromJson(Map<String, dynamic> j) => Post(
         j['id'] ?? '',
         j['handle'] ?? 'anon.xno',
@@ -1223,6 +1244,7 @@ class Post {
         quote: j['quote'],
         replyTo: j['reply_to'],
         poll: (j['poll']?['options'] as List?)?.map((e) => '$e').toList(),
+        medias: (j['medias'] as List?)?.map((e) => '$e').toList(),
         edited: (j['edited'] is int) ? j['edited'] as int : 0,
       );
   // Round-trips through fromJson (same keys) for the on-device feed cache. Runtime-only fields
@@ -1237,6 +1259,7 @@ class Post {
         if (quote != null) 'quote': quote,
         if (replyTo != null) 'reply_to': replyTo,
         if (poll != null) 'poll': {'options': poll},
+        if (medias != null) 'medias': medias,
         if (edited > 0) 'edited': edited,
       };
 }
@@ -1721,6 +1744,15 @@ class Api {
   }
 
   static Future<void> like(String pid, int delta) => _engagePost('like', pid, delta);
+  // Emoji reaction on a post — a per-emoji DISPLAY counter, same trust class as likes (anyone can bump).
+  // delta +1 to add, -1 to remove; the node fans it out to every relay and /engagement returns the map.
+  static Future<void> react(String pid, String emoji, int delta) async {
+    try {
+      await http.post(Uri.parse('$kBase/api/react'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'post_id': pid, 'emoji': emoji, 'delta': '$delta'}));
+    } catch (_) {}
+  }
   // A reshare earns a slice of every tip to the post, so it is SIGNED on-device (canon
   // reshare|account|post_id|ts). The relay verifies it before crediting the resharer — an unsigned
   // reshare can no longer name someone else's/your own account to skim tips.
@@ -1926,7 +1958,7 @@ class Api {
   // node assembles the thread, pins it, and returns the content CID + head seq; (2) sign the head
   // "account|seq|cid|expires" locally + POST to /api/post_submit — the node verifies + gossips it.
   // The seed never leaves the device; the node only assembles content and relays signed records.
-  static Future<String> post(String text, {String handle = 'you.xno', String media = '', String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = '', int? ts, NanoWallet? signer}) async {
+  static Future<String> post(String text, {String handle = 'you.xno', String media = '', List<String> medias = const [], String mediaKind = '', String quote = '', String replyTo = '', String title = '', String poll = '', int? ts, NanoWallet? signer}) async {
     final w = signer ?? gWallet;   // `signer` lets a post be authored by a channel identity, not the user
     if (w == null) return '';
     ts ??= DateTime.now().millisecondsSinceEpoch ~/ 1000;   // a flushed queued post keeps its compose time
@@ -1944,7 +1976,8 @@ class Api {
       final pr = await http.post(Uri.parse('$kBase/api/post_prepare'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({'id': id, 'handle': handle, 'account': w.account, 'kind': kind, 'text': text,
-                            'ts': ts, 'media': media, 'title': title, 'quote': quote, 'reply_to': replyTo,
+                            'ts': ts, 'media': media, if (medias.length > 1) 'medias': medias,
+                            'title': title, 'quote': quote, 'reply_to': replyTo,
                             'poll': pollOpts, 'sig': es['sig'], 'pub': es['pub']})).timeout(t);
       final pj = jsonDecode(pr.body);
       if (pj['ok'] != true) return '';
@@ -3193,6 +3226,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   Settings _settings = Settings();
   Map<String, dynamic> _engage = {}; // post_id -> {likes, reposts, tips_raw}
   final Set<String> _liked = {}, _reposted = {}, _reported = {};
+  final Map<String, String> _myReactions = {}; // post_id -> the emoji THIS device reacted with
   Set<String> _muted = {}, _blocked = {}; // per-viewer moderation (accounts)
   List<String> _mutedWords = [];          // hidden words — posts containing one are filtered (viewer-only)
   Set<String> _bookmarks = {}; // saved post ids (private, on-device)
@@ -3240,6 +3274,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     // per-device engagement memory — so a view/like is counted once per device, not re-sent each launch
     EngageStore.liked().then((s) { if (mounted) setState(() => _liked.addAll(s)); });
     EngageStore.reposted().then((s) { if (mounted) setState(() => _reposted.addAll(s)); });
+    EngageStore.reactions().then((m) { if (mounted) setState(() => _myReactions.addAll(m)); });
     EngageStore.viewed().then((s) { if (mounted) _viewed.addAll(s); });
     _refreshTxLog();
     SharedPreferences.getInstance().then((sp) {
@@ -4170,6 +4205,45 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     }
   }
 
+  // Optimistically move a post's per-emoji reaction counter so the chip updates before the relay echoes.
+  void _bumpReaction(String pid, String emoji, int delta) {
+    final e = _eng(pid);
+    final rx = Map<String, dynamic>.from((e['reactions'] as Map?) ?? const {});
+    final next = (((rx[emoji] ?? 0) as num).toInt()) + delta;
+    if (next > 0) {
+      rx[emoji] = next;
+    } else {
+      rx.remove(emoji);
+    }
+    e['reactions'] = rx;
+    _engage[pid] = e;
+  }
+
+  // Emoji reaction on a post — one per device. Tapping your current emoji removes it; a different emoji
+  // replaces it. Counters are optimistic + fanned out to the relays (same DISPLAY-counter class as likes).
+  void _toggleReact(Post p, String emoji) {
+    final cur = _myReactions[p.id] ?? '';
+    setState(() {
+      if (cur == emoji) {
+        _myReactions.remove(p.id);
+        _bumpReaction(p.id, emoji, -1);
+        Api.react(p.id, emoji, -1);
+      } else {
+        if (cur.isNotEmpty) {
+          _bumpReaction(p.id, cur, -1);
+          Api.react(p.id, cur, -1);
+        }
+        _myReactions[p.id] = emoji;
+        _bumpReaction(p.id, emoji, 1);
+        Api.react(p.id, emoji, 1);
+      }
+    });
+    EngageStore.saveReactions(_myReactions);
+    if (cur != emoji && p.account != _account && _settings.notifyLike) {
+      Api.notifyPush(p.account, _handle, 'like', 'reacted $emoji to your post');
+    }
+  }
+
   void _toggleRepost(Post p) {
     final rp = _reposted.contains(p.id);
     setState(() {
@@ -4213,6 +4287,8 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         onTip: () => _tallyTip(post),
         onLike: () => _toggleLike(post),
         onRepost: () => _toggleRepost(post),
+        onReact: (emoji) => _toggleReact(post, emoji),
+        myReaction: _myReactions[post.id] ?? '',
         onReport: () => _reportPost(post),
         onComment: () => _openComments(post),
         onReply: () => _compose(replyToPost: post),                 // X-style reply → new post w/ reply_to
@@ -5353,7 +5429,23 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   // (offline / node error) so the caller keeps it queued and retries later.
   Future<bool> _sendJob(Map<String, dynamic> job) async {
     String mediaCid = '';
-    final b64 = job['mediaB64'] as String?;
+    String mediaKind = (job['mediaKind'] as String?) ?? '';
+    List<String> medias = const [];
+    // Multi-image: upload each photo to a content-addressed blob; `medias` carries them all, `media`
+    // stays = medias[0] so an older client still shows the first image.
+    final photosB64 = (job['photosB64'] as List?)?.cast<String>() ?? const <String>[];
+    if (photosB64.isNotEmpty) {
+      final cids = <String>[];
+      for (final p in photosB64) {
+        final cid = await Api.blobPut(base64Decode(p)) ?? '';
+        if (cid.isEmpty) return false;                        // any upload failing → keep the job queued
+        cids.add(cid);
+      }
+      medias = cids;
+      mediaCid = cids.first;
+      mediaKind = 'photo';
+    }
+    final b64 = job['mediaB64'] as String?;                   // a video (mutually exclusive with photos)
     if (b64 != null && b64.isNotEmpty) {
       mediaCid = await Api.blobPut(base64Decode(b64)) ?? '';
       if (mediaCid.isEmpty) return false;                     // media upload needs the network
@@ -5371,7 +5463,8 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       // (all segments share the job's single ts) collapses to one id and the reply chain breaks. +i keeps
       // order and makes each unique. (Also fixes a fast online thread posting >1 segment in the same second.)
       final id = await Api.post(segs[i], handle: postHandle, signer: signer,
-          media: i == 0 ? mediaCid : '', mediaKind: i == 0 ? (job['mediaKind'] as String? ?? '') : '',
+          media: i == 0 ? mediaCid : '', medias: i == 0 ? medias : const [],
+          mediaKind: i == 0 ? mediaKind : '',
           // first segment threads under the post being replied to (X-style reply); later segments chain
           // to the previous segment so a multi-part reply stays a self-thread under that first reply.
           quote: i == 0 ? (job['quote'] as String? ?? '') : '',
@@ -7118,6 +7211,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       'reply_to': replyToPost?.id ?? '',   // X-style reply: this post threads under replyToPost
       'mediaKind': res.mediaBytes != null ? res.mediaKind : '',
       'mediaB64': res.mediaBytes != null ? base64Encode(res.mediaBytes!) : '',
+      'photosB64': res.photos.map((b) => base64Encode(b)).toList(),   // 1..4 → a multi-image post
       'poll': res.pollOptions,
       'channel': res.channel,
     };
@@ -7133,7 +7227,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       return;
     }
 
-    if (res.mediaBytes != null && mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+    if ((res.mediaBytes != null || res.photos.isNotEmpty) && mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
         duration: Duration(milliseconds: 1200), backgroundColor: kCard, content: Text('uploading media…')));
     final ok = await _sendJob(job);
     if (!ok) {
@@ -10100,6 +10194,8 @@ class PostCard extends StatefulWidget {
   final Map<String, dynamic> engage;
   final bool liked, reposted;
   final int commentCount;
+  final String myReaction; // the emoji THIS device reacted with ('' = none)
+  final void Function(String emoji) onReact; // add/replace/remove this device's reaction
   final VoidCallback onTip, onLike, onRepost, onReport, onComment;
   final VoidCallback? onOpenProfile, onQuote, onOpenThread, onMute, onBlock, onBookmark, onPin, onDelete, onEdit, onReply, onPinProfile;
   /// Tapping an @handle or a #tag inside the body. The card cannot resolve either itself — a handle
@@ -10122,6 +10218,8 @@ class PostCard extends StatefulWidget {
       this.liked = false,
       this.reposted = false,
       this.commentCount = 0,
+      this.myReaction = '',
+      this.onReact = _noopReact,
       required this.onTip,
       this.onLike = _noop,
       this.onRepost = _noop,
@@ -10150,6 +10248,7 @@ class PostCard extends StatefulWidget {
       this.expanded = false,
       this.repostedBy = ''});
   static void _noop() {}
+  static void _noopReact(String _) {}
   @override
   State<PostCard> createState() => _PostCardState();
 }
@@ -10610,25 +10709,10 @@ class _PostCardState extends State<PostCard> {
                 return link == null ? const SizedBox.shrink() : LinkPreview(url: link);
               }),
             // photo / GIF attachment (Image.memory animates GIFs)
-            if (p.kind == 'photo' && p.media != null)
+            if (p.kind == 'photo' && p.gallery.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 10),
-                child: GestureDetector(
-                  onTap: () => Navigator.of(context).push(
-                      MaterialPageRoute(builder: (_) => PhotoScreen(cid: p.media!))),
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(16),
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 380),
-                      child: SizedBox(
-                          width: double.infinity,
-                          child: MediaImage(
-                              cid: p.media!,
-                              fit: BoxFit.cover,
-                              label: 'Photo in a post by ${p.handle}')),
-                    ),
-                  ),
-                ),
+                child: _PhotoGrid(cids: p.gallery, handle: p.handle),
               ),
             if (p.kind == 'movie' && p.media != null) _MoviePreview(post: p),
             // poll
@@ -10646,6 +10730,7 @@ class _PostCardState extends State<PostCard> {
               ),
             // (the "Show this thread" link was removed — tapping the post already opens its conversation
             // + comments, so the separate affordance was redundant.)
+            _reactionBar(),
             const SizedBox(height: 8),
             _Actions(
               reposts: (e['reposts'] ?? 0) as int,
@@ -10666,6 +10751,76 @@ class _PostCardState extends State<PostCard> {
           ]),
         ),
       ]),
+      ]),
+    );
+  }
+
+  // The reaction palette — the same six emoji DMs use, so a reaction reads the same everywhere.
+  static const _reactEmojis = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+
+  void _reactMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kBg,
+      builder: (_) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 10),
+          child: Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+            for (final e in _reactEmojis)
+              GestureDetector(
+                onTap: () { Navigator.pop(context); widget.onReact(e); },
+                child: Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: widget.myReaction == e ? kAccent.withValues(alpha: 0.20) : Colors.transparent),
+                  child: Text(e, style: const TextStyle(fontSize: 30)),
+                ),
+              ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  // Chips of a post's reactions (emoji + count), your own highlighted; tap a chip to toggle it, or the
+  // trailing ＋ to pick another. Hidden entirely until the post actually has a reaction.
+  Widget _reactionBar() {
+    final raw = (widget.engage['reactions'] as Map?) ?? const {};
+    final entries = raw.entries
+        .map((e) => MapEntry('${e.key}', ((e.value ?? 0) as num).toInt()))
+        .where((e) => e.value > 0)
+        .toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    if (entries.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Wrap(spacing: 6, runSpacing: 6, children: [
+        for (final e in entries)
+          GestureDetector(
+            onTap: () => widget.onReact(e.key),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+              decoration: BoxDecoration(
+                color: widget.myReaction == e.key ? kAccent.withValues(alpha: 0.16) : kCard,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: widget.myReaction == e.key ? kAccent : kLine),
+              ),
+              child: Text('${e.key} ${e.value}',
+                  style: TextStyle(
+                      color: widget.myReaction == e.key ? kAccent : kText,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600)),
+            ),
+          ),
+        GestureDetector(
+          onTap: () => _reactMenu(context),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+            decoration: BoxDecoration(borderRadius: BorderRadius.circular(14), border: Border.all(color: kLine)),
+            child: const Icon(Icons.add_reaction_outlined, color: kDim, size: 16),
+          ),
+        ),
       ]),
     );
   }
@@ -10692,6 +10847,13 @@ class _PostCardState extends State<PostCard> {
             subtitle: const Text('quiet replies attached under this post',
                 style: TextStyle(color: kDim, fontSize: 11)),
             onTap: () { Navigator.pop(context); widget.onComment(); },
+          ),
+          ListTile(
+            leading: const Icon(Icons.add_reaction_outlined, color: kText),
+            title: const Text('React', style: TextStyle(color: kText, fontWeight: FontWeight.w600)),
+            subtitle: const Text('add an emoji reaction to this post',
+                style: TextStyle(color: kDim, fontSize: 11)),
+            onTap: () { Navigator.pop(context); _reactMenu(context); },
           ),
           if (widget.onBookmark != null)
             ListTile(
@@ -11824,6 +11986,134 @@ class PhotoScreen extends StatelessWidget {
   }
 }
 
+/// The 1–4 image layout under a post, X-style: one fills the width, two split it, three are a big-left +
+/// two-stacked-right, four are a 2×2. Tapping any tile opens the full-screen swipeable [GalleryScreen] at
+/// that image. Corners are rounded once, on the whole grid.
+class _PhotoGrid extends StatelessWidget {
+  const _PhotoGrid({required this.cids, required this.handle});
+  final List<String> cids;
+  final String handle;
+
+  void _open(BuildContext c, int i) => Navigator.of(c).push(MaterialPageRoute(
+      builder: (_) => GalleryScreen(cids: cids, initial: i, label: 'Photo in a post by $handle')));
+
+  Widget _cell(BuildContext c, int i) => GestureDetector(
+        onTap: () => _open(c, i),
+        child: SizedBox.expand(
+          child: MediaImage(cid: cids[i], fit: BoxFit.cover, label: 'Photo ${i + 1} in a post by $handle'),
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    const gap = 3.0;
+    Widget grid;
+    if (cids.length == 1) {
+      grid = GestureDetector(
+        onTap: () => _open(context, 0),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 380),
+          child: SizedBox(
+              width: double.infinity,
+              child: MediaImage(cid: cids[0], fit: BoxFit.cover, label: 'Photo in a post by $handle')),
+        ),
+      );
+    } else if (cids.length == 2) {
+      grid = SizedBox(
+        height: 220,
+        child: Row(children: [
+          Expanded(child: _cell(context, 0)),
+          const SizedBox(width: gap),
+          Expanded(child: _cell(context, 1)),
+        ]),
+      );
+    } else if (cids.length == 3) {
+      grid = SizedBox(
+        height: 260,
+        child: Row(children: [
+          Expanded(child: _cell(context, 0)),
+          const SizedBox(width: gap),
+          Expanded(
+              child: Column(children: [
+            Expanded(child: _cell(context, 1)),
+            const SizedBox(height: gap),
+            Expanded(child: _cell(context, 2)),
+          ])),
+        ]),
+      );
+    } else {
+      grid = SizedBox(
+        height: 300,
+        child: Column(children: [
+          Expanded(
+              child: Row(children: [
+            Expanded(child: _cell(context, 0)),
+            const SizedBox(width: gap),
+            Expanded(child: _cell(context, 1)),
+          ])),
+          const SizedBox(height: gap),
+          Expanded(
+              child: Row(children: [
+            Expanded(child: _cell(context, 2)),
+            const SizedBox(width: gap),
+            Expanded(child: _cell(context, 3)),
+          ])),
+        ]),
+      );
+    }
+    return ClipRRect(borderRadius: BorderRadius.circular(16), child: grid);
+  }
+}
+
+/// Full-screen swipeable viewer for a post's images: pinch-zoom each, swipe between, with an "n / m"
+/// counter. A single image behaves exactly like the old PhotoScreen.
+class GalleryScreen extends StatefulWidget {
+  const GalleryScreen({super.key, required this.cids, this.initial = 0, this.label = 'Photo'});
+  final List<String> cids;
+  final int initial;
+  final String label;
+  @override
+  State<GalleryScreen> createState() => _GalleryScreenState();
+}
+
+class _GalleryScreenState extends State<GalleryScreen> {
+  late final PageController _pc = PageController(initialPage: widget.initial);
+  late int _i = widget.initial;
+
+  @override
+  void dispose() {
+    _pc.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        title: widget.cids.length > 1
+            ? Text('${_i + 1} / ${widget.cids.length}', style: const TextStyle(fontSize: 15))
+            : null,
+      ),
+      body: PageView.builder(
+        controller: _pc,
+        onPageChanged: (i) => setState(() => _i = i),
+        itemCount: widget.cids.length,
+        itemBuilder: (_, i) => Center(
+          child: InteractiveViewer(
+            minScale: 1,
+            maxScale: 6,
+            child: MediaImage(cid: widget.cids[i], fit: BoxFit.contain, label: widget.label),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // FLAG_SECURE gate (native, via MainActivity). Blocks OS screenshots + screen recording + the recents
 // thumbnail while a disappearing photo is on screen. NOT camera-proof — nothing an app does can be.
 class SecureScreen {
@@ -12564,11 +12854,13 @@ class ComposeResult {
   final String quote;
   final String title;
   final List<String> pollOptions; // non-empty → a poll (segments.first is the question)
-  final Uint8List? mediaBytes;    // an attached photo/GIF/video (goes on the first post)
-  final String mediaKind;         // 'photo' or 'movie'
+  final Uint8List? mediaBytes;    // an attached VIDEO (goes on the first post; photos use `photos`)
+  final String mediaKind;         // 'movie' for a video; photos are carried in `photos`
+  final List<Uint8List> photos;   // 1..4 attached photos → a multi-image post (mutually exclusive w/ video)
   final String channel;           // publish under this channel identity (name); '' = as yourself
   ComposeResult(this.segments, this.quote,
-      {this.title = '', this.pollOptions = const [], this.mediaBytes, this.mediaKind = '', this.channel = ''});
+      {this.title = '', this.pollOptions = const [], this.mediaBytes, this.mediaKind = '',
+       this.photos = const [], this.channel = ''});
 }
 
 class ComposeSheet extends StatefulWidget {
@@ -12589,14 +12881,16 @@ class _ComposeSheetState extends State<ComposeSheet> {
   final List<TextEditingController> _pollOpts = [TextEditingController(), TextEditingController()];
   bool _article = false, _poll = false;
   bool _preview = false;    // article composer: show the rendered body (Markdown/HTML) below the editor
-  Uint8List? _mediaBytes;   // attached photo/GIF/video
-  String _mediaKind = '';   // 'photo' | 'movie'
+  Uint8List? _mediaBytes;   // attached VIDEO only ('movie'); photos live in _photos
+  String _mediaKind = '';   // 'movie' when a video is attached
+  final List<Uint8List> _photos = [];   // 1..4 attached photos → a multi-image post
+  static const int kMaxPhotos = 4;
   final _picker = ImagePicker();
 
   bool get _isQuote => widget.quotedPost != null;
   bool get _isReply => widget.replyToPost != null;
   bool get _isThread => _cs.length > 1;
-  bool get _hasMedia => _mediaBytes != null;
+  bool get _hasMedia => _mediaBytes != null || _photos.isNotEmpty;
 
   bool _compressing = false;
 
@@ -12703,7 +12997,26 @@ class _ComposeSheetState extends State<ComposeSheet> {
     ]);
   }
 
+  void _snack(String m) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(backgroundColor: kCard, content: Text(m)));
+  }
+
   Future<void> _attach(bool video) async {
+    // A post carries EITHER one video OR up to four photos — not both. Guard the incompatible cases with
+    // a clear reason rather than silently ignoring the pick.
+    if (video && _photos.isNotEmpty) {
+      _snack('Remove the photos to attach a video.');
+      return;
+    }
+    if (!video && _mediaBytes != null) {
+      _snack('Remove the video to attach photos.');
+      return;
+    }
+    if (!video && _photos.length >= kMaxPhotos) {
+      _snack('You can attach up to $kMaxPhotos photos.');
+      return;
+    }
     final x = video
         ? await _picker.pickVideo(source: ImageSource.gallery)
         : await _picker.pickImage(source: ImageSource.gallery, imageQuality: 88, maxWidth: 1600);
@@ -12741,7 +13054,14 @@ class _ComposeSheetState extends State<ComposeSheet> {
           content: Text('$what is $mb MB — the limit is $capMb MB. $tip')));
       return;
     }
-    setState(() { _mediaBytes = bytes; _mediaKind = video ? 'movie' : 'photo'; });
+    setState(() {
+      if (video) {
+        _mediaBytes = bytes;
+        _mediaKind = 'movie';
+      } else {
+        _photos.add(bytes);   // append — up to kMaxPhotos, guarded above
+      }
+    });
   }
 
   @override
@@ -12778,7 +13098,7 @@ class _ComposeSheetState extends State<ComposeSheet> {
         _article ? [segs.first] : segs, // an article is a single long-form post
         _isQuote ? widget.quotedPost!.id : '',
         title: _article ? _titleCtl.text.trim() : '',
-        mediaBytes: _mediaBytes, mediaKind: _mediaKind,
+        mediaBytes: _mediaBytes, mediaKind: _mediaKind, photos: List.of(_photos),
         channel: _article ? _asChannel : ''));   // articles can be published under a channel
   }
 
@@ -12947,20 +13267,19 @@ class _ComposeSheetState extends State<ComposeSheet> {
                       },
                     ),
                   ),
-                if (_hasMedia) Padding(
+                // A video preview (single) …
+                if (_mediaBytes != null) Padding(
                   padding: const EdgeInsets.only(left: 52, top: 8),
                   child: Stack(children: [
                     ClipRRect(
                       borderRadius: BorderRadius.circular(14),
-                      child: _mediaKind == 'photo'
-                          ? Image.memory(_mediaBytes!, width: double.infinity, height: 180, fit: BoxFit.cover)
-                          : Container(
-                              height: 120, width: double.infinity, color: kCard,
-                              child: const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-                                Icon(Icons.movie_outlined, color: kDim, size: 30),
-                                SizedBox(height: 6),
-                                Text('video attached', style: TextStyle(color: kDim, fontSize: 13)),
-                              ]))),
+                      child: Container(
+                          height: 120, width: double.infinity, color: kCard,
+                          child: const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                            Icon(Icons.movie_outlined, color: kDim, size: 30),
+                            SizedBox(height: 6),
+                            Text('video attached', style: TextStyle(color: kDim, fontSize: 13)),
+                          ]))),
                     ),
                     Positioned(right: 6, top: 6, child: GestureDetector(
                       onTap: () => setState(() { _mediaBytes = null; _mediaKind = ''; }),
@@ -12969,6 +13288,36 @@ class _ComposeSheetState extends State<ComposeSheet> {
                         decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.6), shape: BoxShape.circle),
                         child: const Icon(Icons.close, color: Colors.white, size: 18)),
                     )),
+                  ]),
+                ),
+                // … or a row of 1–4 photo thumbnails, each removable.
+                if (_photos.isNotEmpty) Padding(
+                  padding: const EdgeInsets.only(left: 52, top: 8),
+                  child: Wrap(spacing: 8, runSpacing: 8, children: [
+                    for (int i = 0; i < _photos.length; i++)
+                      Stack(children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Image.memory(_photos[i], width: 92, height: 92, fit: BoxFit.cover),
+                        ),
+                        Positioned(right: 3, top: 3, child: GestureDetector(
+                          onTap: () => setState(() => _photos.removeAt(i)),
+                          child: Container(
+                            padding: const EdgeInsets.all(3),
+                            decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.6), shape: BoxShape.circle),
+                            child: const Icon(Icons.close, color: Colors.white, size: 15)),
+                        )),
+                      ]),
+                    if (_photos.length < kMaxPhotos)
+                      GestureDetector(
+                        onTap: () => _attach(false),
+                        child: Container(
+                          width: 92, height: 92,
+                          decoration: BoxDecoration(
+                              color: kCard, borderRadius: BorderRadius.circular(12), border: Border.all(color: kLine)),
+                          child: const Icon(Icons.add_photo_alternate_outlined, color: kDim, size: 26),
+                        ),
+                      ),
                   ]),
                 ),
                 if (_isQuote) Padding(

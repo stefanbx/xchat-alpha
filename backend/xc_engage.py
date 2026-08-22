@@ -26,6 +26,11 @@ def like(post_id, delta):
     post('/like', {'post_id': post_id, 'delta': int(delta)})
     return {"ok": True}
 
+def react(post_id, emoji, delta):
+    # Per-emoji reaction counters, in the same DISPLAY-counter class as likes (unsigned, anyone can bump).
+    post('/react', {'post_id': post_id, 'emoji': str(emoji), 'delta': int(delta)})
+    return {"ok": True}
+
 def repost(rec):
     # rec is the app-SIGNED reshare record {post_id, delta, account, ts, sig, pub}; the relay verifies the
     # signature before crediting a resharer (a reshare earns a tip split), so the node only forwards it.
@@ -67,11 +72,13 @@ def get():
         if not e:
             continue
         for pid, v in e.items():
-            a = agg.setdefault(pid, {'likes': 0, 'tips_raw': 0, 'reposts': 0, 'views': 0, 'resharers': []})
+            a = agg.setdefault(pid, {'likes': 0, 'tips_raw': 0, 'reposts': 0, 'views': 0, 'resharers': [], 'reactions': {}})
             a['likes'] = max(a['likes'], v.get('likes', 0))
             a['tips_raw'] = max(a['tips_raw'], v.get('tips_raw', 0))
             a['reposts'] = max(a['reposts'], v.get('reposts', 0))
             a['views'] = max(a['views'], v.get('views', 0))
+            for emo, cnt in (v.get('reactions') or {}).items():
+                a['reactions'][emo] = max(a['reactions'].get(emo, 0), int(cnt))
             for who in (v.get('resharers') or []):     # union, earliest-first preserved
                 if who not in a['resharers']:
                     a['resharers'].append(who)

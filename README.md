@@ -24,11 +24,13 @@ seed** — and post.  ·  **Read the design** → [`docs/WHITEPAPER.md`](docs/WH
 - 🛰️ **Discovery is on-ledger.** Relays self-announce on XNO; the app finds them by scanning keyless, plural rendezvous accounts. No relay URL is hardcoded — [verify it yourself](#verify-discovery-yourself).
 - ⚡ **Money is Nano.** Only tips touch the chain — batched, feeless, non-custodial, signed on-device. A billion posts cost zero ledger growth.
 - 📦 **Self-delivering.** Updates are signed, content-addressed, pinned across the relays, and hash-verified on-device before an explicit-tap install.
+- 💬 **A real client, not a demo.** Feed with threads, quotes, reposts, likes and **emoji reactions**, tips, polls, **multi-image posts**, **rich-HTML long-form articles**, channels, edit/delete, and **end-to-end encrypted DMs** — in the Android app *or* the browser.
 
-> **Alpha, on mainnet.** Research software — it moves no money on your behalf; you hold your keys.
+> **Public beta, on mainnet.** Research software — it moves no money on your behalf; you hold your keys.
 > Only tip amounts you can afford to lose, and **back up your wallet seed** (it is the *only*
-> recovery). Android-only today; one small hosted node + a couple of relays, so expect rough edges.
-> See [§11 of the whitepaper](docs/WHITEPAPER.md) for an honest done-vs-building breakdown.
+> recovery). Runs as an Android app or a browser web client; one small hosted node + a couple of
+> relays, so expect rough edges. See [§11 of the whitepaper](docs/WHITEPAPER.md) for an honest
+> done-vs-building breakdown.
 
 ---
 
@@ -45,12 +47,12 @@ seed** — and post.  ·  **Read the design** → [`docs/WHITEPAPER.md`](docs/WH
 
 ## Install the app
 
-Download `apk/xchat-alpha.apk` (**v2.5.5**) onto an Android phone and open it (allow "install from
+Download `apk/xchat-alpha.apk` (**v2.5.9**) onto an Android phone and open it (allow "install from
 this source" once). **Verify it first:**
 
 ```
 sha256sum xchat-alpha.apk
-# expected: 23658971ba110b867d93087fa49fc378516786541fba5242fbc2d349be2ccb47
+# expected: 097729adfdc21504a0f3691cc4c369b82c72505f9d989d1f62bfa8e0c7c2832a
 ```
 
 Signing certificate SHA-256: `d3c83e1a08edc6339a95489bce6cd017e10c921272af15429aa07a9919b7788e`
@@ -59,7 +61,7 @@ Signing certificate SHA-256: `d3c83e1a08edc6339a95489bce6cd017e10c921272af15429a
 signed by the same certificate, so this fingerprint is what ties every future release to this one.
 
 On first launch, **Create a new wallet** (write down the seed — it *is* your account) or restore
-an existing seed — and you're on the network. Out of the box the app connects to a **hosted alpha
+an existing seed — and you're on the network. Out of the box the app connects to a **hosted beta
 node** (`https://xchat-alpha-node.fly.dev`, reading **mainnet** for discovery) so you can try it
 immediately; to be fully self-sovereign, **run your own node** (below) and repoint in
 **Settings → Connection**. Once updates land in-app, the app re-verifies each release's SHA-256
@@ -210,7 +212,7 @@ needs `dart` on PATH and an `ipfs` daemon.)
 
 ## Security & honesty
 
-- **Alpha quality.** Don't put anything you can't afford to lose on it.
+- **Beta quality.** Don't put anything you can't afford to lose on it.
 - The app **never** sends money on your behalf; tips and any settlement are user-initiated and
   go directly wallet-to-wallet.
 - **The node cannot act as you.** It holds no seed; every write is signed on the device and the

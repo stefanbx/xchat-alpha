@@ -1,1 +1,1 @@
-ӾChat 2.5.8 is live — channel articles now render rich HTML (tables, callouts, alignment, colour), plus a fix so Report is back on every post. Tap to update.
+ӾChat 2.5.9 is live — emoji reactions on posts, multi-image posts (up to 4, with a swipeable gallery), and ӾChat is now in public beta. Tap to update.

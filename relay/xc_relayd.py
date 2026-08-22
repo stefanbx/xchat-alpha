@@ -250,7 +250,7 @@ def _cap_dict(d, maxn):
         d.pop(next(iter(d)), None)
 
 def engage_for(pid):
-    e = engage.setdefault(pid, {'likes': 0, 'tips_raw': 0, 'reposts': 0})
+    e = engage.setdefault(pid, {'likes': 0, 'tips_raw': 0, 'reposts': 0, 'reactions': {}})
     _cap_dict(engage, ENGAGE_MAX)                # bound distinct post_ids (was unbounded → OOM)
     return e
 
@@ -2016,6 +2016,18 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({'ok': True, 'likes': e['likes']}))
             except Exception as ex:
                 self._send(400, json.dumps({'ok': False, 'error': str(ex)}))
+        elif self.path.startswith('/react'):
+            try:
+                m = json.loads(raw)
+                e = engage_for(m['post_id']); rx = e.setdefault('reactions', {})
+                emo = str(m.get('emoji', ''))[:8]
+                if emo:
+                    rx[emo] = max(0, int(rx.get(emo, 0)) + int(m.get('delta', 1)))
+                    if rx[emo] == 0:
+                        rx.pop(emo, None)
+                self._send(200, json.dumps({'ok': True, 'reactions': e.get('reactions', {})}))
+            except Exception:
+                self._send(400, json.dumps({'ok': False}))
         elif self.path.startswith('/repost'):
             # A reshare is MONEY-BEARING: the earliest resharer of a post earns a slice (the reposter
             # split) of every tip to it. So the relay VERIFIES a SIGNED reshare event here — otherwise an
