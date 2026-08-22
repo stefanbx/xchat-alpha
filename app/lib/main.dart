@@ -9255,9 +9255,13 @@ class _DmChatScreenState extends State<DmChatScreen> {
                     color: _emoji ? kAccent : kDim),
                 tooltip: _emoji ? 'Keyboard' : 'Emoji',
               ),
-              // Tap = normal photo; long-press = a disappearing (view-once) photo. Keeps the common
-              // path one tap while giving the ephemeral option a discoverable home + a hint.
-              GestureDetector(
+              // Tap = normal photo; long-press = a disappearing (view-once) photo. An InkWell (not an
+              // IconButton) so the long-press reaches us — IconButton's own long-press shows its tooltip
+              // and would swallow the gesture. Keeps the common path one tap; the ephemeral option gets a
+              // discoverable home + a hint.
+              InkWell(
+                borderRadius: BorderRadius.circular(24),
+                onTap: _sending ? null : () => _sendImage(),
                 onLongPress: _sending
                     ? null
                     : () {
@@ -9266,10 +9270,9 @@ class _DmChatScreenState extends State<DmChatScreen> {
                             content: Text('Disappearing photo — deletes after they open it once')));
                         _sendImage(once: true);
                       },
-                child: IconButton(
-                  onPressed: _sending ? null : () => _sendImage(),
-                  icon: Icon(Icons.image_outlined, color: _sending ? kLine : kDim),
-                  tooltip: 'Photo · long-press for a disappearing one',
+                child: Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: Icon(Icons.image_outlined, color: _sending ? kLine : kDim),
                 ),
               ),
               Expanded(
