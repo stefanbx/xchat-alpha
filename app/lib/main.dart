@@ -390,6 +390,16 @@ class BlockStore {
       (await SharedPreferences.getInstance()).setStringList(_k, s.toList());
 }
 
+// Hidden words (Threads-style): a private, on-device list of words/phrases. Any feed post whose text
+// contains one is filtered out for this viewer only — nothing is published.
+class MutedWordsStore {
+  static const _k = 'xchat_muted_words';
+  static Future<List<String>> get() async =>
+      (await SharedPreferences.getInstance()).getStringList(_k) ?? <String>[];
+  static Future<void> save(List<String> w) async =>
+      (await SharedPreferences.getInstance()).setStringList(_k, w);
+}
+
 // private, on-device bookmarks — a list of saved post ids. Client-side only (like X bookmarks,
 // which are private); nothing is published, so your reading list stays yours.
 class BookmarkStore {
@@ -3182,6 +3192,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   Map<String, dynamic> _engage = {}; // post_id -> {likes, reposts, tips_raw}
   final Set<String> _liked = {}, _reposted = {}, _reported = {};
   Set<String> _muted = {}, _blocked = {}; // per-viewer moderation (accounts)
+  List<String> _mutedWords = [];          // hidden words — posts containing one are filtered (viewer-only)
   Set<String> _bookmarks = {}; // saved post ids (private, on-device)
   final Set<String> _viewed = {}; // ids counted as viewed this session (dedup)
   final Map<String, int> _commentCount = {}; // post_id -> comment count (lazy)
@@ -3222,6 +3233,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     _initProfile();
     MuteStore.get().then((m) { if (mounted) setState(() => _muted = m); });
     BlockStore.get().then((b) { if (mounted) setState(() => _blocked = b); });
+    MutedWordsStore.get().then((w) { if (mounted) setState(() => _mutedWords = w); });
     BookmarkStore.get().then((b) { if (mounted) setState(() => _bookmarks = b); });
     // per-device engagement memory — so a view/like is counted once per device, not re-sent each launch
     EngageStore.liked().then((s) { if (mounted) setState(() => _liked.addAll(s)); });
@@ -3522,10 +3534,40 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     // settle can fail). The creator is notified at SETTLE (see _settle / _maybeAutoSettle), when a real
     // Nano block actually lands.
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        duration: const Duration(milliseconds: 1200),
+        duration: const Duration(seconds: 4),
         backgroundColor: kCard,
-        content: Text('◈ +${fmtXno(amt)} XNO tallied off-chain — no network, no block')));
+        content: Text('◈ +${fmtXno(amt)} XNO tallied off-chain — no network, no block'),
+        // Undo is safe HERE because a tip is only a pledge until it settles — and auto-settle is fired
+        // right after, so the window is exactly while it's still pending. `_untip` refuses once settled.
+        action: SnackBarAction(label: 'Undo', textColor: kAccent, onPressed: () => _untip(p, amt))));
     _maybeAutoSettle(p.account, p.handle);
+  }
+
+  // Undo a tip that hasn't settled on-chain yet — a mistap or a change of mind. It just removes the
+  // off-chain pledge from `_pending` (and the local tip display); nothing left the wallet until settle,
+  // so there's nothing to claw back. Once settled (real XNO sent), it's irreversible — say so.
+  void _untip(Post p, double amt) {
+    final pending = _pending[p.account] ?? 0;
+    if (pending < amt - 1e-9) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          backgroundColor: kCard,
+          content: Text("too late to undo — this tip already settled on-chain")));
+      return;
+    }
+    setState(() {
+      final rem = pending - amt;
+      if (rem <= 1e-9) {
+        _pending.remove(p.account);
+      } else {
+        _pending[p.account] = rem;
+      }
+      _bumpEngage(p.id, 'tips_xno', -amt);   // pull it back out of this post's tally display
+    });
+    Api.tipstat(p.id, '-${_rawOf(amt)}');     // best-effort decrement of the network counter
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: kCard,
+        duration: const Duration(milliseconds: 1400),
+        content: Text('↩ tip undone — ${fmtXno(amt)} XNO not tallied')));
   }
 
   // fire an on-chain settlement automatically ONLY within the user-consented policy
@@ -3912,6 +3954,21 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                             style: const TextStyle(color: kText, fontSize: 14, fontWeight: FontWeight.w600))),
                         Text('${fmtXno(e.value)} XNO',
                             style: const TextStyle(color: kAccent, fontWeight: FontWeight.w700, fontSize: 14)),
+                        // Undo this whole pending tally — a change of mind before it settles on-chain.
+                        // Nothing has moved yet, so it just drops the pledge.
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          icon: const Icon(Icons.undo, size: 18, color: kDim),
+                          tooltip: 'Undo tip',
+                          onPressed: () {
+                            final amt = e.value;
+                            setState(() => _pending.remove(e.key));   // drop the pledge (FeedScreen state)
+                            setSheet(() {});                           // rebuild the sheet list
+                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                                backgroundColor: kCard, duration: const Duration(milliseconds: 1500),
+                                content: Text('↩ undone — ${fmtXno(amt)} XNO not tallied')));
+                          },
+                        ),
                       ]),
                     )),
                 const Divider(color: kLine, height: 22),
@@ -4034,6 +4091,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
             _follows.contains(p.account) &&
             !_reported.contains(p.id) &&
             !_hidden(p.account) &&
+            !_hasMutedWord(p) &&
             !_channelAccounts.contains(p.account) && // channels have their own tab
             p.replyTo == null)
         .toList();
@@ -4059,10 +4117,22 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     return engagement * engW[f] + recency * recW[f] + affinity + (p.account == _account ? 0.5 : 0);
   }
 
-  // ranked feed across everyone (minus muted/blocked/reported), highest score first
+  // A post is filtered if it contains one of the viewer's hidden words (Threads-style, viewer-only).
+  bool _hasMutedWord(Post p) {
+    if (_mutedWords.isEmpty) return false;
+    final t = '${p.text} ${p.title ?? ''}'.toLowerCase();
+    for (final w in _mutedWords) {
+      final ww = w.trim().toLowerCase();
+      if (ww.isNotEmpty && t.contains(ww)) return true;
+    }
+    return false;
+  }
+
+  // ranked feed across everyone (minus muted/blocked/reported/hidden-words), highest score first
   List<Post> _forYouPosts() {
     final list = _posts
         .where((p) => !_reported.contains(p.id) && !_hidden(p.account) && p.replyTo == null &&
+            !_hasMutedWord(p) &&
             !_channelAccounts.contains(p.account)) // channels live in the Channels tab, not the feed
         .toList();
     list.sort((a, b) => _score(b).compareTo(_score(a)));
@@ -5072,6 +5142,67 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     )));
   }
 
+  // Manage hidden words (Threads-style): add/remove words that filter posts from your feed.
+  void _manageHiddenWords() {
+    final ctl = TextEditingController();
+    showModalBottomSheet(
+      context: context, backgroundColor: kBg, isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setSheet) {
+        void add() {
+          final w = ctl.text.trim();
+          if (w.isEmpty || _mutedWords.contains(w)) { ctl.clear(); return; }
+          setState(() => _mutedWords = [..._mutedWords, w]);
+          MutedWordsStore.save(_mutedWords);
+          ctl.clear(); setSheet(() {});
+        }
+        return Padding(
+          padding: EdgeInsets.fromLTRB(18, 16, 18, 22 + MediaQuery.of(ctx).viewInsets.bottom),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Hidden words', style: TextStyle(color: kText, fontWeight: FontWeight.w800, fontSize: 17)),
+            const SizedBox(height: 4),
+            const Text('Posts containing any of these are hidden from your feed — private, on-device.',
+                style: TextStyle(color: kDim, fontSize: 12)),
+            const SizedBox(height: 12),
+            Row(children: [
+              Expanded(
+                child: TextField(
+                  controller: ctl, onSubmitted: (_) => add(), style: const TextStyle(color: kText),
+                  decoration: const InputDecoration(
+                      hintText: 'Add a word or phrase', hintStyle: TextStyle(color: kDim),
+                      filled: true, fillColor: kCard,
+                      border: OutlineInputBorder(borderSide: BorderSide.none)),
+                ),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                  onPressed: add,
+                  style: FilledButton.styleFrom(backgroundColor: kAccent, foregroundColor: Colors.black),
+                  child: const Text('Add', style: TextStyle(fontWeight: FontWeight.w700))),
+            ]),
+            const SizedBox(height: 14),
+            if (_mutedWords.isEmpty)
+              const Padding(padding: EdgeInsets.symmetric(vertical: 16),
+                  child: Text('No hidden words yet.', style: TextStyle(color: kDim)))
+            else
+              Wrap(spacing: 8, runSpacing: 8, children: [
+                for (final w in _mutedWords)
+                  Chip(
+                    backgroundColor: kCard, label: Text(w, style: const TextStyle(color: kText)),
+                    deleteIconColor: kDim,
+                    side: const BorderSide(color: kLine),
+                    onDeleted: () {
+                      setState(() => _mutedWords = _mutedWords.where((x) => x != w).toList());
+                      MutedWordsStore.save(_mutedWords);
+                      setSheet(() {});
+                    },
+                  ),
+              ]),
+          ]),
+        );
+      }),
+    );
+  }
+
   // Report = a trust-scoped, reversible flag (NOT a dislike/downvote). Feeds moderation.
   void _reportPost(Post p) {
     setState(() => _reported.add(p.id));                 // hide on this device immediately
@@ -5664,6 +5795,14 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
               subtitle: const Text('privately saved posts · on-device', style: TextStyle(color: kDim, fontSize: 12)),
               trailing: Text('${_bookmarks.length}', style: const TextStyle(color: kDim, fontSize: 13)),
               onTap: () { Navigator.pop(ctx); _openBookmarks(); },
+            ),
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.visibility_off_outlined, color: kText, size: 20),
+              title: const Text('Hidden words', style: TextStyle(color: kText, fontWeight: FontWeight.w700, fontSize: 15)),
+              subtitle: const Text('hide posts containing certain words · on-device', style: TextStyle(color: kDim, fontSize: 12)),
+              trailing: Text('${_mutedWords.length}', style: const TextStyle(color: kDim, fontSize: 13)),
+              onTap: () { Navigator.pop(ctx); _manageHiddenWords(); },
             ),
             ListTile(
               contentPadding: EdgeInsets.zero,
@@ -7206,6 +7345,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
               : _tab == 2
                   ? DiscoverScreen(
                       initialQuery: _discoverQ,
+                      myAccount: _account,
                       posts: _posts.where((p) => !_hidden(p.account)).toList(),
                       authors: _authors(),
                       follows: _follows,
@@ -9724,6 +9864,7 @@ class DiscoverScreen extends StatefulWidget {
   final Map<String, dynamic> engage;
   final void Function(String account) onToggleFollow;
   final String? initialQuery;      // set when arriving from a tapped mention or hashtag
+  final String myAccount;          // exclude self from "who to follow"
   final double Function(String account) pendingOf;
   final int Function(String postId) commentCountOf;
   final void Function(Post) onTipPost, onLikePost, onRepostPost, onReportPost, onCommentPost;
@@ -9731,6 +9872,7 @@ class DiscoverScreen extends StatefulWidget {
   const DiscoverScreen(
       {super.key,
       this.initialQuery,
+      this.myAccount = '',
       required this.posts,
       required this.authors,
       required this.follows,
@@ -9799,6 +9941,13 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
                 p.handle.toLowerCase().contains(q) ||
                 (p.title ?? '').toLowerCase().contains(q))
             .toList();
+    final trending = q.isEmpty ? _trending() : const <MapEntry<String, int>>[];
+    final whoToFollow = q.isEmpty
+        ? people
+            .where((a) => !widget.follows.contains(a['account']) && a['account'] != widget.myAccount)
+            .take(8)
+            .toList()
+        : const <Map<String, String>>[];
     return Column(children: [
       Padding(
         padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
@@ -9819,9 +9968,32 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
       ),
       Expanded(
         child: ListView(children: [
-          _section(q.isEmpty ? 'People · top earners' : 'People (${people.length})'),
-          ...people.map((a) => _person(a['account']!, a['handle']!)),
-          if (q.isNotEmpty) ...[
+          if (q.isEmpty) ...[
+            if (trending.isNotEmpty) ...[
+              _section('Trending'),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 2, 12, 4),
+                child: Wrap(spacing: 8, runSpacing: 8, children: [
+                  for (final t in trending)
+                    ActionChip(
+                      backgroundColor: kCard,
+                      side: const BorderSide(color: kLine),
+                      label: Text('#${t.key}  ${t.value}',
+                          style: const TextStyle(color: kAccent, fontWeight: FontWeight.w600, fontSize: 13)),
+                      onPressed: () { _c.text = '#${t.key}'; setState(() => _q = '#${t.key}'); },
+                    ),
+                ]),
+              ),
+            ],
+            if (whoToFollow.isNotEmpty) ...[
+              _section('Who to follow'),
+              ...whoToFollow.map((a) => _person(a['account']!, a['handle']!)),
+            ],
+            _section('Top earners'),
+            ...people.map((a) => _person(a['account']!, a['handle']!)),
+          ] else ...[
+            _section('People (${people.length})'),
+            ...people.map((a) => _person(a['account']!, a['handle']!)),
             _section('Posts (${posts.length})'),
             ...posts.map((p) => _card(p)),
             if (posts.isEmpty)
@@ -9833,6 +10005,20 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
         ]),
       ),
     ]);
+  }
+
+  // Top hashtags across the loaded feed — a lightweight, client-side "Trending" (no backend needed).
+  List<MapEntry<String, int>> _trending() {
+    final counts = <String, int>{};
+    final re = RegExp(r'#([A-Za-z0-9_]{2,30})');
+    for (final p in widget.posts) {
+      for (final m in re.allMatches(p.text)) {
+        final tag = m.group(1)!.toLowerCase();
+        counts[tag] = (counts[tag] ?? 0) + 1;
+      }
+    }
+    final out = counts.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+    return out.take(10).toList();
   }
 
   Widget _section(String t) => Padding(
