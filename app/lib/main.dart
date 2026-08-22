@@ -30,6 +30,7 @@ import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:crypto/crypto.dart' show sha256;
 import 'package:url_launcher/url_launcher.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';   // QR scan → autofill a Nano address in Send
 import 'body.dart';
 import 'wallet.dart';
 import 'mesh.dart';
@@ -39,6 +40,14 @@ import 'ledger_discovery.dart';
 // 10.0.2.2. Runtime-configurable (Settings → Connection) so the app can point at a hosted
 // relay (e.g. a Fly.io node) — that's how a physical phone + an emulator share one network.
 const String kDefaultBase = 'https://xchat-alpha-node.fly.dev'; // hosted alpha node (run your own + repoint in Settings)
+
+// The "key" live avatar is the keyholder's mark, reserved to this account. The picker hides it from
+// everyone else and the node rejects a `live:key` profile from any other account (xc_profile.py); this
+// is the last line — every viewer's app downgrades a non-owner's `live:key` to 'orbit' on render, so a
+// hand-crafted profile can never wear the key on anyone's screen.
+const String kKeyholderAccount = 'nano_1egg8kim6cw4dktmrttwno5hrcwwtey7c4i15xy1iwi8ixw1156881kkbhs3';
+String liveStyleFor(String style, String account) =>
+    (style == 'key' && account != kKeyholderAccount) ? 'orbit' : style;
 String kBase = kDefaultBase;
 
 // Preferred endpoint for delegated proof-of-work (tip settlement, sends). A node that advertises
@@ -167,7 +176,7 @@ Future<void> resolveWorkBase() async {
 // seed. Set as soon as the seed is known (RootGate), used by the Api layer below.
 NanoWallet? gWallet;
 const String kGw = 'http://10.0.2.2:8080/ipfs/';
-const String kAppVersion = '2.5.9'; // this build; the update checker compares against the signed release.
+const String kAppVersion = '2.5.10'; // this build; the update checker compares against the signed release.
 // 2.3.0: HARD signing-format break (issue #2) — domain-tagged, length-prefixed signature preimage
 // (see NanoWallet.sigCanon / node xc_common.sig_canon). Signatures from 2.2.x no longer verify, so
 // heads/comments/follows/profiles/polls/dm-keys must be re-published from this build onward.
@@ -2926,7 +2935,7 @@ class AuthorAvatar extends StatelessWidget {
         ProfileCache.I.ensure(account);
         final cid = ProfileCache.I.avatarCid(account);
         final Widget avatar = (cid != null && cid.startsWith('live:'))
-            ? LiveAvatar(style: cid.substring(5), radius: radius)   // animated, code-drawn avatar
+            ? LiveAvatar(style: liveStyleFor(cid.substring(5), account), radius: radius)   // animated, code-drawn
             : cid != null
                 ? ClipOval(
                     child: SizedBox(
@@ -3003,8 +3012,7 @@ class _LiveAvatarState extends State<LiveAvatar> with SingleTickerProviderStateM
       width: d, height: d,
       child: AnimatedBuilder(
         animation: _c,
-        builder: (_, __) => CustomPaint(
-            painter: widget.style == 'key' ? _KeyPainter(_c.value) : _OrbitPainter(_c.value)),
+        builder: (_, __) => CustomPaint(painter: _liveAvatarPainter(widget.style, _c.value)),
       ),
     );
   }
@@ -3083,6 +3091,144 @@ class _KeyPainter extends CustomPainter {
   }
   @override
   bool shouldRepaint(_KeyPainter old) => old.t != t;
+}
+
+// Big googly eyes — the shared goofy motif. Two white ovals with a black pupil that looks around.
+void _googly(Canvas c, Offset ctr, double r, {double lookX = 0, double lookY = 0, double blink = 1}) {
+  final er = r * 0.34, gap = r * 0.42;
+  for (final s in const [-1.0, 1.0]) {
+    final e = ctr + Offset(s * gap, -r * 0.20);
+    c.drawOval(Rect.fromCenter(center: e, width: er * 2, height: er * 2 * blink),
+        Paint()..color = Colors.white);
+    c.drawOval(Rect.fromCenter(center: e, width: er * 2, height: er * 2 * blink),
+        Paint()..style = PaintingStyle.stroke..strokeWidth = r * 0.06..color = Colors.black45);
+    if (blink > 0.35) {
+      final p = e + Offset(lookX * er * 0.7, lookY * er * 0.7);
+      c.drawCircle(p, er * 0.5, Paint()..color = const Color(0xFF0C1012));
+    }
+  }
+}
+
+void _liveDisc(Canvas c, Offset ctr, double r) {
+  c.drawCircle(ctr, r, Paint()..color = const Color(0xFF0B1A22));                 // dark disc
+  c.drawCircle(ctr, r - 1, Paint()                                               // faint teal rim
+    ..style = PaintingStyle.stroke..strokeWidth = 1..color = const Color(0xFF14E0C8).withValues(alpha: 0.22));
+}
+
+// "Coin": the Ӿ mark on a teal-green coin, flipping like a spun coin (horizontal rotation).
+class _CoinPainter extends CustomPainter {
+  final double t; _CoinPainter(this.t);
+  @override
+  void paint(Canvas c, Size size) {
+    final ctr = size.center(Offset.zero); final r = size.width / 2;
+    _liveDisc(c, ctr, r);
+    c.save(); c.translate(ctr.dx, ctr.dy);
+    c.scale(math.cos(2 * math.pi * t).abs().clamp(0.14, 1.0), 1.0);
+    c.drawCircle(Offset.zero, r * 0.8, Paint()..color = const Color(0xFF1CCEA8));
+    c.drawOval(Rect.fromCenter(center: Offset(0, -r * 0.28), width: r * 1.1, height: r * 0.7),
+        Paint()..color = Colors.white.withValues(alpha: 0.16));
+    final xr = r * 0.4;
+    final pen = Paint()..color = Colors.white..strokeWidth = r * 0.14..strokeCap = StrokeCap.round;
+    c.drawLine(Offset(-xr * 0.62, -xr), Offset(xr * 0.62, xr), pen);
+    c.drawLine(Offset(xr * 0.62, -xr), Offset(-xr * 0.62, xr), pen);
+    c.drawLine(Offset(-xr * 0.5, 0), Offset(xr * 0.5, 0), pen);
+    c.restore();
+  }
+  @override
+  bool shouldRepaint(_CoinPainter old) => old.t != t;
+}
+
+// "Node": a relay node — a bright core with signal rings pulsing out and three coloured relays orbiting.
+class _NodePainter extends CustomPainter {
+  final double t; _NodePainter(this.t);
+  @override
+  void paint(Canvas c, Size size) {
+    final ctr = size.center(Offset.zero); final r = size.width / 2;
+    _liveDisc(c, ctr, r);
+    for (int i = 0; i < 3; i++) {
+      final ph = (t + i / 3) % 1.0;
+      c.drawCircle(ctr, r * 0.2 + ph * r * 0.72, Paint()
+        ..style = PaintingStyle.stroke..strokeWidth = r * 0.05
+        ..color = const Color(0xFF14E0C8).withValues(alpha: (1 - ph) * 0.7));
+    }
+    const cols = [Color(0xFF14E0C8), Color(0xFF3B82F6), Color(0xFF3BD671)];
+    for (int i = 0; i < 3; i++) {
+      final a = 2 * math.pi * (t + i / 3);
+      c.drawCircle(ctr + Offset(math.cos(a), math.sin(a)) * r * 0.6, r * 0.13, Paint()..color = cols[i]);
+    }
+    c.drawCircle(ctr, r * 0.17, Paint()..color = Colors.white);
+  }
+  @override
+  bool shouldRepaint(_NodePainter old) => old.t != t;
+}
+
+// "Blob": a squishy green blob with googly eyes and a grin.
+class _BlobPainter extends CustomPainter {
+  final double t; _BlobPainter(this.t);
+  @override
+  void paint(Canvas c, Size size) {
+    final ctr = size.center(Offset.zero); final r = size.width / 2;
+    _liveDisc(c, ctr, r);
+    final sx = 1 + 0.12 * math.sin(t * 4 * math.pi), sy = 1 / sx;
+    c.drawOval(Rect.fromCenter(center: ctr, width: r * 1.5 * sx, height: r * 1.5 * sy),
+        Paint()..color = const Color(0xFF3BD671));
+    _googly(c, ctr - Offset(0, r * 0.05), r * 0.72, lookX: math.sin(t * 2 * math.pi) * 0.4);
+    c.drawArc(Rect.fromCenter(center: ctr + Offset(0, r * 0.22), width: r * 0.6, height: r * 0.5),
+        0.35, 2.44, false, Paint()
+          ..style = PaintingStyle.stroke..strokeWidth = r * 0.09..strokeCap = StrokeCap.round
+          ..color = const Color(0xFF0C1012));
+  }
+  @override
+  bool shouldRepaint(_BlobPainter old) => old.t != t;
+}
+
+// "Ghost": a little white ghost bobbing, with googly eyes.
+class _GhostPainter extends CustomPainter {
+  final double t; _GhostPainter(this.t);
+  @override
+  void paint(Canvas c, Size size) {
+    final ctr = size.center(Offset.zero); final r = size.width / 2;
+    _liveDisc(c, ctr, r);
+    final gc = ctr + Offset(0, math.sin(t * 2 * math.pi) * r * 0.12);
+    final rr = r * 0.62;
+    final ghost = Paint()..color = const Color(0xFFF0F8F8);
+    c.drawArc(Rect.fromCircle(center: gc - Offset(0, rr * 0.15), radius: rr), math.pi, math.pi, false, ghost);
+    c.drawRect(Rect.fromLTRB(gc.dx - rr, gc.dy - rr * 0.15, gc.dx + rr, gc.dy + rr * 0.55), ghost);
+    for (int i = 0; i < 4; i++) {
+      final x = gc.dx - rr + (2 * rr) * (i + 0.5) / 4;
+      c.drawCircle(Offset(x, gc.dy + rr * 0.55), rr * 0.25, ghost);
+    }
+    _googly(c, gc - Offset(0, rr * 0.1), rr * 0.7, lookX: math.sin(t * 1.4 * math.pi) * 0.4);
+  }
+  @override
+  bool shouldRepaint(_GhostPainter old) => old.t != t;
+}
+
+// "Googly": pure goofy — a blue disc that is mostly a pair of rolling googly eyes.
+class _GooglyPainter extends CustomPainter {
+  final double t; _GooglyPainter(this.t);
+  @override
+  void paint(Canvas c, Size size) {
+    final ctr = size.center(Offset.zero); final r = size.width / 2;
+    _liveDisc(c, ctr, r);
+    c.drawCircle(ctr, r * 0.9, Paint()..color = const Color(0xFF3B82F6));
+    _googly(c, ctr, r * 0.86,
+        lookX: math.cos(t * 2 * math.pi) * 0.5, lookY: math.sin(t * 2.4 * math.pi) * 0.4);
+  }
+  @override
+  bool shouldRepaint(_GooglyPainter old) => old.t != t;
+}
+
+CustomPainter _liveAvatarPainter(String style, double t) {
+  switch (style) {
+    case 'key': return _KeyPainter(t);
+    case 'coin': return _CoinPainter(t);
+    case 'node': return _NodePainter(t);
+    case 'blob': return _BlobPainter(t);
+    case 'ghost': return _GhostPainter(t);
+    case 'googly': return _GooglyPainter(t);
+    default: return _OrbitPainter(t);
+  }
 }
 
 // a subtle dark scrim + camera glyph, laid over an image thumbnail to say "tap to change"
@@ -3189,6 +3335,10 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   int _onchainBlocks = 0;
   int _relaysUp = 0, _relaysTotal = 0;
   final Map<String, double> _pending = {}; // author account -> tallied XNO (off-chain)
+  // post id -> XNO this device has pledged to THAT post, still un-settled. Lets the Tip button toggle:
+  // tap a post you've tipped (before it settles) to remove the tip. Cleared on untip and on settle.
+  final Map<String, double> _pendingPostTip = {};
+  bool _tipPending(Post p) => _pendingPostTip.containsKey(p.id) && (_pending[p.account] ?? 0) > 1e-9;
   final Set<String> _settling = {};        // creators with a settle in flight — blocks re-entrant settles
   bool _settleBusy = false;                 // guards the manual batch settle against a double-tap
   final Map<String, String> _handleOf = {}; // account -> handle, for the settle bar
@@ -3554,6 +3704,13 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
           backgroundColor: kCard, content: Text("You can't tip your own post")));
       return;
     }
+    // TOGGLE: tapping Tip again on a post you've already tipped (still un-settled) removes it. Once it
+    // settles on-chain the pledge is gone from _pending, so this falls through to a fresh tip instead.
+    if (_tipPending(p)) {
+      _untip(p, _pendingPostTip[p.id]!);
+      return;
+    }
+    _pendingPostTip.remove(p.id);   // drop any stale (already-settled) marker before a fresh tip
     final amt = _settings.defaultTip;
     if (!_guardTip(amt)) return;
     setState(() {
@@ -3564,6 +3721,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       _reposterOf.putIfAbsent(p.account, () => _firstResharer(p));
       _mediaOf.putIfAbsent(p.account, () => p.media ?? '');
       _bumpEngage(p.id, 'tips_xno', amt); // XNO gathered by this post
+      _pendingPostTip[p.id] = amt;        // remember this post is tipped (so Tip can toggle it off)
     });
     Api.tipstat(p.id, _rawOf(amt));
     // NB: no notification here. A tip is only a PLEDGE until it settles — notifying the creator now
@@ -3599,6 +3757,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         _pending[p.account] = rem;
       }
       _bumpEngage(p.id, 'tips_xno', -amt);   // pull it back out of this post's tally display
+      _pendingPostTip.remove(p.id);          // no longer tipped → Tip goes back to "tip", not "untip"
     });
     Api.tipstat(p.id, '-${_rawOf(amt)}');     // best-effort decrement of the network counter
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
@@ -4277,6 +4436,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         expanded: expanded,
         softFlag: mod,
         pending: _pending[post.account] ?? 0,
+        youTipped: _tipPending(post),
         engage: _eng(post.id),
         liked: _liked.contains(post.id),
         reposted: _reposted.contains(post.id),
@@ -4932,7 +5092,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                     padding: const EdgeInsets.all(3),
                     decoration: const BoxDecoration(color: kBg, shape: BoxShape.circle),
                     child: avatar.startsWith('live:')
-                        ? LiveAvatar(style: avatar.substring(5), radius: 31)
+                        ? LiveAvatar(style: liveStyleFor(avatar.substring(5), _account), radius: 31)
                         : avatar.isNotEmpty
                             ? Stack(children: [
                                 ClipOval(child: SizedBox(width: 62, height: 62, child: MediaImage(cid: avatar, fit: BoxFit.cover))),
@@ -4964,7 +5124,12 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                 const Text('Live avatar', style: TextStyle(color: kDim, fontSize: 12.5)),
                 const SizedBox(width: 12),
                 Expanded(child: Wrap(spacing: 8, runSpacing: 8, children: [
-                  for (final s in const [('orbit', 'Orbit'), ('key', 'Key')])
+                  for (final s in [
+                    ('orbit', 'Orbit'), ('coin', 'Coin'), ('node', 'Node'),
+                    ('blob', 'Blob'), ('ghost', 'Ghost'), ('googly', 'Googly'),
+                    // "Key" is the keyholder's mark — offered only to that account.
+                    if (_account == kKeyholderAccount) ('key', 'Key'),
+                  ])
                     GestureDetector(
                       onTap: () => setSheet(() => avatar = avatar == 'live:${s.$1}' ? '' : 'live:${s.$1}'),
                       child: Container(
@@ -6079,7 +6244,35 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                 minLines: 1, maxLines: 2,
                 decoration: _fieldDeco('Recipient address (nano_…)'),
               ),
-              const SizedBox(height: 10),
+              // Paste from the clipboard, or scan a Nano-address QR with the camera — no more typing 65 chars.
+              const SizedBox(height: 4),
+              Row(children: [
+                TextButton.icon(
+                  onPressed: () async {
+                    final d = await Clipboard.getData('text/plain');
+                    final t = _nanoFrom(d?.text ?? '');
+                    if (t != null) {
+                      setSheet(() { toCtl.text = t; err = null; });
+                    } else {
+                      setSheet(() => err = 'clipboard has no Nano address');
+                    }
+                  },
+                  style: TextButton.styleFrom(visualDensity: VisualDensity.compact),
+                  icon: const Icon(Icons.content_paste, size: 16, color: kAccent),
+                  label: const Text('Paste', style: TextStyle(color: kAccent, fontSize: 13)),
+                ),
+                TextButton.icon(
+                  onPressed: () async {
+                    final addr = await Navigator.of(ctx)
+                        .push<String>(MaterialPageRoute(builder: (_) => const QRScanScreen()));
+                    if (addr != null) setSheet(() { toCtl.text = addr; err = null; });
+                  },
+                  style: TextButton.styleFrom(visualDensity: VisualDensity.compact),
+                  icon: const Icon(Icons.qr_code_scanner, size: 17, color: kAccent),
+                  label: const Text('Scan', style: TextStyle(color: kAccent, fontSize: 13)),
+                ),
+              ]),
+              const SizedBox(height: 6),
               TextField(
                 controller: amtCtl,
                 style: const TextStyle(color: kText, fontSize: 15),
@@ -6988,7 +7181,12 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     if (_posts.isEmpty) {
       final cached = await Api.loadCachedPosts();
       if (cached.isNotEmpty && mounted && _posts.isEmpty) {
-        setState(() => _posts = cached);
+        // Show the cache INSTANTLY and end the loading state — the incremental fetch below then merges
+        // new posts in silently. A relaunch feels immediate instead of spinning until the network answers.
+        setState(() {
+          _posts = cached;
+          _loading = false;
+        });
       }
     }
     try {
@@ -6998,14 +7196,14 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       // engagement counts load just after (see _loadSecondary) — a lighter startup burst.
       final haveTs = _newestTs();
       final incremental = _posts.isNotEmpty && haveTs > 0;
+      // Only the feed + identity gate the first paint. The moderation labels (a SOFT shield filter, not a
+      // takedown) load just after in _loadSecondary, so a slow /api/labels no longer holds up launch.
       final results = await Future.wait([
         incremental ? Api.feed(since: haveTs - 1) : Api.feed(limit: _pageSize),
         Api.me(),
-        Api.labels(),
       ]);
       final fd = results[0] as FeedData;
       final me = results[1] as Map<String, dynamic>;
-      final labelers = results[2] as List<Labeler>;
       setState(() {
         if (incremental) {
           // MERGE new posts into the persisted timeline (dedupe by id) — never replace what we cached.
@@ -7029,7 +7227,6 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         _handle = me['handle'] ?? 'you.xno';
         _account = me['account'] ?? '';
         _balance = me['balance']?.toString() ?? '0';
-        _labelers = labelers;
         _loading = false;
       });
       _persistFeed();   // keep the on-device cache current, bounded to feedCacheSize
@@ -7058,6 +7255,9 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
       _engage = await Api.engagement();
       if (mounted) setState(() {});
     } catch (_) {}
+    // Moderation labels — moved off the launch critical path (a soft shield filter, not needed for first
+    // paint). Posts render immediately; the shield applies a beat later when this resolves.
+    Api.labels().then((l) { if (mounted) setState(() => _labelers = l); });
     // Seed a censorship-resistant fallback from the ledger while the current endpoint is healthy, so a
     // later takedown of the default nodes can't strand this install. Only until we've cached an endpoint
     // BEYOND the baked-in defaults — keeps the launch burst light and public RPCs unhammered.
@@ -9748,7 +9948,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           padding: const EdgeInsets.all(3),
                           decoration: const BoxDecoration(color: kBg, shape: BoxShape.circle),
                           child: avatar.startsWith('live:')
-                              ? LiveAvatar(style: avatar.substring(5), radius: 36)
+                              ? LiveAvatar(style: liveStyleFor(avatar.substring(5), widget.account), radius: 36)
                               : avatar.isNotEmpty
                                   ? ClipOval(child: SizedBox(width: 72, height: 72, child: MediaImage(cid: avatar, fit: BoxFit.cover)))
                                   : CircleAvatar(radius: 36, backgroundColor: avatarColor(widget.handle),
@@ -10191,6 +10391,7 @@ class PostCard extends StatefulWidget {
   final Post post;
   final PostMod? softFlag;
   final double pending;
+  final bool youTipped; // this device has an un-settled tip on this post → Tip toggles it off
   final Map<String, dynamic> engage;
   final bool liked, reposted;
   final int commentCount;
@@ -10214,6 +10415,7 @@ class PostCard extends StatefulWidget {
       required this.post,
       this.softFlag,
       this.pending = 0,
+      this.youTipped = false,
       this.engage = const {},
       this.liked = false,
       this.reposted = false,
@@ -10366,6 +10568,84 @@ Future<void> openLink(String url) async {
     await launchUrl(u, mode: LaunchMode.externalApplication);
   } catch (_) {
     // No browser installed, or the OS refused. Nothing useful to say to the reader.
+  }
+}
+
+/// Pull a Nano account out of pasted/scanned text: a bare `nano_…`, or a `nano:nano_…?amount=…` URI
+/// (the standard payment-QR scheme). Returns null if there's no plausible address.
+String? _nanoFrom(String raw) {
+  var s = raw.trim();
+  if (s.toLowerCase().startsWith('nano:')) s = s.substring(5);
+  final q = s.indexOf('?');
+  if (q >= 0) s = s.substring(0, q);
+  s = s.trim();
+  return (s.startsWith('nano_') && s.length >= 60) ? s : null;
+}
+
+/// Full-screen camera QR scanner. Pops with the first Nano address it sees. The OS asks for camera
+/// permission on first use (mobile_scanner handles the prompt); denial just returns nothing.
+class QRScanScreen extends StatefulWidget {
+  const QRScanScreen({super.key});
+  @override
+  State<QRScanScreen> createState() => _QRScanScreenState();
+}
+
+class _QRScanScreenState extends State<QRScanScreen> {
+  final MobileScannerController _ctrl = MobileScannerController(detectionSpeed: DetectionSpeed.noDuplicates);
+  bool _done = false;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  void _onDetect(BarcodeCapture capture) {
+    if (_done) return;
+    for (final b in capture.barcodes) {
+      final addr = _nanoFrom(b.rawValue ?? '');
+      if (addr != null) {
+        _done = true;
+        Navigator.of(context).pop(addr);
+        return;
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        title: const Text('Scan a Nano address', style: TextStyle(fontSize: 15)),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.flash_on),
+            onPressed: () => _ctrl.toggleTorch(),
+            tooltip: 'Torch',
+          ),
+        ],
+      ),
+      body: Stack(alignment: Alignment.center, children: [
+        MobileScanner(controller: _ctrl, onDetect: _onDetect),
+        // viewfinder
+        Container(
+          width: 240,
+          height: 240,
+          decoration: BoxDecoration(
+              border: Border.all(color: kAccent, width: 3), borderRadius: BorderRadius.circular(16)),
+        ),
+        const Positioned(
+          bottom: 48,
+          left: 24,
+          right: 24,
+          child: Text('Point at a Nano address QR code',
+              textAlign: TextAlign.center, style: TextStyle(color: Colors.white70, fontSize: 13)),
+        ),
+      ]),
+    );
   }
 }
 
@@ -10741,6 +11021,7 @@ class _PostCardState extends State<PostCard> {
               likes: ((e['likes'] ?? 0) as int) + (_likedNow == widget.liked ? 0 : (_likedNow ? 1 : -1)),
               reposted: widget.reposted,
               pending: widget.pending,
+              youTipped: widget.youTipped,
               views: (e['views'] ?? 0) as int,
               onReply: widget.onReply,
               onLike: () { setState(() => _likedNow = !_likedNow); widget.onLike(); },
@@ -11730,50 +12011,128 @@ class _MediaImageState extends State<MediaImage> {
   }
 }
 
-class _MoviePreview extends StatelessWidget {
+// An in-feed video: streams from the relay, shows the FIRST FRAME as a poster, and autoplays MUTED
+// and looping (X-style) as soon as it's on screen. Tap opens the full-screen player WITH sound. The
+// controller is disposed when the card is recycled off-screen, so a video far from view stops on its own.
+class _MoviePreview extends StatefulWidget {
   final Post post;
   const _MoviePreview({required this.post});
   @override
+  State<_MoviePreview> createState() => _MoviePreviewState();
+}
+
+class _MoviePreviewState extends State<_MoviePreview> {
+  VideoPlayerController? _c;
+  bool _ready = false, _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    final cid = widget.post.media;
+    if (cid == null || kIsWeb) {
+      // /api/media returns base64 JSON (not a streamable URL), so the mobile path fetches + decodes the
+      // bytes and plays from a temp file. Web has no temp dir, so it keeps the tap-to-open poster there.
+      if (mounted && cid == null) setState(() => _failed = true);
+      return;
+    }
+    try {
+      final tail = cid.substring(cid.length - 12);
+      final f = File('${Directory.systemTemp.path}/xc_feed_$tail.mp4');
+      if (!await f.exists() || (await f.length()) == 0) {
+        final bytes = await Api.media(cid);          // decodes the base64 the node serves
+        if (bytes == null) {
+          if (mounted) setState(() => _failed = true);
+          return;
+        }
+        await f.writeAsBytes(bytes);
+      }
+      final c = VideoPlayerController.file(f)
+        ..setLooping(true)
+        ..setVolume(0); // muted autoplay, X-style
+      await c.initialize();
+      if (!mounted) {
+        c.dispose();
+        return;
+      }
+      setState(() {
+        _c = c;
+        _ready = true;
+      });
+      c.play();
+    } catch (_) {
+      if (mounted) setState(() => _failed = true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _c?.dispose();
+    super.dispose();
+  }
+
+  void _openFull() {
+    final cid = widget.post.media;
+    if (cid != null) {
+      Navigator.of(context).push(MaterialPageRoute(builder: (_) => VideoScreen(cid: cid)));
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final ar = (_c != null && _c!.value.aspectRatio > 0) ? _c!.value.aspectRatio : 16 / 9;
     return Padding(
       padding: const EdgeInsets.only(top: 10),
-      child: GestureDetector(
-        onTap: post.media == null
-            ? null
-            : () => Navigator.of(context).push(
-                MaterialPageRoute(builder: (_) => VideoScreen(cid: post.media!))),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(16),
-        child: Stack(alignment: Alignment.center, children: [
-          AspectRatio(
-            aspectRatio: 16 / 9,
-            child: post.thumb != null
-                ? MediaImage(cid: post.thumb!, label: 'Video thumbnail, post by ${post.handle}')
-                : Container(color: kCard),
-          ),
-          Container(
-            width: 54,
-            height: 54,
-            decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.5),
-                shape: BoxShape.circle),
-            child: const Icon(Icons.play_arrow, color: Colors.white, size: 34),
-          ),
-          if (post.dur != null)
-            Positioned(
-              right: 8,
-              bottom: 8,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.65),
-                    borderRadius: BorderRadius.circular(5)),
-                child: Text(post.dur!,
-                    style: const TextStyle(color: Colors.white, fontSize: 11)),
-              ),
+        child: GestureDetector(
+          onTap: _openFull,
+          child: Stack(alignment: Alignment.center, children: [
+            AspectRatio(
+              aspectRatio: ar,
+              child: (_ready && _c != null)
+                  ? VideoPlayer(_c!)
+                  : widget.post.thumb != null
+                      ? MediaImage(cid: widget.post.thumb!, label: 'Video, post by ${widget.post.handle}')
+                      : Container(
+                          color: kCard,
+                          child: Center(
+                            child: _failed
+                                ? const Icon(Icons.videocam_off_outlined, color: kDim, size: 30)
+                                : const SizedBox(
+                                    width: 26,
+                                    height: 26,
+                                    child: CircularProgressIndicator(strokeWidth: 2, color: kAccent)),
+                          )),
             ),
-        ]),
-      ),
+            // muted badge — a hint that tapping opens the full player with sound
+            if (_ready)
+              Positioned(
+                left: 8,
+                bottom: 8,
+                child: Container(
+                  padding: const EdgeInsets.all(5),
+                  decoration:
+                      BoxDecoration(color: Colors.black.withValues(alpha: 0.5), shape: BoxShape.circle),
+                  child: const Icon(Icons.volume_off, color: Colors.white, size: 15),
+                ),
+              ),
+            if (widget.post.dur != null)
+              Positioned(
+                right: 8,
+                bottom: 8,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.65), borderRadius: BorderRadius.circular(5)),
+                  child: Text(widget.post.dur!, style: const TextStyle(color: Colors.white, fontSize: 11)),
+                ),
+              ),
+          ]),
+        ),
       ),
     );
   }
@@ -12364,7 +12723,7 @@ class _AnnouncementMarqueeState extends State<_AnnouncementMarquee> with SingleT
 class _Actions extends StatelessWidget {
   final int likes, reposts, replies, views;
   final double tipsXno, pending;
-  final bool liked, reposted;
+  final bool liked, reposted, youTipped;
   final VoidCallback onLike, onRepost, onTip;
   final VoidCallback? onReply, onQuote;
   const _Actions(
@@ -12380,6 +12739,7 @@ class _Actions extends StatelessWidget {
       this.views = 0,
       this.onReply,
       this.onQuote,
+      this.youTipped = false,
       this.pending = 0});
   @override
   Widget build(BuildContext context) {
@@ -12417,19 +12777,26 @@ class _Actions extends StatelessWidget {
         Semantics(
           button: true,
           // The Ӿ glyph is a custom painter, so there is nothing here for a screen reader to read at
-          // all — this control was previously silent, and it moves money.
-          label: pending > 0 ? 'Tip, ${pending.toStringAsFixed(2)} XNO pending' : 'Tip this post',
+          // all — this control was previously silent, and it moves money. When you've tipped this post
+          // (still un-settled), the control says so — and tapping it again removes the tip.
+          label: youTipped
+              ? 'Tipped ${pending.toStringAsFixed(2)} XNO — tap to undo'
+              : (pending > 0 ? 'Tip, ${pending.toStringAsFixed(2)} XNO pending' : 'Tip this post'),
           child: ExcludeSemantics(
             child: InkWell(
               onTap: onTip,
               borderRadius: BorderRadius.circular(20),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              child: Container(
+                // filled pill while this post carries your un-settled tip — a clear "tap again to undo"
+                decoration: youTipped
+                    ? BoxDecoration(color: kAccent.withValues(alpha: 0.16), borderRadius: BorderRadius.circular(20))
+                    : null,
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                 child: Row(children: [
                   const XnoGlyph(size: 16, color: kAccent, weight: 0.16),
                   const SizedBox(width: 5),
-                  Text(pending > 0 ? pending.toStringAsFixed(2) : 'Tip',
-                      style: const TextStyle(color: kAccent, fontSize: 13)),
+                  Text(youTipped ? 'Tipped ✓' : (pending > 0 ? pending.toStringAsFixed(2) : 'Tip'),
+                      style: TextStyle(color: kAccent, fontSize: 13, fontWeight: youTipped ? FontWeight.w700 : FontWeight.w400)),
                 ]),
               ),
             ),
@@ -13024,18 +13391,25 @@ class _ComposeSheetState extends State<ComposeSheet> {
 
     Uint8List bytes;
     if (video) {
-      // On-device compression so more clips fit under the ~6 MB relay pin cap. Falls back to the
-      // original bytes if compression fails or isn't supported; the size check below is the backstop.
-      setState(() => _compressing = true);
-      try {
-        final info = await VideoCompress.compressVideo(
-            x.path, quality: VideoQuality.MediumQuality, deleteOrigin: false, includeAudio: true);
-        final f = info?.file;
-        bytes = (f != null) ? await f.readAsBytes() : await x.readAsBytes();
-      } catch (_) {
-        bytes = await x.readAsBytes();
-      } finally {
-        if (mounted) setState(() => _compressing = false);
+      // Only re-encode a clip that's ACTUALLY too big for the relay pin cap. The on-device compressor
+      // (video_compress) is a heavy native step that has thrown on some devices ("Unsupported value:
+      // 'kotlin.Unit'") — skipping it for already-small clips avoids that flaky failure and posts faster.
+      final raw = await x.readAsBytes();
+      const capMb = 6;
+      if (raw.length <= capMb * 1024 * 1024) {
+        bytes = raw;
+      } else {
+        setState(() => _compressing = true);
+        try {
+          final info = await VideoCompress.compressVideo(
+              x.path, quality: VideoQuality.MediumQuality, deleteOrigin: false, includeAudio: true);
+          final f = info?.file;
+          bytes = (f != null) ? await f.readAsBytes() : raw;   // fall back to the original on any failure
+        } catch (_) {
+          bytes = raw;
+        } finally {
+          if (mounted) setState(() => _compressing = false);
+        }
       }
     } else {
       bytes = await x.readAsBytes();

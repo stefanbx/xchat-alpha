@@ -36,6 +36,12 @@ if mode == 'pub':
     ts = src.get('ts'); sig = src.get('sig', ''); pub = src.get('pub', '')
     if not (xc.pub_to_addr(pub) == acc and verify(pub, canon(acc, ts, display, bio, avatar, banner), sig)):
         json.dump({'ok': False, 'error': 'bad signature'}, open('/tmp/xc_profile_result.json', 'w')); sys.exit()
+    # The "key" live avatar is the keyholder's mark — reserved to one account. A validly-signed profile
+    # from anyone else that tries to wear it is refused publication (the app hides it from the picker and
+    # every viewer downgrades it on render, but this keeps it off the relays in the first place).
+    KEYHOLDER = 'nano_1egg8kim6cw4dktmrttwno5hrcwwtey7c4i15xy1iwi8ixw1156881kkbhs3'
+    if avatar == 'live:key' and acc != KEYHOLDER:
+        json.dump({'ok': False, 'error': 'the key avatar is reserved'}, open('/tmp/xc_profile_result.json', 'w')); sys.exit()
     rec = {'account': acc, 'display': display, 'bio': bio, 'avatar': avatar, 'banner': banner,
            'ts': ts, 'sig': sig, 'pub': pub}
     # forward the (unsigned) profile TYPE so channels are identifiable in the directory. It's not in the

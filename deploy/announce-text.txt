@@ -1,1 +1,1 @@
-ӾChat 2.5.9 is live — emoji reactions on posts, multi-image posts (up to 4, with a swipeable gallery), and ӾChat is now in public beta. Tap to update.
+ӾChat 2.5.10 is live — videos autoplay in the feed, new goofy & XNO profile avatars, scan or paste a Nano address in Send, untip by tapping Tip again, faster loading, and a video-post crash fix. Tap to update.

@@ -22,7 +22,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # 2.2.1 → 2.2.2 …; anchored at 2.2.x because the phone already installed 2.2.0 and the version doubles as
 # the update-check comparison — can't go below it. NB the emitted versionCode may differ from N; only
 # that it INCREASES matters — verify with `aapt2 dump badging` if unsure.)
-version: 2.5.9+22509
+version: 2.5.10+22510
 
 environment:
   sdk: ^3.12.2
@@ -60,6 +60,7 @@ dependencies:
   flutter_secure_storage: ^9.2.4
   flutter_local_notifications: ^18.0.1   # Android system notifications for likes/comments/tips/DMs
   app_badge_plus: ^1.2.2                  # unread-DM count on the launcher icon (AGP-8 safe)
+  mobile_scanner: ^5.2.3
 
 dev_dependencies:
   flutter_test:
