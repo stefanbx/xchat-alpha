@@ -3117,6 +3117,8 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   List<Map<String, dynamic>> _notifs = []; // push payloads (mentions/replies)
   int _dmUnread = 0;   // conversations with an incoming DM newer than _dmSeenTs (drives the mail badge)
   int _dmSeenTs = 0;   // unix-s of the last time DMs were opened; persisted so the badge survives restarts
+  int _dmNewestInTs = 0; // ts of the newest incoming DM the badge has seen — a floor for "seen" on open,
+                         // so a sender whose clock runs ahead of ours can't leave a read DM stuck unread
   int _notifSeenTs = 0;  // unix-s the notifications bell was last opened; older notifs don't count as unread
   // unread = notifications newer than the last bell-open, minus muted/blocked (matches what _showNotifs lists)
   int get _notifUnread {
@@ -4447,10 +4449,13 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
   }
 
   void _openDms() {
-    // opening the inbox marks everything up to now as seen, so the mail badge clears
+    // Opening the inbox marks everything up to now as seen, so the mail badge clears. Floor it at the
+    // newest incoming DM the badge already knows about: a DM carries the SENDER's clock time, which can
+    // run ahead of ours, so `now` alone would leave a just-arrived (already-read) DM counted as unread.
     final nowTs = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-    _dmSeenTs = nowTs;
-    SharedPreferences.getInstance().then((sp) => sp.setInt('dm_seen_ts', nowTs));
+    final seenTs = nowTs > _dmNewestInTs ? nowTs : _dmNewestInTs;
+    _dmSeenTs = seenTs;
+    SharedPreferences.getInstance().then((sp) => sp.setInt('dm_seen_ts', seenTs));
     setState(() => _dmUnread = 0);
     Navigator.of(context).push(MaterialPageRoute(builder: (_) => DmInboxScreen(
       handleOf: _handleFor,
@@ -4526,6 +4531,7 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
     try {
       final convos = await Api.dmInbox();
       var unread = 0;
+      var newestIn = _dmNewestInTs;                // track the newest incoming ts across all convos
       final fresh = <Map<String, dynamic>>[];     // newest incoming per conversation, for alerting
       for (final c in convos) {
         final msgs = (c['messages'] as List?) ?? const [];
@@ -4537,9 +4543,11 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
             if (ts > lastIn) { lastIn = ts; lastText = '${m['text'] ?? ''}'; }
           }
         }
+        if (lastIn > newestIn) newestIn = lastIn;
         if (lastIn > _dmSeenTs) unread++;
         if (lastIn > 0) fresh.add({'peer': c['peer'], 'ts': lastIn, 'text': lastText});
       }
+      _dmNewestInTs = newestIn;                     // remembered so _openDms can floor "seen" at it
       // Only rebuild when the number actually MOVED. This runs inside the 12s feed poll, and an
       // unconditional setState here rebuilt the entire home screen — feed, avatars and all — four
       // times a minute to redraw an identical badge. That is invisible in a screenshot diff (the
@@ -5918,7 +5926,14 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         return FutureBuilder<Map<String, dynamic>?>(
           future: f,
           builder: (_, snap) {
-            final health = (snap.data?['health'] as List?) ?? const [];
+            // Drop persistently-dead relays: a ledger-announced relay that is down AND has 0% uptime in
+            // the rolling window (never answered a probe) is just noise — e.g. an old lhr.life tunnel a
+            // peer abandoned. Anything reachable now, or reachable at some point in the window (a
+            // flapping relay, reliability > 0), stays so a brief blip isn't hidden.
+            final health = ((snap.data?['health'] as List?) ?? const []).where((h) {
+              final m = h as Map;
+              return m['up'] == true || ((m['reliability'] as num?) ?? 0) > 0;
+            }).toList();
             final rvs = (snap.data?['rendezvous'] as List?) ?? const [];
             final up = health.where((h) => h['up'] == true).length;
             final onLedger = health.where((h) => h['onchain'] == true).length;
