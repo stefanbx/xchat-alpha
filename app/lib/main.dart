@@ -4540,7 +4540,12 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
         var lastIn = 0;
         var lastText = '';
         for (final m in msgs) {
-          if ((m as Map)['outgoing'] != true) {
+          // Skip control (read receipts, reactions) and group-plumbing messages: they arrive as
+          // incoming records but are NOT a message the user sent. Counting them lit the mail badge and
+          // pushed a notification whenever a peer merely opened the thread or reacted — with the raw
+          // `xchat:ctl/1 read {...}` machine line as the preview text. hiddenInDm is the same filter the
+          // thread view uses to hide them.
+          if ((m as Map)['outgoing'] != true && !hiddenInDm('${m['text'] ?? ''}')) {
             final ts = (m['ts'] ?? 0) as int;
             if (ts > lastIn) { lastIn = ts; lastText = '${m['text'] ?? ''}'; }
           }

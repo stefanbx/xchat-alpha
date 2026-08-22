@@ -92,17 +92,31 @@ import time
 now = time.time()
 best = {}
 for h in heads:
-    exp = h.get('expires', 9e18)
-    msg = xc.sig_canon('head', h['author'], h['seq'], h['cid'], exp)
-    if exp < now:
+    # A relay (or a peer POSTing to one) can hand us a head missing a field or with a non-numeric seq/
+    # expires. Guard the whole record: one malformed head must skip itself, never KeyError/TypeError out
+    # of the loop and blank the feed for everyone. CRUCIAL: the signing preimage must use the field
+    # values EXACTLY as signed — sig_canon stringifies with str(), so coercing expires to float here
+    # ('1787..0' -> '1787..0.0') would change the preimage and break every head's signature. Keep the
+    # originals for sig_canon; derive numeric copies only for the expiry check / seq ordering.
+    try:
+        if not isinstance(h, dict):
+            continue
+        author = h['author']; seq = h['seq']; cid = h['cid']
+        pub = h['pub']; sig = h['sig']
+        exp = h.get('expires', 9e18)               # original value → signing preimage (unchanged)
+        seq_n = int(seq); exp_n = float(exp)        # numeric views → comparison/sort only
+    except (KeyError, TypeError, ValueError):
+        continue
+    msg = xc.sig_canon('head', author, seq, cid, exp)
+    if exp_n < now:
         continue                                   # expired head — ignore (needs republish)
-    if not verify(h['pub'], msg, h['sig']):
+    if not verify(pub, msg, sig):
         continue                                   # forged / bad signature — reject
-    if xc.pub_to_addr(h['pub']) != h['author']:
+    if xc.pub_to_addr(pub) != author:
         continue                                   # key doesn't match the claimed author — reject
-    cur = best.get(h['author'])
-    if cur is None or h['seq'] > cur['seq'] or (h['seq'] == cur['seq'] and exp > cur.get('expires', 0)):
-        best[h['author']] = h                      # highest valid seq (mutable head), freshest TTL
+    cur = best.get(author)
+    if cur is None or seq_n > cur['seq'] or (seq_n == cur['seq'] and exp_n > cur.get('expires', 0)):
+        best[author] = {**h, 'seq': seq_n, 'expires': exp_n}   # numeric seq/expires for downstream compare
 
 # COMMUNITY TAKEDOWN: a post whose reputation-WEIGHTED reports cross the threshold is dropped from the
 # feed for everyone (not just the reporter's client filter). Reports are verified + reputation-weighted
@@ -123,7 +137,12 @@ if best_heads:
                     posts += [p for p in json.loads(data).get('posts', []) if p.get('id') not in taken]
                 except Exception:
                     pass
-posts.sort(key=lambda p: p.get('ts', 0), reverse=True)
+def _ts(p):                            # a post with a string/None/missing ts must not blow up the sort
+    try:
+        return float(p.get('ts', 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+posts.sort(key=_ts, reverse=True)
 # ATOMIC write: a reader (api_feed) must never see this file half-written, or the feed blinks empty.
 json.dump({"feed": "XChat", "posts": posts, "relays_up": up, "relays_total": len(RELAYS),
            "authors": len(best)}, open(xc.FEED_CACHE + '.tmp', 'w'))

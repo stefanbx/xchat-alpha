@@ -123,7 +123,15 @@ elif mode == 'send':
     # The record is ALREADY SEALED BY THE APP (nonce+ciphertext in `ct`). The node just relays it.
     msg = json.load(open('/tmp/xc_dm_msg.json'))
     relays = post('/dm', msg)
-    json.dump({'ok': True, 'relays': relays, 'ts': msg.get('ts')}, open('/tmp/xc_dm_result.json', 'w'))
+    # A send that reached ZERO relays did not leave this device — reporting ok:True there is a silent
+    # loss: the app confirms the bubble, drops it from the composer, and the message exists nowhere. Tie
+    # ok to actual delivery so the app restores the text and shows "send failed" (it already does on
+    # ok:false) instead of eating the message. relays==0 also covers an EMPTY relay set (post() returns 0).
+    ok = relays > 0
+    out = {'ok': ok, 'relays': relays, 'ts': msg.get('ts')}
+    if not ok:
+        out['error'] = 'no relay reachable — message not sent'
+    json.dump(out, open('/tmp/xc_dm_result.json', 'w'))
 
 else:                                                      # inbox: return RAW ciphertext records (app decrypts)
     acc = rd('/tmp/xc_dm_acct.txt')

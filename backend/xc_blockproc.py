@@ -234,7 +234,11 @@ def _compute_work_rpc(root, difficulty=None):
     # and turns each of those into a clean fall-through to the next source.
     try:
         w = json.loads(urllib.request.urlopen(WORK + '/work?hash=' + root, timeout=WORK_TIMEOUT).read())['work']
-        if w and _work_ok(w, root):
+        # Validate against THIS block's threshold, not the fixed send default. A receive needs only
+        # _RECV_DIFF; validating the local server's (valid, receive-grade) answer at the harder send
+        # difficulty rejected it, so every receive fell through to the slow RPC race — the "tips slow"
+        # symptom. Send-grade work still passes the easier receive check, so this only ever accepts more.
+        if w and _work_ok(w, root, difficulty):
             return w
     except Exception:
         pass

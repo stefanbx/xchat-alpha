@@ -279,11 +279,18 @@ def channels_directory():
         if not isinstance(rec, dict) or rec.get('type') != 'channel':
             continue
         if xc is not None:
-            msg = xc.sig_canon('profile', acc, rec.get('ts', 0), rec.get('display', ''),
-                               rec.get('bio', ''), rec.get('avatar', ''), rec.get('banner', ''))
-            if not (xc.pub_to_addr(rec.get('pub', '')) == acc
-                    and xc.verify_msg(rec.get('pub', ''), msg, rec.get('sig', ''))):
-                continue                                        # unsigned/spoofed → not listed
+            # A malformed `pub` (bad length / non-hex) makes pub_to_addr raise. Unguarded, that one bad
+            # profile aborts the whole directory build — and since it stays in `profiles`, EVERY later
+            # /channels request 500s too (a permanent DoS from a single unauth POST). Treat any error
+            # verifying a profile as "not a valid signed channel" and skip just that record.
+            try:
+                msg = xc.sig_canon('profile', acc, rec.get('ts', 0), rec.get('display', ''),
+                                   rec.get('bio', ''), rec.get('avatar', ''), rec.get('banner', ''))
+                if not (xc.pub_to_addr(rec.get('pub', '')) == acc
+                        and xc.verify_msg(rec.get('pub', ''), msg, rec.get('sig', ''))):
+                    continue                                    # unsigned/spoofed → not listed
+            except Exception:
+                continue                                        # malformed record → skip, never 500
         out.append({'account': acc, 'display': rec.get('display', ''), 'bio': rec.get('bio', ''),
                     'avatar': rec.get('avatar', ''),
                     'followers': follower_ct.get(acc, 0), 'online': online_ct.get(acc, 0)})
@@ -319,17 +326,26 @@ def _dms_flat():
 
 def _dm_evict_oldest():
     # Remove the single globally-oldest LIVE record: walk arrival order, skipping tombstones left by the
-    # per-/distinct-mailbox caps. The oldest live record of any mailbox is that bucket's front (older ones
-    # were enqueued earlier and already left), so an identity match on b[0] is enough.
+    # per-/distinct-mailbox caps. The oldest live record of any mailbox is normally that bucket's front
+    # (older ones were enqueued earlier and already left), so an identity match on b[0] is the fast path.
     while _dm_order:
         r = _dm_order.popleft()
         if _dm_key(r) not in _dm_seen:
             continue                                     # tombstone — already evicted by a per-mailbox cap
-        b = dms_by_to.get(r.get('to') or '')
-        if b and b[0] is r:
-            _dm_forget(b.pop(0))
+        to = r.get('to') or ''
+        b = dms_by_to.get(to)
+        # r is live and has been removed from _dm_order, so we MUST forget it now — otherwise it lives on
+        # in _dm_seen and its bucket with no _dm_order entry to ever evict it again: an orphan that inflates
+        # _dm_total forever and holds the global cap permanently over ceiling. Normally r is b[0]; but if an
+        # invariant ever slips (r somewhere inside b, or its bucket already gone), still account for r by
+        # removing it wherever it is, rather than returning and leaking it.
+        if b is not None:
+            for i, x in enumerate(b):                    # remove by IDENTITY (usually i==0), not by ==
+                if x is r:
+                    b.pop(i); break
             if not b:
-                dms_by_to.pop(r.get('to') or '', None)
+                dms_by_to.pop(to, None)
+        _dm_forget(r)
         return
 
 
@@ -341,10 +357,18 @@ def _dm_store(m):
     #      order, via _dm_order). This last path is rare: 1+2 keep the total modest in normal use.
     # Returns True if the record was newly stored. Dedup is unchanged (_dm_key: `mid` for sealed v2).
     global _dm_total, _dm_order
+    if not isinstance(m, dict):
+        return False
+    to = m.get('to') or ''
+    # A record with no recipient mailbox is unreadable by anyone (mailbox reads are keyed by `to`), and
+    # one with no ciphertext carries nothing — but stored, either still consumes a DM_PER_ACCT/DM_ACCTS/
+    # DM_MAX slot. A spray of empty-`to` records would poison those caps and evict real DMs. Drop them at
+    # the door before they take any budget. (`to` is public by design — this leaks nothing new.)
+    if not to or not (m.get('ct') or m.get('epk')):
+        return False
     key = _dm_key(m)
     if key in _dm_seen:
         return False
-    to = m.get('to') or ''
     _dm_seen.add(key); _dm_total += 1
     dms_by_to.setdefault(to, []).append(m)
     _dm_order.append(m)
