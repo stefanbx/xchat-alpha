@@ -144,6 +144,53 @@ The two mechanisms compose: a permanent relay announces on-chain and is discover
 at all; an ephemeral one is learned by gossip and followed across address changes by identity. Neither
 requires anyone's permission.
 
+### Reaching a relay behind NAT — a self-hosted mesh, not a third-party tunnel
+
+On-chain discovery presumes a relay can be *dialed*. A relay on a home machine or a laptop cannot: it
+is behind NAT — able to dial **out**, never **in**. The usual fix (Cloudflare, `localhost.run`,
+Tailscale) reintroduces exactly what the rest of this design removes: an external service that is both
+a single point of failure and a point of control. ӾChat's answer is a **self-hosted reverse mesh** with
+no external dependency.
+
+Any node with a public IP can volunteer as an **entry node** — a capability advertised on the ledger
+just like a relay (permissionless, plural, no owner). A NAT'd relay opens **outbound** long-poll
+connections to *several* entry nodes at once and holds them open. A public request arriving at any
+entry is framed and handed down the held connection to the home relay, which serves it against its own
+local port and posts the response back up. Kill any one entry and the relay stays reachable through the
+others — there is no single hop whose loss takes it offline, and no third party in the path. (Long-poll,
+not WebSocket: a hanging `GET` for work plus a `POST` for the reply needs nothing but stdlib HTTP and
+passes through every HTTP ingress — Fly included — untouched, at the cost of one extra round-trip.)
+
+**The entry never learns which relay it carries.** An entry forwards bytes, so it necessarily sees the
+flows it relays; what it must *not* be able to do is tie a flow to a relay's stable identity. So routing
+is by an **ephemeral token**, never the relay's account:
+
+> `token = pubkey( KDF(rendezvous_secret, entry_id, epoch) )`
+
+The relay registers at each entry under this token and signs its polls and replies with the matching
+ephemeral key — **never its ledger key**. Each entry therefore learns only an opaque pubkey that (a) is
+not the account and cannot be inverted to it, (b) is **different at every entry** (the entry's id is
+mixed into the KDF), so colluding entries cannot link one relay across them, and (c) **rotates every
+epoch**, so no entry can aggregate a relay's traffic over time. A client that holds the
+`rendezvous_secret` derives the same token and addresses the relay as `/r/<token>/…`; the relay's real
+account rides end-to-end *inside* the request it serves, never as the routing key. The secret is shared
+out-of-band by the operator with the people who should reach a private relay — the same secret-scoped
+model that keeps such a relay off the public ledger entirely (**private by secret**: it never
+self-announces, so it is absent from the public relay set and reachable only by someone who holds the
+secret).
+
+**Honest limit.** This hides *identity*, not *timing*. A single entry that happens to carry both ends
+can still correlate "this inbound request ↔ that backend reply" by timing, and it knows the token is
+reachable through it right now. Defeating that — so no single node ever sees both ends at once — needs
+≥2 hops or a mix layer (**Layer B**), which builds on this same token abstraction and is **not yet
+shipped**.
+
+The two reachability paths compose with the two discovery paths above: a **permanent** relay has a
+public IP and commits its URL on-chain (discoverable with no bootstrap); an **ephemeral** relay sits
+behind NAT and is reached through the entry mesh under a rotating token. Either way there is no
+hardcoded URL, no directory, and no external service in the path — only the ledger and the nodes
+themselves.
+
 ## 5. Moderation — community reports feed one value score
 
 Moderation is **community reports**. A report is a signed record — `report|account|postId|ts`, signed
@@ -565,8 +612,8 @@ now shipped:
   the released binary **is** the published code — trust in an update rests on readable code, not a key.
 
 - **Anyone can run a relay, and a browser can be the client (v2.3.4).** One command installs a relay
-  with a free tunnel, a loopback-only settings page, and a login service — so contributing no longer
-  requires a public IP or a sysadmin. The same app now also runs **in a browser** at any node's
+  reachable through the **self-hosted entry mesh** (§4 — no third-party tunnel), with a loopback-only
+  settings page and a login service — so contributing no longer requires a public IP or a sysadmin. The same app now also runs **in a browser** at any node's
   `/chat`, with a BigInt ed25519-blake2b for the web (JavaScript has no 64-bit integers, so the
   Android signer's arithmetic cannot compile there) checked byte-for-byte against the Android
   implementation and against the node's independent Python verifier. Relays hold a hash-placed
