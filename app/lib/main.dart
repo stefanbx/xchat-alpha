@@ -10397,20 +10397,42 @@ class _WalletHistoryScreenState extends State<WalletHistoryScreen> {
                       final r = rows[i];
                       final incoming = '${r['type']}' == 'receive';
                       final acct = '${r['account'] ?? ''}';
-                      final handle = widget.handles[acct];
                       final xno = (double.tryParse('${r['amount'] ?? 0}') ?? 0) / 1e30;
                       final ts = (r['ts'] as int?) ?? 0;
-                      return ListTile(
-                        leading: Icon(incoming ? Icons.south_west : Icons.north_east,
-                            color: incoming ? const Color(0xFF4DD0A7) : kDim, size: 20),
-                        title: Text(handle != null ? '@$handle' : _short(acct),
-                            style: const TextStyle(color: kText, fontSize: 14.5, fontWeight: FontWeight.w700)),
-                        subtitle: Text(handle != null ? _short(acct) : (ts > 0 ? timeAgo(ts) : ''),
-                            style: const TextStyle(color: kDim, fontSize: 11.5, fontFamily: 'monospace')),
-                        trailing: Text('${incoming ? '+' : '−'}${xno.toStringAsFixed(5)}',
-                            style: TextStyle(
-                                color: incoming ? const Color(0xFF4DD0A7) : kText,
-                                fontSize: 14, fontWeight: FontWeight.w800)),
+                      // Resolve the counterparty's NAME even when they aren't in the current feed. The
+                      // `handles` map only covers accounts this device has actually seen post, so a
+                      // creator you tipped whose post has since scrolled off — and split-leg recipients
+                      // (the relay, a reposter) that never appear in the feed at all — used to render as
+                      // a bare nano_ address. ProfileCache.I.ensure() fetches the account's signed
+                      // profile on demand and, being a ChangeNotifier, rebuilds this row when the name
+                      // lands. Feed-seen handles stay the instant fallback so known names show with no
+                      // round-trip.
+                      return AnimatedBuilder(
+                        animation: ProfileCache.I,
+                        builder: (_, __) {
+                          if (acct.isNotEmpty) ProfileCache.I.ensure(acct);
+                          final name = ProfileCache.I.displayName(acct, widget.handles[acct] ?? '').trim();
+                          final hasName = name.isNotEmpty;
+                          return ListTile(
+                            leading: Icon(incoming ? Icons.south_west : Icons.north_east,
+                                color: incoming ? const Color(0xFF4DD0A7) : kDim, size: 20),
+                            title: Text(hasName ? '@$name' : _short(acct),
+                                style: const TextStyle(color: kText, fontSize: 14.5, fontWeight: FontWeight.w700)),
+                            // Keep the address AND the time visible when a name is present — the
+                            // name↔address pairing is the whole point (recognise the name, still verify
+                            // the account it maps to), and the timestamp shouldn't vanish just because
+                            // the name resolved.
+                            subtitle: Text(
+                                hasName
+                                    ? (ts > 0 ? '${_short(acct)}  ·  ${timeAgo(ts)}' : _short(acct))
+                                    : (ts > 0 ? timeAgo(ts) : ''),
+                                style: const TextStyle(color: kDim, fontSize: 11.5, fontFamily: 'monospace')),
+                            trailing: Text('${incoming ? '+' : '−'}${xno.toStringAsFixed(5)}',
+                                style: TextStyle(
+                                    color: incoming ? const Color(0xFF4DD0A7) : kText,
+                                    fontSize: 14, fontWeight: FontWeight.w800)),
+                          );
+                        },
                       );
                     },
                   ),
