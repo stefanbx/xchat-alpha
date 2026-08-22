@@ -2887,7 +2887,8 @@ class _LiveAvatarState extends State<LiveAvatar> with SingleTickerProviderStateM
       width: d, height: d,
       child: AnimatedBuilder(
         animation: _c,
-        builder: (_, __) => CustomPaint(painter: _OrbitPainter(_c.value)),
+        builder: (_, __) => CustomPaint(
+            painter: widget.style == 'key' ? _KeyPainter(_c.value) : _OrbitPainter(_c.value)),
       ),
     );
   }
@@ -2925,6 +2926,47 @@ class _OrbitPainter extends CustomPainter {
   }
   @override
   bool shouldRepaint(_OrbitPainter old) => old.t != t;
+}
+
+// "Key": a glowing key (diamond bow + toothed blade) spinning on a dark disc — the "keyholder" motif.
+class _KeyPainter extends CustomPainter {
+  final double t; // 0..1 phase → one full rotation per cycle
+  _KeyPainter(this.t);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = size.center(Offset.zero);
+    final r = size.width / 2;
+    canvas.drawCircle(c, r, Paint()..color = const Color(0xFF0B1A22));            // disc
+    canvas.drawCircle(c, r - 1, Paint()                                          // faint rim
+      ..style = PaintingStyle.stroke..strokeWidth = 1
+      ..color = const Color(0xFF14E0C8).withValues(alpha: 0.22));
+
+    // key silhouette, centred on the origin and scaled to the radius
+    final key = Path();
+    final bowY = -0.40 * r, bs = 0.34 * r;                                        // bow = diamond
+    key.moveTo(0, bowY - bs); key.lineTo(bs, bowY); key.lineTo(0, bowY + bs); key.lineTo(-bs, bowY); key.close();
+    final sw = 0.10 * r;
+    key.addRect(Rect.fromLTRB(-sw, bowY, sw, 0.60 * r));                          // shaft
+    key.addRect(Rect.fromLTRB(sw, 0.28 * r, sw + 0.22 * r, 0.38 * r));            // tooth 1
+    key.addRect(Rect.fromLTRB(sw, 0.46 * r, sw + 0.13 * r, 0.55 * r));            // tooth 2
+    final hole = Path();                                                          // bow negative space
+    final hs = 0.15 * r;
+    hole.moveTo(0, bowY - hs); hole.lineTo(hs, bowY); hole.lineTo(0, bowY + hs); hole.lineTo(-hs, bowY); hole.close();
+
+    canvas.save();
+    canvas.translate(c.dx, c.dy);
+    // Turn LEFT → RIGHT around the vertical axis (like a key turning in a lock), rather than a flat
+    // pinwheel spin: scaling X by cos(phase) is the orthographic projection of that horizontal rotation.
+    canvas.scale(math.cos(2 * math.pi * t), 1.0);
+    canvas.drawPath(key, Paint()                                                  // glow halo
+      ..color = const Color(0xFF4FD1C5).withValues(alpha: 0.85)
+      ..maskFilter = MaskFilter.blur(BlurStyle.normal, (r * 0.22).clamp(1.0, 10.0)));
+    canvas.drawPath(key, Paint()..color = const Color(0xFF2EA8F0));              // sharp key
+    canvas.drawPath(hole, Paint()..color = const Color(0xFF0B1A22));            // punch the bow hole
+    canvas.restore();
+  }
+  @override
+  bool shouldRepaint(_KeyPainter old) => old.t != t;
 }
 
 // a subtle dark scrim + camera glyph, laid over an image thumbnail to say "tap to change"
@@ -4672,27 +4714,30 @@ class _FeedScreenState extends State<FeedScreen> with WidgetsBindingObserver {
                 decoration: _fieldDeco('Bio'),
               ),
               const SizedBox(height: 6),
-              // LIVE avatar picker — an animated, code-drawn avatar (no upload). Tap to set/unset.
+              // LIVE avatar picker — animated, code-drawn avatars (no upload). Tap a style to set/unset.
               Row(children: [
                 const Text('Live avatar', style: TextStyle(color: kDim, fontSize: 12.5)),
                 const SizedBox(width: 12),
-                GestureDetector(
-                  onTap: () => setSheet(() => avatar = avatar == 'live:orbit' ? '' : 'live:orbit'),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    decoration: BoxDecoration(
-                        color: avatar == 'live:orbit' ? kAccent.withValues(alpha: 0.15) : kCard,
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(color: avatar == 'live:orbit' ? kAccent : kLine)),
-                    child: Row(mainAxisSize: MainAxisSize.min, children: [
-                      const LiveAvatar(style: 'orbit', radius: 11),
-                      const SizedBox(width: 7),
-                      Text('Orbit',
-                          style: TextStyle(color: avatar == 'live:orbit' ? kAccent : kText,
-                              fontWeight: FontWeight.w700, fontSize: 13)),
-                    ]),
-                  ),
-                ),
+                Expanded(child: Wrap(spacing: 8, runSpacing: 8, children: [
+                  for (final s in const [('orbit', 'Orbit'), ('key', 'Key')])
+                    GestureDetector(
+                      onTap: () => setSheet(() => avatar = avatar == 'live:${s.$1}' ? '' : 'live:${s.$1}'),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                            color: avatar == 'live:${s.$1}' ? kAccent.withValues(alpha: 0.15) : kCard,
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(color: avatar == 'live:${s.$1}' ? kAccent : kLine)),
+                        child: Row(mainAxisSize: MainAxisSize.min, children: [
+                          LiveAvatar(style: s.$1, radius: 11),
+                          const SizedBox(width: 7),
+                          Text(s.$2,
+                              style: TextStyle(color: avatar == 'live:${s.$1}' ? kAccent : kText,
+                                  fontWeight: FontWeight.w700, fontSize: 13)),
+                        ]),
+                      ),
+                    ),
+                ])),
               ]),
               const SizedBox(height: 8),
               SizedBox(width: double.infinity, child: FilledButton(
